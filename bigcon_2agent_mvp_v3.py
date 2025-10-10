@@ -282,42 +282,86 @@ def build_agent2_prompt(agent1_json):
 """
     return guide
 
-def call_gemini_agent2(prompt_text, model_name='gemini-2.5-flash'):
+def call_gemini_agent2(prompt_text, model_name='gemini-1.5-flash'):
+    """
+    빈 응답 방지용:
+    - model fallback (flash → flash-latest → pro-latest)
+    - response_mime_type 제거 (강제 JSON이 빈 응답 유발하는 경우 회피)
+    - 세이프티 완화 (BLOCK_NONE)
+    - 텍스트/코드펜스/JSON 모두 파싱 시도
+    """
+    import google.generativeai as genai
+
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
-        try:
-            api_key = input('Enter GEMINI_API_KEY: ').strip()
-        except Exception:
-            api_key = None
-    if not api_key:
         raise RuntimeError('GEMINI_API_KEY가 설정되지 않았습니다.')
-    os.environ['GEMINI_API_KEY'] = api_key
-
-    import google.generativeai as genai
     genai.configure(api_key=api_key)
+
+    # 세이프티 완화
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    ]
+
     generation_config = {
-        'temperature': 0.4,
-        'top_p': 0.9,
-        'top_k': 32,
-        'max_output_tokens': 1400,
-        'response_mime_type': 'application/json',
+        "temperature": 0.25,
+        "top_p": 0.9,
+        "top_k": 32,
+        "max_output_tokens": 1400,
+        # "response_mime_type": "application/json",  # ← 잠시 비활성화
     }
-    model = genai.GenerativeModel(model_name=model_name, generation_config=generation_config)
-    resp = model.generate_content(prompt_text)
-    text = ''
-    try:
-        text = resp.text
-    except Exception:
-        if hasattr(resp, 'candidates') and resp.candidates:
-            parts = resp.candidates[0].content.parts
+
+    def _run_once(name: str):
+        model = genai.GenerativeModel(
+            model_name=name,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        resp = model.generate_content(prompt_text)
+
+        # 1) resp.text 우선
+        text = getattr(resp, "text", "") or ""
+        # 2) candidates/parts 보강
+        if (not text) and getattr(resp, "candidates", None):
+            parts = resp.candidates[0].content.parts if resp.candidates[0].content else []
             if parts:
-                text = getattr(parts[0], 'text', '')
-    if not text:
-        raise RuntimeError('Gemini 응답이 비어 있습니다.')
-    try:
-        data = json.loads(text)
-    except Exception:
-        data = {'raw': text}
+                # text, inline_data, function_call 등 섞일 수 있음
+                for p in parts:
+                    t = getattr(p, "text", "")
+                    if t:
+                        text += t
+
+        if not text:
+            return None, resp
+
+        # 텍스트에서 JSON 코어 추출 시도
+        import re, json
+        # 코드펜스 포함/미포함 모두 대응
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+                return obj, resp
+            except Exception:
+                pass
+
+        # 마지막 방어: raw 텍스트라도 JSON으로 래핑
+        return {"raw": text}, resp
+
+    # 1차 시도: 지정(기본 flash)
+    data, resp = _run_once(model_name)
+    if not data:
+        # 2차: flash-latest
+        data, resp = _run_once("gemini-1.5-flash-latest")
+    if not data:
+        # 3차: pro-latest (세이프티/길이/부하 우회)
+        data, resp = _run_once("gemini-1.5-pro-latest")
+
+    if not data:
+        raise RuntimeError("Gemini 응답이 비어 있습니다. (모델/세이프티/쿼터 문제 가능)")
+
     outp = OUTPUT_DIR / 'agent2_result.json'
     with open(outp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
