@@ -47,7 +47,7 @@ if st.button("분석 실행", type="primary"):
         try:
             os.environ["GEMINI_API_KEY"] = API_KEY  # 내부 함수가 env 읽도록 주입
             prompt_text = build_agent2_prompt(a1)
-            result = call_gemini_agent2(prompt_text, model_name='gemini-2.5-flash')
+            result = call_gemini_agent2(prompt_text)
             st.success("Agent-2 카드 생성 완료")
         except Exception:
             st.error("Agent-2 실행 오류")
