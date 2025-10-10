@@ -282,14 +282,14 @@ def build_agent2_prompt(agent1_json):
 """
     return guide
 
-def call_gemini_agent2(prompt_text, model_name='models/gemini-1.5-flash-001'):
+def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
     """
-    빈 응답/세이프티 블록 방지용 견고화:
-    - model fallback (1.5-flash → 1.5-flash-latest → 1.5-pro-latest)
-    - response_mime_type 제거 (강제 JSON이 빈 응답 유발하는 경우 회피)
-    - 세이프티 완화 (BLOCK_NONE) 시도하되, 그래도 block되면 폴백 카드 반환
-    - candidates/parts가 없을 때도 안전 처리
-    - 안전 로그를 outputs/gemini_debug.json 로 남김
+    Gemini 2.5 Flash 전용 호출:
+    - google-generativeai==0.8.3 기준
+    - 2.5 flash 가용성 자동 확인(list_models) 후 2.5 flash 계열만 시도
+    - response_mime_type 강제 해제(빈 응답 회피), 텍스트→JSON 추출
+    - 세이프티/빈응답/가용성 이슈 시 폴백 카드 반환 (앱은 계속 동작)
+    - 디버그 로그: outputs/gemini_debug.json
     """
     import google.generativeai as genai
     import re, json, datetime
@@ -299,57 +299,78 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-1.5-flash-001'):
         raise RuntimeError('GEMINI_API_KEY가 설정되지 않았습니다.')
     genai.configure(api_key=api_key)
 
+    # 1) 계정에서 실제 가능한 2.5-flash 계열 모델만 수집
+    candidates = []
+    try:
+        avail = []
+        for m in genai.list_models():
+            if "generateContent" in getattr(m, "supported_generation_methods", []):
+                avail.append(m.name)  # 예: 'models/gemini-2.5-flash'
+        # 2.5 flash 계열만 필터
+        for name in avail:
+            tail = name.split("/")[-1]
+            if "2.5" in tail and "flash" in tail:
+                candidates.append(name)
+    except Exception:
+        pass
+
+    # 가용성 조회 실패/비어있으면 합리적 후보(2.5 flash 계열)만 시도
+    if not candidates:
+        candidates = [
+            "models/gemini-2.5-flash",
+            "models/gemini-2.5-flash-latest",
+            "models/gemini-2.5-flash-001",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-latest",
+            "gemini-2.5-flash-001",
+        ]
+
+    # 사용자가 인자를 줬다면 맨 앞에 둠(역시 2.5 flash 계열이어야 함)
+    if model_name and model_name not in candidates:
+        candidates.insert(0, model_name)
+
+    # 세이프티(완화) + 토큰 보수적
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     ]
-
     generation_config = {
-        "temperature": 0.2,        # 더 보수적으로
+        "temperature": 0.2,
         "top_p": 0.9,
         "top_k": 32,
-        "max_output_tokens": 900,  # 토큰 축소로 세이프티/길이 이슈 완화
-        # "response_mime_type": "application/json",  # 강제하지 않음
+        "max_output_tokens": 900,
+        # "response_mime_type": "application/json",  # 강제하지 않음(빈 응답 회피)
     }
 
     def _extract_text(resp):
-        """candidates/parts 유무와 관계없이 텍스트를 최대한 끌어온다."""
         text = ""
-        # 1) 빠른 경로
         try:
             t = getattr(resp, "text", None)
-            if t:
-                text = t
+            if t: text = t
         except Exception:
             pass
-        # 2) candidates/parts 경로
         if (not text) and getattr(resp, "candidates", None):
             try:
                 cand0 = resp.candidates[0]
                 if cand0 and getattr(cand0, "content", None) and cand0.content.parts:
                     for p in cand0.content.parts:
                         pt = getattr(p, "text", "")
-                        if pt:
-                            text += pt
+                        if pt: text += pt
             except Exception:
                 pass
-        return text.strip()
+        return (text or "").strip()
 
     def _blocked_info(resp):
-        """세이프티/피드백 정보를 dict로 추출."""
         info = {}
-        try:
-            info["prompt_feedback"] = getattr(resp, "prompt_feedback", None)
-        except Exception:
-            pass
+        try: info["prompt_feedback"] = getattr(resp, "prompt_feedback", None)
+        except Exception: pass
         try:
             if getattr(resp, "candidates", None):
                 info["candidate_safety"] = getattr(resp.candidates[0], "safety_ratings", None)
                 info["finish_reason"] = getattr(resp.candidates[0], "finish_reason", None)
-        except Exception:
-            pass
+        except Exception: pass
         return info
 
     def _run_once(name: str):
@@ -361,78 +382,70 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-1.5-flash-001'):
         resp = model.generate_content(prompt_text)
         text = _extract_text(resp)
         info = _blocked_info(resp)
-        return text, info, resp
+        return text, info, name
 
     tried = []
-    for mname in [
-    model_name,  # 아래 기본값도 바꿔줄 거예요.
-    "models/gemini-1.5-flash-latest",
-    "models/gemini-1.5-pro-001",       # 안정
-    "models/gemini-1.5-pro-latest",
-]:
-        text, info, resp = _run_once(mname)
-        tried.append({"model": mname, "has_text": bool(text), "meta": info})
-        if text:
-            # JSON 파싱 시도
-            core = None
-            m = re.search(r"\{[\s\S]*\}", text)
-            if m:
+    for mname in candidates:
+        try:
+            text, info, used = _run_once(mname)
+            tried.append({"model": used, "has_text": bool(text), "meta": info})
+            if text:
+                # 텍스트에서 JSON 추출 시도
+                core = None
+                m = re.search(r"\{[\s\S]*\}", text)
+                if m:
+                    try:
+                        core = json.loads(m.group(0))
+                    except Exception:
+                        core = None
+                data = core if core else {"raw": text}
+
+                # 디버그 기록
                 try:
-                    core = json.loads(m.group(0))
+                    debug = {
+                        "ts": datetime.datetime.utcnow().isoformat(),
+                        "chosen_model": used,
+                        "tried": tried,
+                        "preview_text": text[:400]
+                    }
+                    with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
+                        json.dump(debug, f, ensure_ascii=False, indent=2)
                 except Exception:
-                    core = None
-            data = core if core else {"raw": text}
+                    pass
 
-            # 디버그 로그 남기기
-            try:
-                debug = {
-                    "ts": datetime.datetime.utcnow().isoformat(),
-                    "chosen_model": mname,
-                    "tried": tried,
-                    "preview_text": text[:400]
-                }
-                with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
-                    json.dump(debug, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
+                outp = OUTPUT_DIR / 'agent2_result.json'
+                with open(outp, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                print('✅ Agent-2 결과 저장:', outp)
+                return data
+        except Exception as e:
+            tried.append({"model": mname, "error": str(e)})
 
-            outp = OUTPUT_DIR / 'agent2_result.json'
-            with open(outp, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            print('✅ Agent-2 결과 저장:', outp)
-            return data
-
-    # 여기까지 오면 text를 못 받았음 = 세이프티/쿼터/모델 이슈 가능
-    # 폴백: '데이터 보강 제안' 카드 1개를 반환하여 앱이 죽지 않도록 함
+    # 모두 실패 → 폴백(앱 다운 방지)
     fallback = {
         "recommendations": [{
             "title": "데이터 보강 제안",
-            "what": "입력 데이터의 표본 또는 규칙이 부족하여 카드 생성을 보류합니다.",
-            "when": "데이터 업데이트 후 재시도",
+            "what": "모델 가용성/세이프티/쿼터로 카드 생성을 보류합니다.",
+            "when": "환경 확인 후 재시도",
             "where": ["대시보드"],
-            "how": ["데이터 기간 확장", "날씨/행사 데이터 업로드", "질문 길이 축소"],
+            "how": ["2.5 flash 가용성 확인", "API 키/쿼터 확인", "프롬프트 길이 축소"],
             "copy": ["데이터를 조금만 더 주세요!"],
             "kpi": {"target": "revisit_rate", "expected_uplift": None, "range": [None, None]},
-            "risks": ["LLM 안전 필터/쿼터/모델 가용성으로 인한 응답 제한"],
-            "checklist": ["API 키/쿼터 확인", "모델 가용성 점검", "프롬프트 길이 줄이기"],
-            "evidence": ["세이프티/가용성으로 응답 불가 → gemini_debug.json 참조"]
+            "risks": ["LLM 안전 필터/쿼터/모델 가용성"],
+            "checklist": ["App secrets 확인", "list_models() 결과에서 2.5 flash 검색"],
+            "evidence": ["gemini_debug.json의 tried 로그 참고"]
         }]
     }
     try:
-        debug = {
-            "ts": datetime.datetime.utcnow().isoformat(),
-            "chosen_model": None,
-            "tried": tried
-        }
         with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
-            json.dump(debug, f, ensure_ascii=False, indent=2)
+            json.dump({"tried": tried}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
     outp = OUTPUT_DIR / 'agent2_result.json'
     with open(outp, 'w', encoding='utf-8') as f:
         json.dump(fallback, f, ensure_ascii=False, indent=2)
-    print('⚠️ Agent-2: 텍스트 없음 → 폴백 카드 반환')
+    print('⚠️ Agent-2: 2.5 flash 가용성/세이프티 문제 → 폴백 카드 반환')
     return fallback
 
 def main():
