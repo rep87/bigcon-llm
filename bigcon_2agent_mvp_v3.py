@@ -7,7 +7,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-DATA_DIR = Path('/content/bigcon')
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = APP_ROOT / 'data'
 SHINHAN_DIR = DATA_DIR / 'shinhan'
 EXTERNAL_DIR = DATA_DIR / 'external'
 OUTPUT_DIR = DATA_DIR / 'outputs'
