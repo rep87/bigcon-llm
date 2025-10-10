@@ -282,7 +282,7 @@ def build_agent2_prompt(agent1_json):
 """
     return guide
 
-def call_gemini_agent2(prompt_text, model_name='gemini-1.5-flash'):
+def call_gemini_agent2(prompt_text, model_name='models/gemini-1.5-flash-001'):
     """
     빈 응답/세이프티 블록 방지용 견고화:
     - model fallback (1.5-flash → 1.5-flash-latest → 1.5-pro-latest)
@@ -364,7 +364,12 @@ def call_gemini_agent2(prompt_text, model_name='gemini-1.5-flash'):
         return text, info, resp
 
     tried = []
-    for mname in [model_name, "gemini-1.5-flash-latest", "gemini-1.5-pro-latest"]:
+    for mname in [
+    model_name,  # 아래 기본값도 바꿔줄 거예요.
+    "models/gemini-1.5-flash-latest",
+    "models/gemini-1.5-pro-001",       # 안정
+    "models/gemini-1.5-pro-latest",
+]:
         text, info, resp = _run_once(mname)
         tried.append({"model": mname, "has_text": bool(text), "meta": info})
         if text:
