@@ -2,7 +2,8 @@
 # BIGCON 2-Agent MVP (Colab, Gemini API) — v3 (fits actual 3-dataset structure)
 # %pip -q install google-generativeai pandas openpyxl
 
-import os, json, re, random, sys, glob
+import os, json, re, random, sys, glob, datetime
+import unicodedata
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -23,6 +24,26 @@ random.seed(SEED); np.random.seed(SEED)
 _SCHEMA_CACHE = None
 _SCHEMA_VALIDATOR = None
 
+
+def _normalize_str(value: str) -> str:
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKC", str(value))
+    return re.sub(r"\s+", "", text)
+
+
+def _wildcard_to_regex(masked: str | None) -> re.Pattern | None:
+    if not masked:
+        return None
+    normalized = _normalize_str(masked)
+    if not normalized:
+        return None
+    pattern = "".join(".*" if ch == "*" else re.escape(ch) for ch in normalized)
+    try:
+        return re.compile(f"^{pattern}")
+    except re.error:
+        return None
+
 def load_actioncard_schema():
     global _SCHEMA_CACHE, _SCHEMA_VALIDATOR
     if _SCHEMA_CACHE is not None and _SCHEMA_VALIDATOR is not None:
@@ -42,6 +63,26 @@ def read_csv_smart(path):
             continue
     return pd.read_csv(path, encoding='utf-8', errors='replace')
 
+
+def normalize_rate_series(series: pd.Series | None) -> pd.Series | None:
+    if series is None:
+        return series
+    cleaned = (
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.replace("−", "-", regex=False)
+    )
+    cleaned = cleaned.str.replace(r"[^0-9\-.]", "", regex=True)
+    numeric = pd.to_numeric(cleaned, errors='coerce')
+    if numeric is None:
+        return None
+    scaled = numeric.copy()
+    mask = scaled.notna() & (scaled.abs() <= 1)
+    scaled.loc[mask] = scaled.loc[mask] * 100
+    scaled.loc[(scaled < 0) | (scaled > 100)] = np.nan
+    return scaled
+
 def ym_to_date(ym_series):
     s = pd.to_datetime(ym_series.astype(str) + '01', format='%Y%m%d', errors='coerce')
     return s
@@ -58,10 +99,14 @@ def load_set1(shinhan_dir):
         elif ('ZCD' in cu) or ('BZN' in cu) or ('업종' in cu): ren[c] = 'CATEGORY'
         elif cu == 'MCT_NM':    ren[c] = 'MCT_NM'
     df = df.rename(columns=ren)
+    df = df.loc[:, ~df.columns.duplicated()]
     keep = ['ENCODED_MCT','MCT_NM','ADDR_BASE','SIGUNGU','CATEGORY']
     for k in keep:
         if k not in df.columns: df[k] = np.nan
-    return df[keep].drop_duplicates('ENCODED_MCT')
+    df = df[keep].drop_duplicates('ENCODED_MCT')
+    if 'ENCODED_MCT' in df.columns:
+        df['ENCODED_MCT'] = df['ENCODED_MCT'].apply(lambda v: str(v).strip() if pd.notna(v) else '')
+    return df
 
 def load_set2(shinhan_dir):
     p = shinhan_dir / 'big_data_set2_f.csv'
@@ -85,7 +130,17 @@ def load_set3(shinhan_dir):
     for c in keep_cols:
         if c not in df.columns:
             df[c] = np.nan
-    return df[keep_cols]
+    df = df[keep_cols]
+    rate_cols = [
+        'M12_MAL_1020_RAT','M12_MAL_30_RAT','M12_MAL_40_RAT','M12_MAL_50_RAT','M12_MAL_60_RAT',
+        'M12_FME_1020_RAT','M12_FME_30_RAT','M12_FME_40_RAT','M12_FME_50_RAT','M12_FME_60_RAT',
+        'MCT_UE_CLN_REU_RAT','MCT_UE_CLN_NEW_RAT',
+        'RC_M1_SHC_RSD_UE_CLN_RAT','RC_M1_SHC_WP_UE_CLN_RAT','RC_M1_SHC_FLP_UE_CLN_RAT'
+    ]
+    for col in rate_cols:
+        if col in df.columns:
+            df[col] = normalize_rate_series(df[col])
+    return df
 
 def load_weather_monthly(external_dir):
     f = None
@@ -129,8 +184,8 @@ def load_weather_monthly(external_dir):
     monthly['_date'] = pd.to_datetime(monthly['TA_YM'] + '01', format='%Y%m%d', errors='coerce')
     return monthly[['TA_YM','_date','RAIN_SUM']]
 
-def build_panel(shinhan_dir):
-    s1 = load_set1(shinhan_dir)
+def build_panel(shinhan_dir, merchants_df=None):
+    s1 = merchants_df if merchants_df is not None else load_set1(shinhan_dir)
     s2 = load_set2(shinhan_dir)
     s3 = load_set3(shinhan_dir)
     m23 = pd.merge(s2, s3, on=['ENCODED_MCT','TA_YM','_date'], how='outer', suffixes=('_s2',''))
@@ -144,45 +199,203 @@ def build_panel(shinhan_dir):
         panel['YOUTH_SHARE'] = np.nan
     panel['REVISIT_RATE'] = pd.to_numeric(panel.get('MCT_UE_CLN_REU_RAT', np.nan), errors='coerce')
     panel['NEW_RATE'] = pd.to_numeric(panel.get('MCT_UE_CLN_NEW_RAT', np.nan), errors='coerce')
-    panel.rename(columns={'ENCODED_MCT':'_merchant_id', 'CATEGORY':'_category'}, inplace=True)
+    panel.rename(columns={'ENCODED_MCT':'_merchant_id'}, inplace=True)
+    if '_merchant_id' in panel.columns:
+        panel['_merchant_id'] = panel['_merchant_id'].astype(str)
     return panel
 
+
+def resolve_merchant(masked_name: str | None, sigungu: str | None, industry_label: str | None, merchants_df: pd.DataFrame | None):
+    if merchants_df is None or merchants_df.empty:
+        return None
+
+    df = merchants_df.copy()
+    df['_norm_name'] = df['MCT_NM'].apply(_normalize_str)
+    df['_norm_sigungu'] = df['SIGUNGU'].apply(_normalize_str)
+    df['_norm_category'] = df['CATEGORY'].apply(_normalize_str)
+
+    log_context = {
+        'masked_name': masked_name,
+        'sigungu': sigungu,
+        'industry_label': industry_label,
+    }
+
+    candidates = df
+    norm_sigungu = _normalize_str(sigungu) if sigungu else ""
+    sigungu_filter_count = len(candidates)
+    if norm_sigungu:
+        exact = df[df['_norm_sigungu'] == norm_sigungu]
+        if not exact.empty:
+            candidates = exact
+        else:
+            partial = df[df['_norm_sigungu'].str.contains(norm_sigungu, na=False)]
+            if not partial.empty:
+                candidates = partial
+        sigungu_filter_count = len(candidates)
+
+    norm_industry = _normalize_str(industry_label) if industry_label else ""
+    category_filter_count = len(candidates)
+    if norm_industry:
+        narrowed = candidates[candidates['_norm_category'].str.contains(norm_industry, na=False)]
+        if narrowed.empty:
+            tokens = [t for t in re.split(r'[-/,&]', norm_industry) if t]
+            token_matches = []
+            for token in tokens:
+                sub = candidates[candidates['_norm_category'].str.contains(token, na=False)]
+                if not sub.empty:
+                    token_matches.append(sub)
+            if token_matches:
+                candidates = pd.concat(token_matches).drop_duplicates('ENCODED_MCT')
+        else:
+            candidates = narrowed
+        category_filter_count = len(candidates)
+
+    pattern = _wildcard_to_regex(masked_name)
+    name_core = _normalize_str(masked_name.replace('*', '')) if masked_name else ""
+    name_regex = pattern.pattern if pattern else None
+
+    def _score(row):
+        score = 0.0
+        if norm_sigungu:
+            if row['_norm_sigungu'] == norm_sigungu:
+                score += 4.0
+            elif norm_sigungu in row['_norm_sigungu']:
+                score += 2.0
+        if norm_industry:
+            tokens = [t for t in re.split(r'[-/,&]', norm_industry) if t]
+            for token in tokens:
+                if token and token in row['_norm_category']:
+                    score += 1.5
+        if masked_name:
+            name = row['_norm_name']
+            if pattern and pattern.match(name):
+                score += 10.0
+            elif pattern and pattern.search(name):
+                score += 6.0
+            if name_core and name_core in name:
+                score += 3.0
+        return score
+
+    scored = candidates.copy()
+    scored['__score'] = scored.apply(_score, axis=1)
+    if masked_name and scored['__score'].max() <= 0:
+        scored = df.copy()
+        scored['__score'] = scored.apply(_score, axis=1)
+        sigungu_filter_count = len(df)
+        category_filter_count = len(df)
+
+    top = scored.sort_values(['__score', 'ENCODED_MCT'], ascending=[False, True]).head(1)
+    name_match_count = 0
+    if pattern is not None and '_norm_name' in scored:
+        name_match_count = int(scored['_norm_name'].apply(lambda v: bool(pattern.match(v))).sum())
+
+    candidate_preview = []
+    for _, row in scored.sort_values('__score', ascending=False).head(3).iterrows():
+        candidate_preview.append({
+            'ENCODED_MCT': row['ENCODED_MCT'],
+            'MCT_NM': row['MCT_NM'],
+            'SIGUNGU': row['SIGUNGU'],
+            'CATEGORY': row['CATEGORY'],
+            'score': float(row['__score']) if pd.notna(row['__score']) else None,
+        })
+
+    print(
+        "🧭 resolve_phase:",
+        json.dumps({
+            'input': log_context,
+            'sigungu_filter_count': sigungu_filter_count,
+            'category_filter_count': category_filter_count,
+            'name_regex': name_regex,
+            'name_match_count': name_match_count,
+            'candidates': candidate_preview,
+        }, ensure_ascii=False)
+    )
+
+    if top.empty or top.iloc[0]['__score'] <= 0:
+        print("⚠️ resolve_merchant: 가맹점 미일치 — 규칙 완화 필요")
+        return None
+    best = top.iloc[0]
+    resolved = {
+        'encoded_mct': best['ENCODED_MCT'],
+        'masked_name': best['MCT_NM'],
+        'address': best.get('ADDR_BASE'),
+        'sigungu': best.get('SIGUNGU'),
+        'category': best.get('CATEGORY'),
+        'score': float(best['__score']) if pd.notna(best['__score']) else None,
+    }
+    print("✅ resolved_merchant_id:", resolved['encoded_mct'])
+    return resolved
+
 def parse_question(q):
-    q = (q or '').lower()
+    original = q or ''
+    lower_q = original.lower()
     age_cond = None
-    if '10대' in q or 'teen' in q or re.search(r'\b1[0-9]\b', q):
+    if '10대' in original or 'teen' in lower_q or re.search(r'\b1[0-9]\b', lower_q):
         age_cond = ('<=', 19)
-    if '20대' in q or '20s' in q or 'twenties' in q:
-        if ('이하' in q) or ('under' in q) or ('<=' in q):
+    if '20대' in original or '20s' in lower_q or 'twenties' in lower_q:
+        if ('이하' in original) or ('under' in lower_q) or ('<=' in lower_q):
             age_cond = ('<=', 20)
         else:
             age_cond = ('range', (20,29))
-    if '청소년' in q:
+    if '청소년' in original:
         age_cond = ('<=', 19)
 
     weather = None
-    if ('비' in q) or ('우천' in q) or ('rain' in q):
+    if ('비' in original) or ('우천' in original) or ('rain' in lower_q):
         weather = 'rain'
-    elif ('맑' in q) or ('sunny' in q) or ('clear' in q):
+    elif ('맑' in original) or ('sunny' in lower_q) or ('clear' in lower_q):
         weather = 'clear'
-    elif ('눈' in q) or ('snow' in q):
+    elif ('눈' in original) or ('snow' in lower_q):
         weather = 'snow'
 
     months = DEFAULT_MONTHS
-    if '이번달' in q or 'this month' in q:
+    weeks_requested = None
+    week_match = re.search(r'(\d+)\s*주', original)
+    if week_match:
+        try:
+            weeks_requested = int(week_match.group(1))
+        except ValueError:
+            weeks_requested = None
+        if weeks_requested and weeks_requested > 0:
+            months = max(1, round(weeks_requested / 4))
+    if '이번달' in original or 'this month' in lower_q:
         months = 1
-    elif ('한달' in q) or ('1달' in q) or ('month' in q):
+    elif ('한달' in original) or ('1달' in original) or ('month' in lower_q):
         months = 1
-    elif '분기' in q or 'quarter' in q:
+    elif '분기' in original or 'quarter' in lower_q:
         months = 3
 
     industry = None
-    if ('카페' in q) or ('커피' in q):
+    if ('카페' in original) or ('커피' in original):
         industry = 'cafe'
-    elif ('요식' in q) or ('restaurant' in q) or ('식당' in q):
+    elif ('요식' in original) or ('restaurant' in lower_q) or ('식당' in original):
         industry = 'restaurant'
 
-    return {'age_cond': age_cond, 'weather': weather, 'months': months, 'industry': industry}
+    merchant_pattern = re.search(r'(?P<sigungu>[\w\s가-힣]+구)\s+(?P<name>[\w가-힣\*]+)\s*\((?P<industry>[^\)]+)\)', original)
+    merchant_info = {'masked_name': None, 'sigungu': None, 'industry_label': None}
+    if merchant_pattern:
+        merchant_info = {
+            'masked_name': merchant_pattern.group('name').strip(),
+            'sigungu': merchant_pattern.group('sigungu').strip(),
+            'industry_label': merchant_pattern.group('industry').strip(),
+        }
+
+    explicit_id = None
+    trimmed = original.strip()
+    if re.fullmatch(r'[A-Z0-9]{10,12}', trimmed):
+        explicit_id = trimmed
+
+    return {
+        'age_cond': age_cond,
+        'weather': weather,
+        'months': months,
+        'weeks_requested': weeks_requested,
+        'industry': industry,
+        'merchant_masked_name': merchant_info['masked_name'],
+        'merchant_sigungu': merchant_info['sigungu'],
+        'merchant_industry_label': merchant_info['industry_label'],
+        'merchant_explicit_id': explicit_id,
+    }
 
 def subset_period(panel, months=DEFAULT_MONTHS):
     if panel['_date'].isna().all():
@@ -195,23 +408,98 @@ def kpi_summary(panel_sub):
     if panel_sub.empty:
         return {}
     latest_idx = panel_sub.groupby('_merchant_id')['_date'].idxmax()
-    snap = panel_sub.loc[latest_idx]
-    youth_mean = snap['YOUTH_SHARE'].mean(skipna=True)
-    revisit_mean = snap['REVISIT_RATE'].mean(skipna=True)
-    new_mean = snap['NEW_RATE'].mean(skipna=True)
-    age_cols = [c for c in snap.columns if re.match(r'M12_(MAL|FME)_(1020|30|40|50|60)_RAT', c)]
-    top_age = None
-    if age_cols:
-        means = snap[age_cols].mean(numeric_only=True).sort_values(ascending=False)
-        if len(means)>0:
-            top_age = means.index[0]
-    return {
-        'youth_share_avg': float(youth_mean) if pd.notna(youth_mean) else None,
-        'revisit_rate_avg': float(revisit_mean) if pd.notna(revisit_mean) else None,
-        'new_rate_avg': float(new_mean) if pd.notna(new_mean) else None,
-        'top_age_segment': top_age,
-        'n_merchants': int(snap['_merchant_id'].nunique())
+    snap = panel_sub.loc[latest_idx].sort_values('_date', ascending=False)
+
+    def _safe_float(val):
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return None
+        return f
+
+    def _clean_pct(val):
+        if val is None or pd.isna(val):
+            return None
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return None
+        if f < 0 or f > 100:
+            return None
+        return round(f, 1)
+
+    detail_row = snap.iloc[0]
+    youth_latest = _safe_float(detail_row.get('YOUTH_SHARE'))
+    revisit_latest = _safe_float(detail_row.get('REVISIT_RATE'))
+    new_latest = _safe_float(detail_row.get('NEW_RATE'))
+
+    age_labels = {
+        '1020': '청년(10-20)',
+        '30': '30대',
+        '40': '40대',
+        '50': '50대',
+        '60': '60대',
     }
+    age_distribution = []
+    for code, label in age_labels.items():
+        cols = [f'M12_MAL_{code}_RAT', f'M12_FME_{code}_RAT']
+        vals = pd.to_numeric(pd.Series([detail_row.get(c) for c in cols]), errors='coerce')
+        total = vals.sum(skipna=True)
+        if pd.notna(total):
+            cleaned = _clean_pct(total)
+            if cleaned is not None:
+                age_distribution.append({'code': code, 'label': label, 'value': cleaned})
+    age_distribution.sort(key=lambda x: x['value'], reverse=True)
+
+    customer_mix_map = [
+        ('유동', 'RC_M1_SHC_FLP_UE_CLN_RAT'),
+        ('거주', 'RC_M1_SHC_RSD_UE_CLN_RAT'),
+        ('직장', 'RC_M1_SHC_WP_UE_CLN_RAT'),
+    ]
+    customer_mix_detail = {}
+    for label, col in customer_mix_map:
+        customer_mix_detail[label] = _clean_pct(_safe_float(detail_row.get(col)))
+
+    ticket_band_raw = detail_row.get('APV_CE_RAT')
+    ticket_band = None
+    if isinstance(ticket_band_raw, str):
+        parts = ticket_band_raw.split('_', 1)
+        ticket_band = parts[-1].strip() if parts else ticket_band_raw.strip()
+    elif pd.notna(ticket_band_raw):
+        ticket_band = str(ticket_band_raw)
+
+    sanitized = {
+        'youth_share_avg': _clean_pct(youth_latest),
+        'revisit_rate_avg': _clean_pct(revisit_latest),
+        'new_rate_avg': _clean_pct(new_latest),
+        'age_distribution': age_distribution,
+        'age_top_segments': age_distribution[:3],
+        'customer_mix_detail': customer_mix_detail,
+        'avg_ticket_band_label': ticket_band,
+        'n_merchants': int(snap['_merchant_id'].nunique()),
+    }
+
+    raw_cols = [
+        'MCT_UE_CLN_REU_RAT',
+        'MCT_UE_CLN_NEW_RAT',
+        'M12_MAL_1020_RAT',
+        'M12_FME_1020_RAT',
+        'RC_M1_SHC_FLP_UE_CLN_RAT',
+        'RC_M1_SHC_RSD_UE_CLN_RAT',
+        'RC_M1_SHC_WP_UE_CLN_RAT',
+    ]
+    raw_snapshot = {col: detail_row.get(col) for col in raw_cols}
+    raw_snapshot['TA_YM'] = detail_row.get('TA_YM')
+    raw_snapshot['_date'] = str(detail_row.get('_date'))
+    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
+    print("✅ KPI sanitized:", json.dumps({
+        'revisit_pct': sanitized['revisit_rate_avg'],
+        'new_pct': sanitized['new_rate_avg'],
+        'youth_pct': sanitized['youth_share_avg'],
+        'customer_mix_detail': sanitized['customer_mix_detail'],
+    }, ensure_ascii=False))
+
+    return sanitized
 
 def weather_effect(panel_sub, wx_monthly):
     if (wx_monthly is None) or panel_sub.empty or ('REVISIT_RATE' not in panel_sub):
@@ -224,9 +512,68 @@ def weather_effect(panel_sub, wx_monthly):
     return {'metric':'REVISIT_RATE','effect':float(corr), 'ci':[None,None], 'note':'피어슨 상관(월단위)'}
 
 def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR):
-    panel = build_panel(shinhan_dir)
+    merchants_df = load_set1(shinhan_dir)
+    panel = build_panel(shinhan_dir, merchants_df=merchants_df)
     qinfo = parse_question(question)
-    sub = subset_period(panel, months=qinfo['months'])
+
+    run_id = datetime.datetime.utcnow().isoformat()
+    parse_log = {
+        'merchant_mask': qinfo.get('merchant_masked_name'),
+        'sigungu': qinfo.get('merchant_sigungu'),
+        'industry_label': qinfo.get('merchant_industry_label'),
+        'explicit_id': qinfo.get('merchant_explicit_id'),
+    }
+    print("🆔 agent1_run:", run_id)
+    print("🧾 question_fields:", json.dumps(parse_log, ensure_ascii=False))
+
+    merchant_match = None
+    explicit_id = qinfo.get('merchant_explicit_id')
+    if explicit_id:
+        lookup = merchants_df[merchants_df['ENCODED_MCT'] == explicit_id]
+        print(
+            "🏷 explicit_id_lookup:",
+            json.dumps({'explicit_id': explicit_id, 'row_count': int(len(lookup))}, ensure_ascii=False),
+        )
+        if not lookup.empty:
+            row = lookup.iloc[0]
+            merchant_match = {
+                'encoded_mct': str(row['ENCODED_MCT']),
+                'masked_name': row.get('MCT_NM'),
+                'address': row.get('ADDR_BASE'),
+                'sigungu': row.get('SIGUNGU'),
+                'category': row.get('CATEGORY'),
+                'score': None,
+            }
+
+    if merchant_match is None:
+        merchant_match = resolve_merchant(
+            qinfo.get('merchant_masked_name'),
+            qinfo.get('merchant_sigungu'),
+            qinfo.get('merchant_industry_label'),
+            merchants_df,
+        )
+
+    if merchant_match and merchant_match.get('encoded_mct') is not None:
+        merchant_match['encoded_mct'] = str(merchant_match['encoded_mct'])
+
+    merchants_covered_before = int(panel['_merchant_id'].nunique()) if '_merchant_id' in panel.columns else 0
+    panel_focus = panel
+    target_id = None
+    if merchant_match and merchant_match.get('encoded_mct'):
+        target_id = merchant_match['encoded_mct']
+        panel_focus = panel[panel['_merchant_id'] == target_id]
+    merchants_covered_after = int(panel_focus['_merchant_id'].nunique()) if '_merchant_id' in panel_focus.columns else 0
+    print(
+        "📦 panel_filter:",
+        json.dumps({
+            'before': merchants_covered_before,
+            'after': merchants_covered_after,
+            'target_id': target_id,
+        }, ensure_ascii=False),
+    )
+    print("🏁 merchant_match:", json.dumps(merchant_match, ensure_ascii=False))
+
+    sub = subset_period(panel_focus, months=qinfo['months'])
 
     wxm = None
     try:
@@ -245,21 +592,41 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
     if wxm is None and qinfo['weather'] is not None:
         notes.append('날씨 데이터 부재: 날씨 관련 효과는 추정하지 못했습니다.')
         quality = 'low'
+    if merchant_match is None:
+        notes.append('질문과 일치하는 가맹점을 찾지 못해 전체 표본을 사용했습니다.')
+        quality = 'low'
+
+    merchant_query = {
+        'masked_name': qinfo.get('merchant_masked_name'),
+        'sigungu': qinfo.get('merchant_sigungu'),
+        'industry_label': qinfo.get('merchant_industry_label'),
+    }
 
     out = {
-        'context': {'intent': question, 'parsed': qinfo},
+        'context': {
+            'intent': question,
+            'parsed': qinfo,
+            'merchant_query': merchant_query,
+            'run_id': run_id,
+        },
         'kpis': kpis,
         'weather_effect': wfx,
         'limits': notes,
         'quality': quality,
         'period': {
             'max_date': str(panel['_date'].max() if '_date' in panel.columns else None),
-            'months': qinfo['months']
+            'months': qinfo['months'],
+            'weeks_requested': qinfo.get('weeks_requested'),
         },
         'sample': {
             'merchants_covered': int(sub['_merchant_id'].nunique()) if not sub.empty else 0
         }
     }
+
+    if merchant_match:
+        out['context']['merchant'] = merchant_match
+        out['context']['merchant_masked_name'] = merchant_match.get('masked_name')
+
     out_path = OUTPUT_DIR / 'agent1_output.json'
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
@@ -535,7 +902,7 @@ def main():
         except Exception:
             q = None
     if not q:
-        q = '20대 이하 고객 비중이 높은 매장을 대상으로 이번달 마케팅 채널과 메시지를 추천해줘.'
+        q = '성동구 고향*** (한식-찌개/전골) 가맹점 기준으로, 재방문율을 4주 안에 높일 실행카드 제시해줘.'
         print('ℹ️ 질문이 없어 기본 예시를 사용합니다:', q)
 
     try:

@@ -46,8 +46,8 @@ def _format_percent(value) -> str:
         num = float(value)
     except (TypeError, ValueError):
         return "—"
-    if abs(num) <= 1:
-        num *= 100
+    if num < 0 or num > 100:
+        return "—"
     return f"{num:.1f}%"
 
 
@@ -76,31 +76,61 @@ def _humanize_age_segment(code: str) -> str:
 def _collect_major_customers(agent1_json: dict) -> str:
     kpis = (agent1_json or {}).get("kpis", {})
     segments = []
-    top_seg = kpis.get("top_age_segment")
-    human = _humanize_age_segment(top_seg)
-    if human:
-        segments.append(human)
-    youth_share = kpis.get("youth_share_avg")
-    if youth_share is not None:
-        segments.append(f"청년 {_format_percent(youth_share)}")
+    age_segments = kpis.get("age_top_segments") or []
+    for item in age_segments[:3]:
+        label = item.get("label") if isinstance(item, dict) else None
+        value = item.get("value") if isinstance(item, dict) else None
+        if label and value is not None:
+            segments.append(f"{label} {_format_percent(value)}")
+    if not segments:
+        top_seg = kpis.get("top_age_segment")
+        human = _humanize_age_segment(top_seg)
+        if human:
+            segments.append(human)
+        youth_share = kpis.get("youth_share_avg")
+        if youth_share is not None:
+            segments.append(f"청년 {_format_percent(youth_share)}")
     unique = []
     for item in segments:
         if item and item not in unique:
             unique.append(item)
-    return " · ".join(unique[:3]) if unique else "—"
+    return ", ".join(unique[:3]) if unique else "—"
+
+
+def _format_customer_mix(detail: dict | None) -> str:
+    if not detail or not isinstance(detail, dict):
+        return "—"
+    ordered_labels = ["유동", "거주", "직장"]
+    parts = []
+    for label in ordered_labels:
+        value = detail.get(label)
+        if value is not None:
+            percent = _format_percent(value)
+            if percent != "—":
+                parts.append(f"{label} {percent}")
+    for label, value in detail.items():
+        if label in ordered_labels:
+            continue
+        if value is None:
+            continue
+        percent = _format_percent(value)
+        if percent != "—":
+            parts.append(f"{label} {percent}")
+    return ", ".join(parts[:3]) if parts else "—"
 
 
 def _collect_overview_row(agent1_json: dict) -> pd.DataFrame:
     context = (agent1_json or {}).get("context", {})
     parsed = context.get("parsed", {})
-    industry_code = parsed.get("industry") or context.get("industry")
+    merchant = context.get("merchant", {})
+    industry_candidate = merchant.get("category") or parsed.get("merchant_industry_label") or parsed.get("industry")
     industry_labels = {
         "cafe": "카페",
         "restaurant": "음식점",
         "retail": "소매"
     }
-    industry = industry_labels.get(industry_code, industry_code or "—")
-    addr = context.get("address_masked") or context.get("address") or context.get("addr_base")
+    industry = industry_labels.get(industry_candidate, industry_candidate or "—")
+    addr = merchant.get("address") or context.get("address_masked") or context.get("address") or context.get("addr_base")
     if isinstance(addr, (list, tuple)):
         addr = " / ".join([str(v) for v in addr if v])
     address = addr if addr else "—"
@@ -108,15 +138,21 @@ def _collect_overview_row(agent1_json: dict) -> pd.DataFrame:
     kpis = (agent1_json or {}).get("kpis", {})
     new_rate = kpis.get("new_rate_avg")
     revisit_rate = kpis.get("revisit_rate_avg")
-    if new_rate is not None or revisit_rate is not None:
-        new_text = _format_percent(new_rate)
-        revisit_text = _format_percent(revisit_rate)
-        new_revisit = f"신규 {new_text} / 재방문 {revisit_text}"
-    else:
+    new_text = _format_percent(new_rate)
+    revisit_text = _format_percent(revisit_rate)
+    if new_text == "—" and revisit_text == "—":
         new_revisit = "—"
+    else:
+        new_revisit = f"신규 {new_text} / 재방문 {revisit_text}"
 
-    customer_type = context.get("customer_mix") or kpis.get("customer_mix") or "—"
-    spend_band = kpis.get("avg_ticket_band") or context.get("avg_ticket_band") or "—"
+    customer_mix_detail = kpis.get("customer_mix_detail")
+    customer_type = _format_customer_mix(customer_mix_detail)
+    spend_band = kpis.get("avg_ticket_band_label") or context.get("avg_ticket_band") or "—"
+    if isinstance(spend_band, str):
+        spend_band = spend_band.strip()
+        spend_band = re.sub(r"(상위)(\d)", r"\1 \2", spend_band)
+    elif spend_band is None:
+        spend_band = "—"
 
     data = {
         "업종": industry,
@@ -131,47 +167,58 @@ def _collect_overview_row(agent1_json: dict) -> pd.DataFrame:
 
 def _build_diagnosis(agent1_json: dict) -> str:
     kpis = (agent1_json or {}).get("kpis", {})
-    weather = (agent1_json or {}).get("weather_effect", {})
-    parts = []
-    youth = kpis.get("youth_share_avg")
-    if youth is not None:
-        parts.append(f"청년 비중 {_format_percent(youth)}")
-    new_rate = kpis.get("new_rate_avg")
-    revisit_rate = kpis.get("revisit_rate_avg")
-    if new_rate is not None and revisit_rate is not None:
-        parts.append(f"신규 {_format_percent(new_rate)} · 재방문 {_format_percent(revisit_rate)}")
-    elif new_rate is not None:
-        parts.append(f"신규 {_format_percent(new_rate)}")
-    elif revisit_rate is not None:
-        parts.append(f"재방문 {_format_percent(revisit_rate)}")
-    effect = weather.get("effect")
-    if effect is not None:
-        try:
-            eff_val = float(effect)
-            trend = "우천 시 감소" if eff_val < 0 else "우천 시 증가"
-            parts.append(f"월별 비·재방문 상관 {eff_val:.2f} → {trend} 경향")
-        except (TypeError, ValueError):
-            pass
-    if not parts:
+    sentences = []
+
+    mix_detail = kpis.get("customer_mix_detail")
+    mix_items = []
+    if isinstance(mix_detail, dict):
+        sorted_mix = sorted(
+            [(label, val) for label, val in mix_detail.items() if val is not None],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        for label, value in sorted_mix[:2]:
+            percent = _format_percent(value)
+            if percent != "—":
+                mix_items.append(f"{label} {percent}")
+    if mix_items:
+        sentences.append(" · ".join(mix_items) + " 고객 구성입니다.")
+
+    rate_parts = []
+    new_text = _format_percent(kpis.get("new_rate_avg"))
+    revisit_text = _format_percent(kpis.get("revisit_rate_avg"))
+    youth_text = _format_percent(kpis.get("youth_share_avg"))
+    if new_text != "—":
+        rate_parts.append(f"신규 {new_text}")
+    if revisit_text != "—":
+        rate_parts.append(f"재방문 {revisit_text}")
+    if youth_text != "—":
+        rate_parts.append(f"청년 고객 {youth_text}")
+    if rate_parts:
+        sentences.append(" · ".join(rate_parts) + "입니다.")
+
+    if not sentences:
         return "—"
-    first_sentence = " · ".join(parts[:2]) + "."
-    if len(parts) <= 2:
-        return first_sentence
-    return first_sentence + " " + " ".join(parts[2:]) + "."
+    return " ".join(sentences[:2])
 
 
 def _build_goal_lines(agent1_json: dict) -> tuple[str, list[str]]:
     period = (agent1_json or {}).get("period", {})
     months = period.get("months")
-    if months:
+    weeks_requested = period.get("weeks_requested")
+    if weeks_requested:
         try:
-            weeks = int(float(months) * 4)
+            weeks_val = int(weeks_requested)
         except (TypeError, ValueError):
-            weeks = None
-        if weeks and weeks > 0:
-            period_text = f"최근 {months}개월 (약 {weeks}주)"
+            weeks_val = None
+        if weeks_val and months:
+            period_text = f"향후 {weeks_val}주 (약 {months}개월)"
+        elif weeks_val:
+            period_text = f"향후 {weeks_val}주"
         else:
-            period_text = f"최근 {months}개월"
+            period_text = "기간 정보 —"
+    elif months:
+        period_text = f"최근 {months}개월"
     else:
         period_text = "기간 정보 —"
 
@@ -233,7 +280,15 @@ def render_summary_view(agent1_json: dict, agent2_json: dict) -> None:
     merchant_title = _extract_merchant_name(agent1_json)
     st.header(f"📊 {merchant_title} 가맹점 방문 고객 현황 분석")
 
+    context = (agent1_json or {}).get("context", {})
+    if context and not context.get("merchant"):
+        st.warning("질문과 정확히 일치하는 가맹점을 찾지 못해 표본 전체 요약을 보여드립니다.")
+
     overview_df = _collect_overview_row(agent1_json)
+    try:
+        print("📊 overview_table:", json.dumps(overview_df.to_dict(orient="records"), ensure_ascii=False))
+    except Exception:
+        pass
     st.subheader("현황 표")
     st.table(overview_df)
 
