@@ -6,17 +6,33 @@ import os, json, re, random, sys, glob
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from jsonschema import Draft7Validator, ValidationError
 
 APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / 'data'
 SHINHAN_DIR = DATA_DIR / 'shinhan'
 EXTERNAL_DIR = DATA_DIR / 'external'
 OUTPUT_DIR = DATA_DIR / 'outputs'
+SCHEMA_PATH = APP_ROOT / 'schemas' / 'actioncard.schema.json'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MONTHS = 8
 SEED = 42
 random.seed(SEED); np.random.seed(SEED)
+
+_SCHEMA_CACHE = None
+_SCHEMA_VALIDATOR = None
+
+def load_actioncard_schema():
+    global _SCHEMA_CACHE, _SCHEMA_VALIDATOR
+    if _SCHEMA_CACHE is not None and _SCHEMA_VALIDATOR is not None:
+        return _SCHEMA_CACHE, _SCHEMA_VALIDATOR
+    if not SCHEMA_PATH.exists():
+        raise FileNotFoundError(f"스키마 파일을 찾을 수 없습니다: {SCHEMA_PATH}")
+    with open(SCHEMA_PATH, 'r', encoding='utf-8') as f:
+        _SCHEMA_CACHE = json.load(f)
+    _SCHEMA_VALIDATOR = Draft7Validator(_SCHEMA_CACHE)
+    return _SCHEMA_CACHE, _SCHEMA_VALIDATOR
 
 def read_csv_smart(path):
     for enc in ['utf-8', 'utf-8-sig', 'cp949', 'euc-kr', 'latin-1']:
@@ -251,34 +267,34 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
     return out
 
 def build_agent2_prompt(agent1_json):
-    schema = {
-      'recommendations': [{
-        'title':'string',
-        'what':'string',
-        'when':'string',
-        'where':['string'],
-        'how':['string'],
-        'copy':['string','string'],
-        'kpi':{'target':'string','expected_uplift':'float|null','range':['float|null','float|null']},
-        'risks':['string'],
-        'checklist':['string'],
-        'evidence':['string']
-      }]
-    }
-    guide = f"""당신은 소상공인 컨설턴트입니다. 아래 **데이터(JSON)**만 근거로 사용하여,
-반드시 **액션카드 스키마(JSON)**로만 답하세요. 외부 지식/새로운 수치 추정 금지.
+    try:
+        schema, _ = load_actioncard_schema()
+        schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
+    except Exception as e:
+        schema_text = json.dumps({"schema_error": str(e)}, ensure_ascii=False, indent=2)
+
+    rules = [
+        "Agent-1 JSON만 근거로 활용하고 외부 추정은 금지합니다.",
+        "모든 카드에 타겟 → 채널 → 방법 → 카피(2개 이상) → KPI → 리스크/완화 → 근거를 채웁니다.",
+        "근거 문장은 반드시 숫자+컬럼명+기간 형식이며 정보가 없으면 null 또는 '—'로 둡니다.",
+        "품질이 낮거나 데이터가 부족하면 마지막 카드에 '데이터 보강 제안'을 추가합니다.",
+        "상호명은 항상 마스킹된 형태로 유지합니다.",
+        "KPI.expected_uplift와 range는 근거가 있을 때만 값을 넣고, 없으면 null을 유지합니다."
+    ]
+
+    rules_text = "- " + "\n- ".join(rules)
+
+    guide = f"""당신은 한국어 소상공인 컨설턴트입니다. 아래 Agent-1 JSON만 근거로 사용하여,
+반드시 액션카드 스키마(JSON)로만 답하세요. 불확실한 수치는 null 또는 '—'로 남겨두세요.
+
+[출력 규칙]
+{rules_text}
 
 [액션카드 스키마(JSON)]
-{json.dumps(schema, ensure_ascii=False, indent=2)}
+{schema_text}
 
 [데이터(JSON)]
 {json.dumps(agent1_json, ensure_ascii=False, indent=2)}
-
-[출력 규칙]
-- What/When/Where/How/Copy/KPI/risks/checklist/evidence 모두 채우기.
-- KPI.expected_uplift와 range는 입력 JSON의 weather_effect나 kpis에서 유도 가능할 때만 사용(없으면 null).
-- evidence에는 지표명/값/기간 등 근거를 1~3줄로 요약.
-- quality=='low' 또는 limits 존재 시, '데이터 보강 제안' 카드를 맨 마지막에 추가.
 """
     return guide
 
@@ -384,42 +400,90 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
         info = _blocked_info(resp)
         return text, info, name
 
-    tried = []
-    for mname in candidates:
-        try:
-            text, info, used = _run_once(mname)
-            tried.append({"model": used, "has_text": bool(text), "meta": info})
-            if text:
-                # 텍스트에서 JSON 추출 시도
+    try:
+        _, schema_validator = load_actioncard_schema()
+        schema_error = None
+    except Exception as e:
+        schema_validator = None
+        schema_error = str(e)
+
+    all_attempt_logs = []
+    last_error = schema_error
+
+    for attempt in range(2):
+        attempt_logs = []
+        for mname in candidates:
+            try:
+                text, info, used = _run_once(mname)
+                log_entry = {"model": used, "has_text": bool(text), "meta": info}
+                if not text:
+                    log_entry["error"] = "empty_text"
+                    attempt_logs.append(log_entry)
+                    last_error = "LLM 응답이 비어 있습니다."
+                    continue
+
                 core = None
                 m = re.search(r"\{[\s\S]*\}", text)
                 if m:
                     try:
                         core = json.loads(m.group(0))
+                    except Exception as je:
+                        log_entry["error"] = f"json_parse_error: {je}"
+                        attempt_logs.append(log_entry)
+                        last_error = f"JSON 파싱 실패: {je}"
+                        continue
+                else:
+                    log_entry["error"] = "json_not_found"
+                    attempt_logs.append(log_entry)
+                    last_error = "응답에서 JSON 블록을 찾지 못했습니다."
+                    continue
+
+                if not isinstance(core, dict):
+                    log_entry["error"] = "json_not_object"
+                    attempt_logs.append(log_entry)
+                    last_error = "추출된 JSON이 객체 형식이 아닙니다."
+                    continue
+
+                validation_ok = True
+                if schema_validator is not None:
+                    try:
+                        schema_validator.validate(core)
+                    except ValidationError as ve:
+                        validation_ok = False
+                        log_entry["validation_error"] = ve.message
+                        last_error = f"스키마 검증 실패: {ve.message}"
+
+                if validation_ok:
+                    attempt_logs.append(log_entry)
+                    all_attempt_logs.append({"attempt": attempt + 1, "logs": attempt_logs})
+                    # 디버그 기록
+                    try:
+                        debug = {
+                            "ts": datetime.datetime.utcnow().isoformat(),
+                            "chosen_model": used,
+                            "attempts": all_attempt_logs,
+                            "preview_text": text[:400],
+                            "schema_error": schema_error
+                        }
+                        with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
+                            json.dump(debug, f, ensure_ascii=False, indent=2)
                     except Exception:
-                        core = None
-                data = core if core else {"raw": text}
+                        pass
 
-                # 디버그 기록
-                try:
-                    debug = {
-                        "ts": datetime.datetime.utcnow().isoformat(),
-                        "chosen_model": used,
-                        "tried": tried,
-                        "preview_text": text[:400]
-                    }
-                    with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
-                        json.dump(debug, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
+                    outp = OUTPUT_DIR / 'agent2_result.json'
+                    with open(outp, 'w', encoding='utf-8') as f:
+                        json.dump(core, f, ensure_ascii=False, indent=2)
+                    print('✅ Agent-2 결과 저장:', outp)
+                    return core
 
-                outp = OUTPUT_DIR / 'agent2_result.json'
-                with open(outp, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                print('✅ Agent-2 결과 저장:', outp)
-                return data
-        except Exception as e:
-            tried.append({"model": mname, "error": str(e)})
+                attempt_logs.append(log_entry)
+            except Exception as e:
+                attempt_logs.append({"model": mname, "error": str(e)})
+                last_error = str(e)
+
+        all_attempt_logs.append({"attempt": attempt + 1, "logs": attempt_logs})
+        if schema_validator is None:
+            break
 
     # 모두 실패 → 폴백(앱 다운 방지)
     fallback = {
@@ -433,12 +497,21 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
             "kpi": {"target": "revisit_rate", "expected_uplift": None, "range": [None, None]},
             "risks": ["LLM 안전 필터/쿼터/모델 가용성"],
             "checklist": ["App secrets 확인", "list_models() 결과에서 2.5 flash 검색"],
-            "evidence": ["gemini_debug.json의 tried 로그 참고"]
+            "evidence": [
+                "gemini_debug.json 로그 참조",
+                f"사유: {last_error or '원인 미상'}"
+            ]
         }]
     }
     try:
+        debug = {
+            "ts": datetime.datetime.utcnow().isoformat(),
+            "attempts": all_attempt_logs,
+            "schema_error": schema_error,
+            "last_error": last_error
+        }
         with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
-            json.dump({"tried": tried}, f, ensure_ascii=False, indent=2)
+            json.dump(debug, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
