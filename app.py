@@ -74,9 +74,10 @@ def _humanize_age_segment(code: str) -> str:
 
 
 def _collect_major_customers(agent1_json: dict) -> str:
+    debug_snapshot = ((agent1_json or {}).get("debug") or {}).get("sanitized_snapshot") or {}
     kpis = (agent1_json or {}).get("kpis", {})
     segments = []
-    age_segments = kpis.get("age_top_segments") or []
+    age_segments = debug_snapshot.get("age_top_segments") or kpis.get("age_top_segments") or []
     for item in age_segments[:3]:
         label = item.get("label") if isinstance(item, dict) else None
         value = item.get("value") if isinstance(item, dict) else None
@@ -119,7 +120,7 @@ def _format_customer_mix(detail: dict | None) -> str:
     return ", ".join(parts[:3]) if parts else "—"
 
 
-def _collect_overview_row(agent1_json: dict) -> pd.DataFrame:
+def _collect_overview_row(agent1_json: dict) -> tuple[pd.DataFrame, dict]:
     context = (agent1_json or {}).get("context", {})
     parsed = context.get("parsed", {})
     merchant = context.get("merchant", {})
@@ -135,9 +136,10 @@ def _collect_overview_row(agent1_json: dict) -> pd.DataFrame:
         addr = " / ".join([str(v) for v in addr if v])
     address = addr if addr else "—"
 
+    debug_snapshot = ((agent1_json or {}).get("debug") or {}).get("sanitized_snapshot") or {}
     kpis = (agent1_json or {}).get("kpis", {})
-    new_rate = kpis.get("new_rate_avg")
-    revisit_rate = kpis.get("revisit_rate_avg")
+    new_rate = debug_snapshot.get("new_pct", kpis.get("new_rate_avg"))
+    revisit_rate = debug_snapshot.get("revisit_pct", kpis.get("revisit_rate_avg"))
     new_text = _format_percent(new_rate)
     revisit_text = _format_percent(revisit_rate)
     if new_text == "—" and revisit_text == "—":
@@ -145,9 +147,14 @@ def _collect_overview_row(agent1_json: dict) -> pd.DataFrame:
     else:
         new_revisit = f"신규 {new_text} / 재방문 {revisit_text}"
 
-    customer_mix_detail = kpis.get("customer_mix_detail")
+    customer_mix_detail = debug_snapshot.get("customer_mix_detail") or kpis.get("customer_mix_detail")
     customer_type = _format_customer_mix(customer_mix_detail)
-    spend_band = kpis.get("avg_ticket_band_label") or context.get("avg_ticket_band") or "—"
+    spend_band = (
+        debug_snapshot.get("avg_ticket_band_label")
+        or kpis.get("avg_ticket_band_label")
+        or context.get("avg_ticket_band")
+        or "—"
+    )
     if isinstance(spend_band, str):
         spend_band = spend_band.strip()
         spend_band = re.sub(r"(상위)(\d)", r"\1 \2", spend_band)
@@ -162,14 +169,15 @@ def _collect_overview_row(agent1_json: dict) -> pd.DataFrame:
         "신규/재방문": new_revisit,
         "객단가 구간": spend_band if spend_band else "—"
     }
-    return pd.DataFrame([data])
+    return pd.DataFrame([data]), data
 
 
 def _build_diagnosis(agent1_json: dict) -> str:
+    debug_snapshot = ((agent1_json or {}).get("debug") or {}).get("sanitized_snapshot") or {}
     kpis = (agent1_json or {}).get("kpis", {})
     sentences = []
 
-    mix_detail = kpis.get("customer_mix_detail")
+    mix_detail = debug_snapshot.get("customer_mix_detail") or kpis.get("customer_mix_detail")
     mix_items = []
     if isinstance(mix_detail, dict):
         sorted_mix = sorted(
@@ -185,9 +193,9 @@ def _build_diagnosis(agent1_json: dict) -> str:
         sentences.append(" · ".join(mix_items) + " 고객 구성입니다.")
 
     rate_parts = []
-    new_text = _format_percent(kpis.get("new_rate_avg"))
-    revisit_text = _format_percent(kpis.get("revisit_rate_avg"))
-    youth_text = _format_percent(kpis.get("youth_share_avg"))
+    new_text = _format_percent(debug_snapshot.get("new_pct", kpis.get("new_rate_avg")))
+    revisit_text = _format_percent(debug_snapshot.get("revisit_pct", kpis.get("revisit_rate_avg")))
+    youth_text = _format_percent(debug_snapshot.get("youth_pct", kpis.get("youth_share_avg")))
     if new_text != "—":
         rate_parts.append(f"신규 {new_text}")
     if revisit_text != "—":
@@ -222,6 +230,7 @@ def _build_goal_lines(agent1_json: dict) -> tuple[str, list[str]]:
     else:
         period_text = "기간 정보 —"
 
+    debug_snapshot = ((agent1_json or {}).get("debug") or {}).get("sanitized_snapshot") or {}
     kpis = (agent1_json or {}).get("kpis", {})
     mapping = [
         ("revisit_rate_avg", "재방문율"),
@@ -230,7 +239,12 @@ def _build_goal_lines(agent1_json: dict) -> tuple[str, list[str]]:
     ]
     lines = []
     for key, label in mapping:
-        value = kpis.get(key)
+        sanitized_key = {
+            "revisit_rate_avg": "revisit_pct",
+            "new_rate_avg": "new_pct",
+            "youth_share_avg": "youth_pct",
+        }.get(key)
+        value = debug_snapshot.get(sanitized_key, kpis.get(key))
         if value is not None:
             lines.append(f"{label}: 현황 {_format_percent(value)} → 목표 구간 —")
     if not lines:
@@ -276,7 +290,12 @@ def _split_cards(cards: list[dict]) -> tuple[list[dict], list[dict]]:
     return main, booster
 
 
-def render_summary_view(agent1_json: dict, agent2_json: dict) -> None:
+def render_summary_view(
+    agent1_json: dict,
+    agent2_json: dict,
+    overview_df: pd.DataFrame | None = None,
+    table_dict: dict | None = None,
+) -> None:
     merchant_title = _extract_merchant_name(agent1_json)
     st.header(f"📊 {merchant_title} 가맹점 방문 고객 현황 분석")
 
@@ -284,7 +303,20 @@ def render_summary_view(agent1_json: dict, agent2_json: dict) -> None:
     if context and not context.get("merchant"):
         st.warning("질문과 정확히 일치하는 가맹점을 찾지 못해 표본 전체 요약을 보여드립니다.")
 
-    overview_df = _collect_overview_row(agent1_json)
+    debug_info = (agent1_json or {}).get("debug")
+    if overview_df is None or table_dict is None:
+        if isinstance(debug_info, dict) and isinstance(debug_info.get("table_dict"), dict):
+            table_dict = debug_info.get("table_dict")
+            overview_df = pd.DataFrame([table_dict])
+        else:
+            overview_df, table_dict = _collect_overview_row(agent1_json)
+            if isinstance(debug_info, dict):
+                debug_info["table_dict"] = table_dict
+    if overview_df is None:
+        if table_dict:
+            overview_df = pd.DataFrame([table_dict])
+        else:
+            overview_df = pd.DataFrame()
     try:
         print("📊 overview_table:", json.dumps(overview_df.to_dict(orient="records"), ensure_ascii=False))
     except Exception:
@@ -359,7 +391,7 @@ st.sidebar.write(f"📁 SHINHAN_DIR 존재: {SHINHAN_DIR.exists()}")
 st.sidebar.write(f"📁 EXTERNAL_DIR 존재: {EXTERNAL_DIR.exists()}")
 
 # ===== 질문 입력 =====
-default_q = "성동구 {고향***} 기준으로, 재방문율을 4주 안에 높일 실행카드 제시해줘."
+default_q = "성동구 {고향***} 기준으로, 재방문율 4주 플랜 작성해줘."
 question = st.text_input("질문을 입력하세요", value=default_q)
 st.caption("상호는 반드시 {}로 감싸 주세요. 예) 성동구 {동대******}")
 
@@ -372,13 +404,37 @@ if st.button("분석 실행", type="primary"):
     with st.spinner("Agent-1: 데이터 집계/요약 중..."):
         try:
             a1 = agent1_pipeline(question, SHINHAN_DIR, EXTERNAL_DIR)
+            try:
+                overview_df, table_dict = _collect_overview_row(a1)
+            except Exception:
+                overview_df, table_dict = pd.DataFrame(), {}
+            if isinstance(a1, dict):
+                dbg = a1.setdefault('debug', {})
+                if isinstance(dbg, dict):
+                    dbg['table_dict'] = table_dict
+            st.session_state['_latest_overview'] = (overview_df, table_dict)
             st.success("Agent-1 JSON 생성 완료")
             with st.expander("🔎 Agent-1 출력(JSON) 보기", expanded=False):
                 debug_info = (a1 or {}).get('debug', {})
-                st.text(f"parsed: {json.dumps(debug_info.get('parsed'), ensure_ascii=False, default=str)}")
-                st.text(f"resolved_merchant_id: {debug_info.get('resolved_merchant_id')}")
-                st.text(f"latest_raw: {json.dumps(debug_info.get('latest_raw_snapshot'), ensure_ascii=False, default=str)}")
-                st.text(f"sanitized_snapshot: {json.dumps(debug_info.get('sanitized_snapshot'), ensure_ascii=False, default=str)}")
+                st.text(
+                    f"parsed: {json.dumps(debug_info.get('parsed'), ensure_ascii=False, default=str)}"
+                )
+                st.text(
+                    f"candidates: {json.dumps(debug_info.get('resolve_candidates'), ensure_ascii=False, default=str)}"
+                )
+                st.text(
+                    f"resolved_merchant_id: {debug_info.get('resolved_merchant_id')} (path={debug_info.get('resolve_path')})"
+                )
+                st.text(f"merchants_covered: {debug_info.get('merchants_covered')}")
+                st.text(
+                    f"latest_raw: {json.dumps(debug_info.get('latest_raw_snapshot'), ensure_ascii=False, default=str)}"
+                )
+                st.text(
+                    f"sanitized_snapshot: {json.dumps(debug_info.get('sanitized_snapshot'), ensure_ascii=False, default=str)}"
+                )
+                st.text(
+                    f"table_dict: {json.dumps(debug_info.get('table_dict'), ensure_ascii=False, default=str)}"
+                )
                 st.json(a1)
         except Exception:
             st.error("Agent-1 실행 오류")
@@ -399,7 +455,8 @@ if st.button("분석 실행", type="primary"):
 
     # 출력
     try:
-        render_summary_view(a1, result)
+        overview_cached = st.session_state.get('_latest_overview', (None, None))
+        render_summary_view(a1, result, overview_df=overview_cached[0], table_dict=overview_cached[1])
     except Exception:
         st.error("요약 뷰를 렌더링하는 중 오류가 발생했습니다.")
         st.code(traceback.format_exc())

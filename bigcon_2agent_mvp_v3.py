@@ -4,6 +4,7 @@
 
 import os, json, re, random, sys, glob, datetime
 import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -30,6 +31,14 @@ def _normalize_str(value: str) -> str:
         return ""
     text = unicodedata.normalize("NFKC", str(value))
     return re.sub(r"\s+", "", text)
+
+
+def _normalize_compare(value: str | None) -> str:
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKC", str(value))
+    text = re.sub(r"\s+", "", text)
+    return text.upper()
 
 
 def _wildcard_to_regex(masked: str | None) -> re.Pattern | None:
@@ -125,7 +134,8 @@ def load_set3(shinhan_dir):
         'M12_MAL_1020_RAT','M12_MAL_30_RAT','M12_MAL_40_RAT','M12_MAL_50_RAT','M12_MAL_60_RAT',
         'M12_FME_1020_RAT','M12_FME_30_RAT','M12_FME_40_RAT','M12_FME_50_RAT','M12_FME_60_RAT',
         'MCT_UE_CLN_REU_RAT','MCT_UE_CLN_NEW_RAT',
-        'RC_M1_SHC_RSD_UE_CLN_RAT','RC_M1_SHC_WP_UE_CLN_RAT','RC_M1_SHC_FLP_UE_CLN_RAT'
+        'RC_M1_SHC_RSD_UE_CLN_RAT','RC_M1_SHC_WP_UE_CLN_RAT','RC_M1_SHC_FLP_UE_CLN_RAT',
+        'APV_CE_RAT'
     ]
     for c in keep_cols:
         if c not in df.columns:
@@ -223,235 +233,291 @@ def build_panel(shinhan_dir, merchants_df=None, target_id=None):
     if '_merchant_id' in panel.columns:
         panel['_merchant_id'] = panel['_merchant_id'].astype(str)
     stats['merchants_after'] = int(panel['_merchant_id'].nunique()) if '_merchant_id' in panel.columns else 0
+    stats['set2_merchants_after'] = int(s2['ENCODED_MCT'].astype(str).nunique()) if 'ENCODED_MCT' in s2.columns else 0
+    stats['set3_merchants_after'] = int(s3['ENCODED_MCT'].astype(str).nunique()) if 'ENCODED_MCT' in s3.columns else 0
     return panel, stats
 
 
-
-def resolve_merchant(masked_name: str | None, sigungu: str | None, merchants_df: pd.DataFrame | None):
-    if merchants_df is None or merchants_df.empty:
+def call_llm_for_mask(original_question: str | None, merchant_mask: str | None, sigungu: str | None):
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        print('⚠️ GEMINI_API_KEY 미설정으로 LLM 보조 매칭을 건너뜁니다.')
         return None
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        print('⚠️ google-generativeai 미설치로 LLM 보조 매칭을 건너뜁니다.')
+        return None
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name='models/gemini-2.5-flash',
+        generation_config={
+            'temperature': 0.1,
+            'top_p': 0.8,
+            'max_output_tokens': 128,
+        },
+    )
+
+    prompt = f"""당신은 텍스트에서 마스킹된 가맹점 단서를 정리하는 한국어 어시스턴트입니다.
+질문에서 확인 가능한 상호 마스크와 시군구만 JSON으로 다시 써주세요.
+추정이나 생성은 금지하며, 정보가 없으면 null을 넣습니다.
+
+질문: {original_question}
+현재 추출: merchant_mask={merchant_mask}, sigungu={sigungu}
+
+JSON 형식:
+{{"merchant_mask":"문자열 또는 null","sigungu":"문자열 또는 null","notes":"간단 메모"}}
+"""
+
+    try:
+        response = model.generate_content(prompt)
+    except Exception as exc:
+        print('⚠️ LLM 보조 매칭 호출 실패:', exc)
+        return None
+
+    def _response_text(resp):
+        parts = []
+        for part in getattr(resp, 'parts', []) or []:
+            text = getattr(part, 'text', None)
+            if text:
+                parts.append(text)
+        if hasattr(resp, 'text') and resp.text:
+            parts.append(resp.text)
+        return '\n'.join(parts)
+
+    text = _response_text(response)
+    if not text:
+        print('⚠️ LLM 보조 매칭 응답이 비었습니다.')
+        return None
+
+    match = re.search(r'\{[\s\S]*\}', text)
+    if not match:
+        print('⚠️ LLM 보조 매칭에서 JSON을 찾지 못했습니다.')
+        return None
+
+    try:
+        data = json.loads(match.group(0))
+    except Exception as exc:
+        print('⚠️ LLM 보조 매칭 JSON 파싱 실패:', exc)
+        return None
+
+    return data if isinstance(data, dict) else None
+
+
+def resolve_merchant(
+    masked_name: str | None,
+    mask_prefix: str | None,
+    sigungu: str | None,
+    merchants_df: pd.DataFrame | None,
+    original_question: str | None = None,
+    allow_llm: bool = True,
+):
+    debug_info = {
+        'candidates': [],
+        'path': None,
+        'notes': None,
+        'suggestions': None,
+        'llm': None,
+    }
+
+    if merchants_df is None or merchants_df.empty:
+        return None, debug_info
 
     if not masked_name:
+        debug_info['notes'] = '마스킹 상호 미제공'
         print("⚠️ resolve_merchant: 입력된 마스킹 상호가 없어 매칭을 건너뜁니다.")
-        return None
+        return None, debug_info
 
     df = merchants_df.copy()
-    df['_norm_name'] = df['MCT_NM'].apply(_normalize_str)
-    df['_norm_sigungu'] = df['SIGUNGU'].apply(_normalize_str)
-    df['_norm_category'] = df['CATEGORY'].apply(_normalize_str)
+    df['_norm_name'] = df['MCT_NM'].apply(_normalize_compare)
+    df['_norm_sigungu'] = df['SIGUNGU'].apply(_normalize_compare)
+    df['_norm_category'] = df['CATEGORY'].apply(_normalize_compare)
 
-    norm_sigungu = _normalize_str(sigungu) if sigungu else ""
-    candidates = df
+    norm_sigungu = _normalize_compare(sigungu)
+    prefix_norm = _normalize_compare(mask_prefix) if mask_prefix else ''
+
+    base = df
     if norm_sigungu:
-        exact = candidates[candidates['_norm_sigungu'] == norm_sigungu]
-        if not exact.empty:
-            candidates = exact
+        exact = base[base['_norm_sigungu'] == norm_sigungu]
+        if exact.empty:
+            base = base[base['_norm_sigungu'].str.contains(norm_sigungu, na=False)]
         else:
-            candidates = candidates[candidates['_norm_sigungu'].str.contains(norm_sigungu, na=False)]
-    sigungu_filter_count = len(candidates)
+            base = exact
+    sigungu_filter_count = int(len(base))
 
-    pattern = _wildcard_to_regex(masked_name)
-    name_regex = pattern.pattern if pattern else None
-    prefix = ""
-    if masked_name:
-        prefix = _normalize_str(masked_name.split('*', 1)[0])
+    def _preview_candidates(frame: pd.DataFrame) -> list[dict]:
+        preview = []
+        for _, row in frame.head(3).iterrows():
+            preview.append({
+                'ENCODED_MCT': row['ENCODED_MCT'],
+                'MCT_NM': row['MCT_NM'],
+                'SIGUNGU': row['SIGUNGU'],
+                'CATEGORY': row['CATEGORY'],
+                'score': float(row.get('__score')) if '__score' in row else None,
+            })
+        return preview
 
-    if candidates.empty:
+    if base.empty:
+        debug_payload = {
+            'input': {'masked_name': masked_name, 'mask_prefix': mask_prefix, 'sigungu': sigungu},
+            'sigungu_filter_count': sigungu_filter_count,
+            'rule': 'rule1',
+            'candidates': [],
+        }
+        print("🧭 resolve_phase:", json.dumps(debug_payload, ensure_ascii=False))
+        print(f"⚠️ 가맹점 미일치 – {masked_name}·{sigungu}를 확인해 주세요.")
+        debug_info['notes'] = 'sigungu_filter_empty'
+        return None, debug_info
+
+    # Rule-1 strict: startswith
+    if prefix_norm:
+        rule1 = base[base['_norm_name'].str.startswith(prefix_norm, na=False)]
+    else:
+        rule1 = base.iloc[0:0]
+    rule1_count = int(len(rule1))
+
+    if rule1_count == 1:
+        row = rule1.iloc[0]
+        resolved = {
+            'encoded_mct': str(row['ENCODED_MCT']),
+            'masked_name': row.get('MCT_NM'),
+            'address': row.get('ADDR_BASE'),
+            'sigungu': row.get('SIGUNGU'),
+            'category': row.get('CATEGORY'),
+            'score': 1.0,
+        }
+        debug_info['candidates'] = _preview_candidates(rule1.assign(__score=1.0))
+        debug_info['path'] = 'rule1'
         print(
             "🧭 resolve_phase:",
             json.dumps({
-                'input': {'masked_name': masked_name, 'sigungu': sigungu},
+                'input': {'masked_name': masked_name, 'mask_prefix': mask_prefix, 'sigungu': sigungu},
+                'rule': 'rule1',
                 'sigungu_filter_count': sigungu_filter_count,
-                'name_regex': name_regex,
-                'name_match_count': 0,
-                'candidates': [],
+                'rule1_count': rule1_count,
+                'candidates': debug_info['candidates'],
             }, ensure_ascii=False),
         )
-        print(f"⚠️ 가맹점 미일치 – {masked_name}와 구를 확인해 주세요.")
-        return None
+        print("✅ resolved_merchant_id:", resolved['encoded_mct'])
+        return resolved, debug_info
 
-    def _score(row):
-        name = row['_norm_name'] or ""
-        score = 0
-        if prefix and name.startswith(prefix):
-            score += 2
-        elif prefix and prefix in name:
-            score += 1
-        elif pattern and pattern.match(name):
-            score += 2
-        elif pattern and pattern.search(name):
-            score += 1
-        return score
+    def _score_rows(frame: pd.DataFrame) -> pd.DataFrame:
+        scored = frame.copy()
+        scores = []
+        for _, r in scored.iterrows():
+            name_norm = r['_norm_name'] or ''
+            base_score = 0.0
+            if prefix_norm:
+                if name_norm.startswith(prefix_norm):
+                    base_score = 1.0
+                elif prefix_norm in name_norm:
+                    base_score = 0.8
+                else:
+                    base_score = SequenceMatcher(None, prefix_norm, name_norm).ratio()
+            fuzzy = SequenceMatcher(None, prefix_norm, name_norm).ratio() if prefix_norm else 0.0
+            base_val = max(base_score, fuzzy)
+            length_bonus = 0.05 if prefix_norm and len(name_norm) > len(prefix_norm) else 0.0
+            scores.append(round(min(base_val + length_bonus, 1.05), 4))
+        scored['__score'] = scores
+        scored['__name_len'] = scored['_norm_name'].str.len().fillna(0)
+        return scored
 
-    scored = candidates.copy()
-    scored['__score'] = scored.apply(_score, axis=1)
-    scored['__name_len'] = scored['_norm_name'].str.len().fillna(0)
+    # Rule-2 fallback if strict fails
+    rule2_base = base if rule1_count == 0 else rule1
+    rule2 = _score_rows(rule2_base)
+    top = rule2.sort_values(['__score', '__name_len', 'ENCODED_MCT'], ascending=[False, False, True])
+    debug_candidates = _preview_candidates(top)
+    debug_info['candidates'] = debug_candidates
 
-    top = scored.sort_values(['__score', '__name_len', 'ENCODED_MCT'], ascending=[False, False, True])
-    name_match_count = int((scored['__score'] >= 2).sum())
-
-    candidate_preview = []
-    for _, row in top.head(3).iterrows():
-        candidate_preview.append({
-            'ENCODED_MCT': row['ENCODED_MCT'],
-            'MCT_NM': row['MCT_NM'],
-            'SIGUNGU': row['SIGUNGU'],
-            'CATEGORY': row['CATEGORY'],
-            'score': float(row['__score']) if pd.notna(row['__score']) else None,
-        })
+    chosen = None
+    path = 'rule2' if rule1_count == 0 else 'rule1'
+    if not top.empty and float(top.iloc[0]['__score']) >= 0.85:
+        chosen = top.iloc[0]
+        debug_info['path'] = path
+    elif not top.empty and rule1_count > 1:
+        chosen = top.iloc[0]
+        debug_info['path'] = 'rule1'
 
     print(
         "🧭 resolve_phase:",
         json.dumps({
-            'input': {'masked_name': masked_name, 'sigungu': sigungu},
+            'input': {'masked_name': masked_name, 'mask_prefix': mask_prefix, 'sigungu': sigungu},
+            'rule': path,
             'sigungu_filter_count': sigungu_filter_count,
-            'name_regex': name_regex,
-            'name_match_count': name_match_count,
-            'candidates': candidate_preview,
+            'rule1_count': rule1_count,
+            'candidates': debug_candidates,
         }, ensure_ascii=False),
     )
 
-    if top.empty or top.iloc[0]['__score'] <= 0:
-        print(f"⚠️ 가맹점 미일치 – {masked_name}와 구를 확인해 주세요.")
-        return None
+    if chosen is not None:
+        resolved = {
+            'encoded_mct': str(chosen['ENCODED_MCT']),
+            'masked_name': chosen.get('MCT_NM'),
+            'address': chosen.get('ADDR_BASE'),
+            'sigungu': chosen.get('SIGUNGU'),
+            'category': chosen.get('CATEGORY'),
+            'score': float(chosen.get('__score')) if pd.notna(chosen.get('__score')) else None,
+        }
+        print("✅ resolved_merchant_id:", resolved['encoded_mct'])
+        return resolved, debug_info
 
-    best = top.iloc[0]
-    resolved = {
-        'encoded_mct': str(best['ENCODED_MCT']),
-        'masked_name': best['MCT_NM'],
-        'address': best.get('ADDR_BASE'),
-        'sigungu': best.get('SIGUNGU'),
-        'category': best.get('CATEGORY'),
-        'score': float(best['__score']) if pd.notna(best['__score']) else None,
-    }
-    print("✅ resolved_merchant_id:", resolved['encoded_mct'])
-    return resolved
+    # Rule-2 failed → optional LLM assist
+    if allow_llm:
+        llm_result = call_llm_for_mask(original_question, masked_name, sigungu)
+        debug_info['notes'] = 'llm_invoked'
+        if llm_result:
+            debug_info['llm'] = llm_result
+            new_mask = llm_result.get('merchant_mask') or masked_name
+            new_prefix = (new_mask.split('*', 1)[0].strip() if new_mask else mask_prefix)
+            new_sigungu = llm_result.get('sigungu') or sigungu
+            if (new_mask, new_sigungu) != (masked_name, sigungu):
+                match, nested_debug = resolve_merchant(
+                    new_mask,
+                    new_prefix,
+                    new_sigungu,
+                    merchants_df,
+                    original_question=original_question,
+                    allow_llm=False,
+                )
+                if isinstance(nested_debug, dict):
+                    nested_debug.setdefault('llm', llm_result)
+                    nested_debug['notes'] = nested_debug.get('notes') or 'llm_invoked'
+                    if not nested_debug.get('path'):
+                        nested_debug['path'] = 'llm'
+                return match, nested_debug
 
+    # No match → surface suggestions
+    base_scores = []
+    if prefix_norm:
+        for _, row in base.iterrows():
+            ratio = SequenceMatcher(None, prefix_norm, row['_norm_name'] or '').ratio()
+            base_scores.append((ratio, row))
+        base_scores.sort(key=lambda x: x[0], reverse=True)
+        suggestions = [
+            {
+                'ENCODED_MCT': r['ENCODED_MCT'],
+                'MCT_NM': r['MCT_NM'],
+                'SIGUNGU': r['SIGUNGU'],
+                'CATEGORY': r['CATEGORY'],
+            }
+            for ratio, r in base_scores[:3]
+            if ratio > 0
+        ]
+    else:
+        suggestions = []
 
-def resolve_merchant(masked_name: str | None, sigungu: str | None, industry_label: str | None, merchants_df: pd.DataFrame | None):
-    if merchants_df is None or merchants_df.empty:
-        return None
-
-    df = merchants_df.copy()
-    df['_norm_name'] = df['MCT_NM'].apply(_normalize_str)
-    df['_norm_sigungu'] = df['SIGUNGU'].apply(_normalize_str)
-    df['_norm_category'] = df['CATEGORY'].apply(_normalize_str)
-
-    log_context = {
-        'masked_name': masked_name,
-        'sigungu': sigungu,
-        'industry_label': industry_label,
-    }
-
-    candidates = df
-    norm_sigungu = _normalize_str(sigungu) if sigungu else ""
-    sigungu_filter_count = len(candidates)
-    if norm_sigungu:
-        exact = df[df['_norm_sigungu'] == norm_sigungu]
-        if not exact.empty:
-            candidates = exact
-        else:
-            partial = df[df['_norm_sigungu'].str.contains(norm_sigungu, na=False)]
-            if not partial.empty:
-                candidates = partial
-        sigungu_filter_count = len(candidates)
-
-    norm_industry = _normalize_str(industry_label) if industry_label else ""
-    category_filter_count = len(candidates)
-    if norm_industry:
-        narrowed = candidates[candidates['_norm_category'].str.contains(norm_industry, na=False)]
-        if narrowed.empty:
-            tokens = [t for t in re.split(r'[-/,&]', norm_industry) if t]
-            token_matches = []
-            for token in tokens:
-                sub = candidates[candidates['_norm_category'].str.contains(token, na=False)]
-                if not sub.empty:
-                    token_matches.append(sub)
-            if token_matches:
-                candidates = pd.concat(token_matches).drop_duplicates('ENCODED_MCT')
-        else:
-            candidates = narrowed
-        category_filter_count = len(candidates)
-
-    pattern = _wildcard_to_regex(masked_name)
-    name_core = _normalize_str(masked_name.replace('*', '')) if masked_name else ""
-    name_regex = pattern.pattern if pattern else None
-
-    def _score(row):
-        score = 0.0
-        if norm_sigungu:
-            if row['_norm_sigungu'] == norm_sigungu:
-                score += 4.0
-            elif norm_sigungu in row['_norm_sigungu']:
-                score += 2.0
-        if norm_industry:
-            tokens = [t for t in re.split(r'[-/,&]', norm_industry) if t]
-            for token in tokens:
-                if token and token in row['_norm_category']:
-                    score += 1.5
-        if masked_name:
-            name = row['_norm_name']
-            if pattern and pattern.match(name):
-                score += 10.0
-            elif pattern and pattern.search(name):
-                score += 6.0
-            if name_core and name_core in name:
-                score += 3.0
-        return score
-
-    scored = candidates.copy()
-    scored['__score'] = scored.apply(_score, axis=1)
-    if masked_name and scored['__score'].max() <= 0:
-        scored = df.copy()
-        scored['__score'] = scored.apply(_score, axis=1)
-        sigungu_filter_count = len(df)
-        category_filter_count = len(df)
-
-    top = scored.sort_values(['__score', 'ENCODED_MCT'], ascending=[False, True]).head(1)
-    name_match_count = 0
-    if pattern is not None and '_norm_name' in scored:
-        name_match_count = int(scored['_norm_name'].apply(lambda v: bool(pattern.match(v))).sum())
-
-    candidate_preview = []
-    for _, row in scored.sort_values('__score', ascending=False).head(3).iterrows():
-        candidate_preview.append({
-            'ENCODED_MCT': row['ENCODED_MCT'],
-            'MCT_NM': row['MCT_NM'],
-            'SIGUNGU': row['SIGUNGU'],
-            'CATEGORY': row['CATEGORY'],
-            'score': float(row['__score']) if pd.notna(row['__score']) else None,
-        })
-
-    print(
-        "🧭 resolve_phase:",
-        json.dumps({
-            'input': log_context,
-            'sigungu_filter_count': sigungu_filter_count,
-            'category_filter_count': category_filter_count,
-            'name_regex': name_regex,
-            'name_match_count': name_match_count,
-            'candidates': candidate_preview,
-        }, ensure_ascii=False)
-    )
-
-    if top.empty or top.iloc[0]['__score'] <= 0:
-        print("⚠️ resolve_merchant: 가맹점 미일치 — 규칙 완화 필요")
-        return None
-    best = top.iloc[0]
-    resolved = {
-        'encoded_mct': best['ENCODED_MCT'],
-        'masked_name': best['MCT_NM'],
-        'address': best.get('ADDR_BASE'),
-        'sigungu': best.get('SIGUNGU'),
-        'category': best.get('CATEGORY'),
-        'score': float(best['__score']) if pd.notna(best['__score']) else None,
-    }
-    print("✅ resolved_merchant_id:", resolved['encoded_mct'])
-    return resolved
+    debug_info['suggestions'] = suggestions
+    print(f"⚠️ 가맹점 미일치 – {masked_name}·{sigungu}를 확인해 주세요.")
+    if suggestions:
+        print("🔍 유사 후보:", json.dumps(suggestions, ensure_ascii=False))
+    return None, debug_info
 
 def parse_question(q):
     original = q or ''
-    lower_q = original.lower()
+    normalized = unicodedata.normalize('NFKC', original)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    lower_q = normalized.lower()
     age_cond = None
     if '10대' in original or 'teen' in lower_q or re.search(r'\b1[0-9]\b', lower_q):
         age_cond = ('<=', 19)
@@ -495,15 +561,20 @@ def parse_question(q):
         industry = 'restaurant'
 
     merchant_mask = None
-    brace_match = re.search(r'\{([^{}]+)\}', original)
+    brace_match = re.search(r'\{([^{}]+)\}', normalized)
     if brace_match:
         merchant_mask = brace_match.group(1).strip()
 
-    sigungu_match = re.search(r'([가-힣A-Za-z]+구)', original)
-    merchant_sigungu = sigungu_match.group(1).strip() if sigungu_match else '성동구'
+    mask_prefix = None
+    if merchant_mask:
+        mask_prefix = merchant_mask.split('*', 1)[0].strip()
+
+    sigungu_match = re.search(r'(?P<sigungu>[가-힣]{2,}구)', normalized)
+    merchant_sigungu = sigungu_match.group('sigungu') if sigungu_match else '성동구'
 
     merchant_info = {
         'masked_name': merchant_mask,
+        'mask_prefix': mask_prefix,
         'sigungu': merchant_sigungu,
         'industry_label': None,
     }
@@ -514,12 +585,15 @@ def parse_question(q):
         explicit_id = trimmed
 
     return {
+        'original_question': original,
         'age_cond': age_cond,
         'weather': weather,
         'months': months,
         'weeks_requested': weeks_requested,
         'industry': industry,
+        'normalized_question': normalized,
         'merchant_masked_name': merchant_info['masked_name'],
+        'merchant_mask_prefix': merchant_info['mask_prefix'],
         'merchant_sigungu': merchant_info['sigungu'],
         'merchant_industry_label': merchant_info['industry_label'],
         'merchant_explicit_id': explicit_id,
@@ -634,6 +708,21 @@ def kpi_summary(panel_sub):
     return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
 
 
+    sanitized_snapshot = {
+        'revisit_pct': sanitized['revisit_rate_avg'],
+        'new_pct': sanitized['new_rate_avg'],
+        'youth_pct': sanitized['youth_share_avg'],
+        'customer_mix_detail': sanitized['customer_mix_detail'],
+        'age_top_segments': sanitized['age_top_segments'],
+        'avg_ticket_band_label': sanitized['avg_ticket_band_label'],
+    }
+
+    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
+    print("✅ KPI sanitized:", json.dumps(sanitized_snapshot, ensure_ascii=False))
+
+    return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
+
+
 def weather_effect(panel_sub, wx_monthly):
     if (wx_monthly is None) or panel_sub.empty or ('REVISIT_RATE' not in panel_sub):
         return {'metric':'REVISIT_RATE','effect':None,'ci':[None,None],'note':'날씨/표본 부족'}
@@ -650,14 +739,37 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
 
     run_id = datetime.datetime.utcnow().isoformat()
     parse_log = {
+        'original': qinfo.get('original_question'),
         'merchant_mask': qinfo.get('merchant_masked_name'),
+        'mask_prefix': qinfo.get('merchant_mask_prefix'),
         'sigungu': qinfo.get('merchant_sigungu'),
         'explicit_id': qinfo.get('merchant_explicit_id'),
     }
     print("🆔 agent1_run:", run_id)
     print("🧾 question_fields:", json.dumps(parse_log, ensure_ascii=False))
 
+    print(
+        "🧪 parse_debug:",
+        json.dumps(
+            {
+                'original': qinfo.get('original_question'),
+                'normalized': qinfo.get('normalized_question'),
+                'merchant_mask': qinfo.get('merchant_masked_name'),
+                'mask_prefix': qinfo.get('merchant_mask_prefix'),
+                'sigungu': qinfo.get('merchant_sigungu'),
+            },
+            ensure_ascii=False,
+        ),
+    )
+
     merchant_match = None
+    resolve_meta = {
+        'candidates': [],
+        'path': None,
+        'notes': None,
+        'suggestions': None,
+        'llm': None,
+    }
     explicit_id = qinfo.get('merchant_explicit_id')
     if explicit_id:
         lookup = merchants_df[merchants_df['ENCODED_MCT'] == explicit_id]
@@ -675,12 +787,16 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
                 'category': row.get('CATEGORY'),
                 'score': None,
             }
+            resolve_meta['path'] = 'explicit_id'
 
     if merchant_match is None:
-        merchant_match = resolve_merchant(
+        merchant_match, resolve_meta = resolve_merchant(
             qinfo.get('merchant_masked_name'),
+            qinfo.get('merchant_mask_prefix'),
             qinfo.get('merchant_sigungu'),
             merchants_df,
+            original_question=qinfo.get('normalized_question') or question,
+            allow_llm=True,
         )
 
     target_id = None
@@ -698,6 +814,18 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         }, ensure_ascii=False),
     )
     print("🏁 merchant_match:", json.dumps(merchant_match, ensure_ascii=False))
+    print(
+        "🧭 resolve_summary:",
+        json.dumps(
+            {
+                'path': resolve_meta.get('path'),
+                'notes': resolve_meta.get('notes'),
+                'candidates': resolve_meta.get('candidates'),
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
 
     sub = subset_period(panel_focus, months=qinfo['months'])
 
@@ -727,9 +855,12 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
 
     merchant_query = {
         'masked_name': qinfo.get('merchant_masked_name'),
+        'mask_prefix': qinfo.get('merchant_mask_prefix'),
         'sigungu': qinfo.get('merchant_sigungu'),
         'industry_label': qinfo.get('merchant_industry_label'),
     }
+
+    merchants_covered = int(sub['_merchant_id'].nunique()) if not sub.empty else 0
 
     out = {
         'context': {
@@ -738,6 +869,8 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
             'merchant_query': merchant_query,
             'run_id': run_id,
             'panel_stats': panel_stats,
+            'merchant_candidates': resolve_meta.get('candidates'),
+            'merchant_resolution_path': resolve_meta.get('path'),
         },
         'kpis': kpis,
         'weather_effect': wfx,
@@ -749,14 +882,20 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
             'weeks_requested': qinfo.get('weeks_requested'),
         },
         'sample': {
-            'merchants_covered': int(sub['_merchant_id'].nunique()) if not sub.empty else 0
+            'merchants_covered': merchants_covered
         },
         'debug': {
             'parsed': parse_log,
             'resolved_merchant_id': target_id,
+            'resolve_path': resolve_meta.get('path'),
+            'resolve_candidates': resolve_meta.get('candidates'),
+            'resolve_notes': resolve_meta.get('notes'),
+            'resolve_suggestions': resolve_meta.get('suggestions'),
+            'llm_result': resolve_meta.get('llm'),
             'latest_raw_snapshot': kpi_debug.get('latest_raw_snapshot'),
             'sanitized_snapshot': kpi_debug.get('sanitized_snapshot'),
             'panel_stats': panel_stats,
+            'merchants_covered': merchants_covered,
         },
     }
 
