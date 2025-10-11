@@ -708,6 +708,21 @@ def kpi_summary(panel_sub):
     return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
 
 
+    sanitized_snapshot = {
+        'revisit_pct': sanitized['revisit_rate_avg'],
+        'new_pct': sanitized['new_rate_avg'],
+        'youth_pct': sanitized['youth_share_avg'],
+        'customer_mix_detail': sanitized['customer_mix_detail'],
+        'age_top_segments': sanitized['age_top_segments'],
+        'avg_ticket_band_label': sanitized['avg_ticket_band_label'],
+    }
+
+    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
+    print("✅ KPI sanitized:", json.dumps(sanitized_snapshot, ensure_ascii=False))
+
+    return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
+
+
 def weather_effect(panel_sub, wx_monthly):
     if (wx_monthly is None) or panel_sub.empty or ('REVISIT_RATE' not in panel_sub):
         return {'metric':'REVISIT_RATE','effect':None,'ci':[None,None],'note':'날씨/표본 부족'}
