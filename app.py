@@ -359,8 +359,9 @@ st.sidebar.write(f"📁 SHINHAN_DIR 존재: {SHINHAN_DIR.exists()}")
 st.sidebar.write(f"📁 EXTERNAL_DIR 존재: {EXTERNAL_DIR.exists()}")
 
 # ===== 질문 입력 =====
-default_q = "성동구 고향*** (한식-찌개/전골) 가맹점 기준으로, 재방문율을 4주 안에 높일 실행카드 제시해줘."
+default_q = "성동구 {고향***} 기준으로, 재방문율을 4주 안에 높일 실행카드 제시해줘."
 question = st.text_input("질문을 입력하세요", value=default_q)
+st.caption("상호는 반드시 {}로 감싸 주세요. 예) 성동구 {동대******}")
 
 # ===== 실행 버튼 =====
 if st.button("분석 실행", type="primary"):
@@ -373,6 +374,11 @@ if st.button("분석 실행", type="primary"):
             a1 = agent1_pipeline(question, SHINHAN_DIR, EXTERNAL_DIR)
             st.success("Agent-1 JSON 생성 완료")
             with st.expander("🔎 Agent-1 출력(JSON) 보기", expanded=False):
+                debug_info = (a1 or {}).get('debug', {})
+                st.text(f"parsed: {json.dumps(debug_info.get('parsed'), ensure_ascii=False, default=str)}")
+                st.text(f"resolved_merchant_id: {debug_info.get('resolved_merchant_id')}")
+                st.text(f"latest_raw: {json.dumps(debug_info.get('latest_raw_snapshot'), ensure_ascii=False, default=str)}")
+                st.text(f"sanitized_snapshot: {json.dumps(debug_info.get('sanitized_snapshot'), ensure_ascii=False, default=str)}")
                 st.json(a1)
         except Exception:
             st.error("Agent-1 실행 오류")

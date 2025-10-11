@@ -139,7 +139,9 @@ def load_set3(shinhan_dir):
     ]
     for col in rate_cols:
         if col in df.columns:
-            df[col] = normalize_rate_series(df[col])
+            original = df[col].copy()
+            df[f'{col}_raw'] = original
+            df[col] = normalize_rate_series(original)
     return df
 
 def load_weather_monthly(external_dir):
@@ -184,15 +186,33 @@ def load_weather_monthly(external_dir):
     monthly['_date'] = pd.to_datetime(monthly['TA_YM'] + '01', format='%Y%m%d', errors='coerce')
     return monthly[['TA_YM','_date','RAIN_SUM']]
 
-def build_panel(shinhan_dir, merchants_df=None):
+def build_panel(shinhan_dir, merchants_df=None, target_id=None):
     s1 = merchants_df if merchants_df is not None else load_set1(shinhan_dir)
-    s2 = load_set2(shinhan_dir)
-    s3 = load_set3(shinhan_dir)
+    s2_all = load_set2(shinhan_dir)
+    s3_all = load_set3(shinhan_dir)
+
+    stats = {
+        'set2_merchants_before': int(s2_all['ENCODED_MCT'].astype(str).nunique()) if 'ENCODED_MCT' in s2_all.columns else 0,
+        'set3_merchants_before': int(s3_all['ENCODED_MCT'].astype(str).nunique()) if 'ENCODED_MCT' in s3_all.columns else 0,
+    }
+
+    s2 = s2_all
+    s3 = s3_all
+    if target_id:
+        tid = str(target_id)
+        s2 = s2_all[s2_all['ENCODED_MCT'].astype(str) == tid]
+        s3 = s3_all[s3_all['ENCODED_MCT'].astype(str) == tid]
+
+    stats['set2_rows_after'] = int(len(s2))
+    stats['set3_rows_after'] = int(len(s3))
+
     m23 = pd.merge(s2, s3, on=['ENCODED_MCT','TA_YM','_date'], how='outer', suffixes=('_s2',''))
     panel = pd.merge(m23, s1, on='ENCODED_MCT', how='left')
     def nz(x):
-        try: return pd.to_numeric(x, errors='coerce').fillna(0.0)
-        except: return pd.Series([0.0]*len(x))
+        try:
+            return pd.to_numeric(x, errors='coerce').fillna(0.0)
+        except Exception:
+            return pd.Series([0.0] * len(x))
     if 'M12_MAL_1020_RAT' in panel.columns and 'M12_FME_1020_RAT' in panel.columns:
         panel['YOUTH_SHARE'] = nz(panel['M12_MAL_1020_RAT']) + nz(panel['M12_FME_1020_RAT'])
     else:
@@ -202,7 +222,110 @@ def build_panel(shinhan_dir, merchants_df=None):
     panel.rename(columns={'ENCODED_MCT':'_merchant_id'}, inplace=True)
     if '_merchant_id' in panel.columns:
         panel['_merchant_id'] = panel['_merchant_id'].astype(str)
-    return panel
+    stats['merchants_after'] = int(panel['_merchant_id'].nunique()) if '_merchant_id' in panel.columns else 0
+    return panel, stats
+
+
+
+def resolve_merchant(masked_name: str | None, sigungu: str | None, merchants_df: pd.DataFrame | None):
+    if merchants_df is None or merchants_df.empty:
+        return None
+
+    if not masked_name:
+        print("⚠️ resolve_merchant: 입력된 마스킹 상호가 없어 매칭을 건너뜁니다.")
+        return None
+
+    df = merchants_df.copy()
+    df['_norm_name'] = df['MCT_NM'].apply(_normalize_str)
+    df['_norm_sigungu'] = df['SIGUNGU'].apply(_normalize_str)
+    df['_norm_category'] = df['CATEGORY'].apply(_normalize_str)
+
+    norm_sigungu = _normalize_str(sigungu) if sigungu else ""
+    candidates = df
+    if norm_sigungu:
+        exact = candidates[candidates['_norm_sigungu'] == norm_sigungu]
+        if not exact.empty:
+            candidates = exact
+        else:
+            candidates = candidates[candidates['_norm_sigungu'].str.contains(norm_sigungu, na=False)]
+    sigungu_filter_count = len(candidates)
+
+    pattern = _wildcard_to_regex(masked_name)
+    name_regex = pattern.pattern if pattern else None
+    prefix = ""
+    if masked_name:
+        prefix = _normalize_str(masked_name.split('*', 1)[0])
+
+    if candidates.empty:
+        print(
+            "🧭 resolve_phase:",
+            json.dumps({
+                'input': {'masked_name': masked_name, 'sigungu': sigungu},
+                'sigungu_filter_count': sigungu_filter_count,
+                'name_regex': name_regex,
+                'name_match_count': 0,
+                'candidates': [],
+            }, ensure_ascii=False),
+        )
+        print(f"⚠️ 가맹점 미일치 – {masked_name}와 구를 확인해 주세요.")
+        return None
+
+    def _score(row):
+        name = row['_norm_name'] or ""
+        score = 0
+        if prefix and name.startswith(prefix):
+            score += 2
+        elif prefix and prefix in name:
+            score += 1
+        elif pattern and pattern.match(name):
+            score += 2
+        elif pattern and pattern.search(name):
+            score += 1
+        return score
+
+    scored = candidates.copy()
+    scored['__score'] = scored.apply(_score, axis=1)
+    scored['__name_len'] = scored['_norm_name'].str.len().fillna(0)
+
+    top = scored.sort_values(['__score', '__name_len', 'ENCODED_MCT'], ascending=[False, False, True])
+    name_match_count = int((scored['__score'] >= 2).sum())
+
+    candidate_preview = []
+    for _, row in top.head(3).iterrows():
+        candidate_preview.append({
+            'ENCODED_MCT': row['ENCODED_MCT'],
+            'MCT_NM': row['MCT_NM'],
+            'SIGUNGU': row['SIGUNGU'],
+            'CATEGORY': row['CATEGORY'],
+            'score': float(row['__score']) if pd.notna(row['__score']) else None,
+        })
+
+    print(
+        "🧭 resolve_phase:",
+        json.dumps({
+            'input': {'masked_name': masked_name, 'sigungu': sigungu},
+            'sigungu_filter_count': sigungu_filter_count,
+            'name_regex': name_regex,
+            'name_match_count': name_match_count,
+            'candidates': candidate_preview,
+        }, ensure_ascii=False),
+    )
+
+    if top.empty or top.iloc[0]['__score'] <= 0:
+        print(f"⚠️ 가맹점 미일치 – {masked_name}와 구를 확인해 주세요.")
+        return None
+
+    best = top.iloc[0]
+    resolved = {
+        'encoded_mct': str(best['ENCODED_MCT']),
+        'masked_name': best['MCT_NM'],
+        'address': best.get('ADDR_BASE'),
+        'sigungu': best.get('SIGUNGU'),
+        'category': best.get('CATEGORY'),
+        'score': float(best['__score']) if pd.notna(best['__score']) else None,
+    }
+    print("✅ resolved_merchant_id:", resolved['encoded_mct'])
+    return resolved
 
 
 def resolve_merchant(masked_name: str | None, sigungu: str | None, industry_label: str | None, merchants_df: pd.DataFrame | None):
@@ -371,14 +494,19 @@ def parse_question(q):
     elif ('요식' in original) or ('restaurant' in lower_q) or ('식당' in original):
         industry = 'restaurant'
 
-    merchant_pattern = re.search(r'(?P<sigungu>[\w\s가-힣]+구)\s+(?P<name>[\w가-힣\*]+)\s*\((?P<industry>[^\)]+)\)', original)
-    merchant_info = {'masked_name': None, 'sigungu': None, 'industry_label': None}
-    if merchant_pattern:
-        merchant_info = {
-            'masked_name': merchant_pattern.group('name').strip(),
-            'sigungu': merchant_pattern.group('sigungu').strip(),
-            'industry_label': merchant_pattern.group('industry').strip(),
-        }
+    merchant_mask = None
+    brace_match = re.search(r'\{([^{}]+)\}', original)
+    if brace_match:
+        merchant_mask = brace_match.group(1).strip()
+
+    sigungu_match = re.search(r'([가-힣A-Za-z]+구)', original)
+    merchant_sigungu = sigungu_match.group(1).strip() if sigungu_match else '성동구'
+
+    merchant_info = {
+        'masked_name': merchant_mask,
+        'sigungu': merchant_sigungu,
+        'industry_label': None,
+    }
 
     explicit_id = None
     trimmed = original.strip()
@@ -406,7 +534,7 @@ def subset_period(panel, months=DEFAULT_MONTHS):
 
 def kpi_summary(panel_sub):
     if panel_sub.empty:
-        return {}
+        return {}, {'latest_raw_snapshot': None, 'sanitized_snapshot': None}
     latest_idx = panel_sub.groupby('_merchant_id')['_date'].idxmax()
     snap = panel_sub.loc[latest_idx].sort_values('_date', ascending=False)
 
@@ -479,27 +607,32 @@ def kpi_summary(panel_sub):
         'n_merchants': int(snap['_merchant_id'].nunique()),
     }
 
-    raw_cols = [
-        'MCT_UE_CLN_REU_RAT',
-        'MCT_UE_CLN_NEW_RAT',
-        'M12_MAL_1020_RAT',
-        'M12_FME_1020_RAT',
-        'RC_M1_SHC_FLP_UE_CLN_RAT',
-        'RC_M1_SHC_RSD_UE_CLN_RAT',
-        'RC_M1_SHC_WP_UE_CLN_RAT',
-    ]
-    raw_snapshot = {col: detail_row.get(col) for col in raw_cols}
-    raw_snapshot['TA_YM'] = detail_row.get('TA_YM')
-    raw_snapshot['_date'] = str(detail_row.get('_date'))
-    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
-    print("✅ KPI sanitized:", json.dumps({
+    raw_snapshot = {
+        'TA_YM': detail_row.get('TA_YM'),
+        '_date': str(detail_row.get('_date')),
+        'MCT_UE_CLN_REU_RAT_raw': detail_row.get('MCT_UE_CLN_REU_RAT_raw'),
+        'MCT_UE_CLN_NEW_RAT_raw': detail_row.get('MCT_UE_CLN_NEW_RAT_raw'),
+        'M12_MAL_1020_RAT_raw': detail_row.get('M12_MAL_1020_RAT_raw'),
+        'M12_FME_1020_RAT_raw': detail_row.get('M12_FME_1020_RAT_raw'),
+        'RC_M1_SHC_FLP_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_FLP_UE_CLN_RAT_raw'),
+        'RC_M1_SHC_RSD_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_RSD_UE_CLN_RAT_raw'),
+        'RC_M1_SHC_WP_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_WP_UE_CLN_RAT_raw'),
+    }
+
+    sanitized_snapshot = {
         'revisit_pct': sanitized['revisit_rate_avg'],
         'new_pct': sanitized['new_rate_avg'],
         'youth_pct': sanitized['youth_share_avg'],
         'customer_mix_detail': sanitized['customer_mix_detail'],
-    }, ensure_ascii=False))
+        'age_top_segments': sanitized['age_top_segments'],
+        'avg_ticket_band_label': sanitized['avg_ticket_band_label'],
+    }
 
-    return sanitized
+    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
+    print("✅ KPI sanitized:", json.dumps(sanitized_snapshot, ensure_ascii=False))
+
+    return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
+
 
 def weather_effect(panel_sub, wx_monthly):
     if (wx_monthly is None) or panel_sub.empty or ('REVISIT_RATE' not in panel_sub):
@@ -513,14 +646,12 @@ def weather_effect(panel_sub, wx_monthly):
 
 def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR):
     merchants_df = load_set1(shinhan_dir)
-    panel = build_panel(shinhan_dir, merchants_df=merchants_df)
     qinfo = parse_question(question)
 
     run_id = datetime.datetime.utcnow().isoformat()
     parse_log = {
         'merchant_mask': qinfo.get('merchant_masked_name'),
         'sigungu': qinfo.get('merchant_sigungu'),
-        'industry_label': qinfo.get('merchant_industry_label'),
         'explicit_id': qinfo.get('merchant_explicit_id'),
     }
     print("🆔 agent1_run:", run_id)
@@ -549,26 +680,21 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         merchant_match = resolve_merchant(
             qinfo.get('merchant_masked_name'),
             qinfo.get('merchant_sigungu'),
-            qinfo.get('merchant_industry_label'),
             merchants_df,
         )
 
-    if merchant_match and merchant_match.get('encoded_mct') is not None:
-        merchant_match['encoded_mct'] = str(merchant_match['encoded_mct'])
-
-    merchants_covered_before = int(panel['_merchant_id'].nunique()) if '_merchant_id' in panel.columns else 0
-    panel_focus = panel
     target_id = None
-    if merchant_match and merchant_match.get('encoded_mct'):
-        target_id = merchant_match['encoded_mct']
-        panel_focus = panel[panel['_merchant_id'] == target_id]
-    merchants_covered_after = int(panel_focus['_merchant_id'].nunique()) if '_merchant_id' in panel_focus.columns else 0
+    if merchant_match and merchant_match.get('encoded_mct') is not None:
+        target_id = str(merchant_match['encoded_mct'])
+        merchant_match['encoded_mct'] = target_id
+
+    panel, panel_stats = build_panel(shinhan_dir, merchants_df=merchants_df, target_id=target_id)
+    panel_focus = panel
     print(
         "📦 panel_filter:",
         json.dumps({
-            'before': merchants_covered_before,
-            'after': merchants_covered_after,
             'target_id': target_id,
+            **panel_stats,
         }, ensure_ascii=False),
     )
     print("🏁 merchant_match:", json.dumps(merchant_match, ensure_ascii=False))
@@ -581,8 +707,8 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
     except Exception:
         wxm = None
 
-    kpis = kpi_summary(sub)
-    wfx  = weather_effect(sub, wxm)
+    kpis, kpi_debug = kpi_summary(sub)
+    wfx = weather_effect(sub, wxm)
 
     notes = []
     quality = 'normal'
@@ -591,6 +717,9 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         quality = 'low'
     if wxm is None and qinfo['weather'] is not None:
         notes.append('날씨 데이터 부재: 날씨 관련 효과는 추정하지 못했습니다.')
+        quality = 'low'
+    if qinfo.get('merchant_masked_name') is None:
+        notes.append('{상호} 형태의 입력이 없어 가맹점 식별을 진행하지 못했습니다.')
         quality = 'low'
     if merchant_match is None:
         notes.append('질문과 일치하는 가맹점을 찾지 못해 전체 표본을 사용했습니다.')
@@ -608,6 +737,7 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
             'parsed': qinfo,
             'merchant_query': merchant_query,
             'run_id': run_id,
+            'panel_stats': panel_stats,
         },
         'kpis': kpis,
         'weather_effect': wfx,
@@ -620,7 +750,14 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         },
         'sample': {
             'merchants_covered': int(sub['_merchant_id'].nunique()) if not sub.empty else 0
-        }
+        },
+        'debug': {
+            'parsed': parse_log,
+            'resolved_merchant_id': target_id,
+            'latest_raw_snapshot': kpi_debug.get('latest_raw_snapshot'),
+            'sanitized_snapshot': kpi_debug.get('sanitized_snapshot'),
+            'panel_stats': panel_stats,
+        },
     }
 
     if merchant_match:
@@ -632,6 +769,8 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         json.dump(out, f, ensure_ascii=False, indent=2)
     print('✅ Agent-1 JSON 저장:', out_path)
     return out
+
+
 
 def build_agent2_prompt(agent1_json):
     try:
@@ -902,7 +1041,7 @@ def main():
         except Exception:
             q = None
     if not q:
-        q = '성동구 고향*** (한식-찌개/전골) 가맹점 기준으로, 재방문율을 4주 안에 높일 실행카드 제시해줘.'
+        q = '성동구 {고향***} 기준으로, 재방문율을 4주 안에 높일 실행카드 제시해줘.'
         print('ℹ️ 질문이 없어 기본 예시를 사용합니다:', q)
 
     try:
