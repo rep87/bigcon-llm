@@ -411,14 +411,31 @@ JSON 형식:
         return None, meta
 
     def _response_text(resp):
-        parts = []
+        parts: list[str] = []
+
+        def _append_text(value):
+            if value:
+                parts.append(str(value))
+
         for part in getattr(resp, 'parts', []) or []:
-            text = getattr(part, 'text', None)
-            if text:
-                parts.append(text)
-        if hasattr(resp, 'text') and resp.text:
-            parts.append(resp.text)
-        return '\n'.join(parts)
+            _append_text(getattr(part, 'text', None))
+
+        # google.generativeai 응답은 candidates[*].content.parts 에도 텍스트가 담길 수 있다.
+        for candidate in getattr(resp, 'candidates', []) or []:
+            content = getattr(candidate, 'content', None)
+            if content is None:
+                continue
+            for part in getattr(content, 'parts', []) or []:
+                _append_text(getattr(part, 'text', None))
+
+        if hasattr(resp, 'text'):
+            try:
+                quick_text = resp.text
+            except ValueError:
+                quick_text = None
+            _append_text(quick_text)
+
+        return '\n'.join([p for p in parts if p])
 
     text = _response_text(response)
     meta['elapsed_ms'] = to_ms(t0)
@@ -427,7 +444,20 @@ JSON 형식:
     block_reason = None
     if prompt_feedback is not None:
         block_reason = getattr(prompt_feedback, 'block_reason', None)
-    meta['safety_blocked'] = bool(block_reason and str(block_reason).lower() != 'block_none')
+    safety_blocked = bool(block_reason and str(block_reason).lower() != 'block_none')
+
+    if not safety_blocked:
+        # 후보의 finish_reason 이 안전 차단을 나타내면 안전 차단으로 간주한다.
+        for candidate in getattr(response, 'candidates', []) or []:
+            finish_reason = getattr(candidate, 'finish_reason', None)
+            if finish_reason is None:
+                continue
+            fr_text = str(finish_reason).lower()
+            if 'safety' in fr_text or 'blocked' in fr_text or fr_text in {'block_safety', '2'}:
+                safety_blocked = True
+                break
+
+    meta['safety_blocked'] = safety_blocked
 
     if not text:
         print('⚠️ LLM 보조 매칭 응답이 비었습니다.')
