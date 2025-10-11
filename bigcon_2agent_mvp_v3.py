@@ -426,7 +426,7 @@ def kpi_summary(panel_sub):
             return None
         if f < 0 or f > 100:
             return None
-        return round(f, 2)
+        return round(f, 1)
 
     detail_row = snap.iloc[0]
     youth_latest = _safe_float(detail_row.get('YOUTH_SHARE'))
