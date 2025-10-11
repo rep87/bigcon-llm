@@ -304,7 +304,7 @@ st.sidebar.write(f"📁 SHINHAN_DIR 존재: {SHINHAN_DIR.exists()}")
 st.sidebar.write(f"📁 EXTERNAL_DIR 존재: {EXTERNAL_DIR.exists()}")
 
 # ===== 질문 입력 =====
-default_q = "비 오는 날 20대 이하 카페 홍보 전략 제시해줘"
+default_q = "성동구 고향*** (한식-찌개/전골) 가맹점 기준으로, 재방문율을 4주 안에 높일 실행카드 제시해줘."
 question = st.text_input("질문을 입력하세요", value=default_q)
 
 # ===== 실행 버튼 =====
