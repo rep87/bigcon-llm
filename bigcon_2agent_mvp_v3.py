@@ -3,6 +3,7 @@
 # %pip -q install google-generativeai pandas openpyxl
 
 import os, json, re, random, sys, glob, datetime
+from time import perf_counter
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -24,6 +25,32 @@ random.seed(SEED); np.random.seed(SEED)
 
 _SCHEMA_CACHE = None
 _SCHEMA_VALIDATOR = None
+
+
+def tick():
+    return perf_counter()
+
+
+def to_ms(t0):
+    return int((perf_counter() - t0) * 1000)
+
+
+def _env_flag(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value if value is not None else default
+
+
+USE_LLM = _env_flag("AGENT1_USE_LLM", "true").lower() not in {"0", "false", "no"}
+DEBUG_MAX_PREVIEW = int(_env_flag("DEBUG_MAX_PREVIEW", "200") or 200)
+DEBUG_SHOW_RAW = _env_flag("DEBUG_SHOW_RAW", "true").lower() in {"1", "true", "yes"}
+
+
+def _mask_debug_preview(text: str | None, limit: int = DEBUG_MAX_PREVIEW) -> str:
+    if not text:
+        return ""
+    masked = re.sub(r"\{[^{}]*\}", "{***}", str(text))
+    masked = re.sub(r"([A-Za-z0-9]{4})[A-Za-z0-9]{4,}", r"\1***", masked)
+    return masked[:limit]
 
 
 def _normalize_str(value: str) -> str:
@@ -196,6 +223,95 @@ def load_weather_monthly(external_dir):
     monthly['_date'] = pd.to_datetime(monthly['TA_YM'] + '01', format='%Y%m%d', errors='coerce')
     return monthly[['TA_YM','_date','RAIN_SUM']]
 
+
+def _format_percent_debug(value):
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num < 0 or num > 100:
+        return None
+    return round(num, 2)
+
+
+def _format_percent_text(value):
+    pct = _format_percent_debug(value)
+    if pct is None:
+        return '—'
+    return f"{pct:.1f}%"
+
+
+def _format_customer_mix_debug(detail):
+    if not isinstance(detail, dict):
+        return '—'
+    ordered_labels = ['유동', '거주', '직장']
+    parts = []
+    for label in ordered_labels:
+        pct = _format_percent_text(detail.get(label))
+        if pct != '—':
+            parts.append(f"{label} {pct}")
+    for label, value in detail.items():
+        if label in ordered_labels:
+            continue
+        pct = _format_percent_text(value)
+        if pct != '—':
+            parts.append(f"{label} {pct}")
+    return ', '.join(parts[:3]) if parts else '—'
+
+
+def _format_age_segments_debug(segments):
+    if not isinstance(segments, (list, tuple)):
+        return '—'
+    formatted = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        label = seg.get('label') or seg.get('code')
+        value = _format_percent_text(seg.get('value'))
+        if label and value != '—':
+            formatted.append(f"{label} {value}")
+    return ', '.join(formatted[:3]) if formatted else '—'
+
+
+def _build_debug_table(qinfo, merchant_match, sanitized_snapshot):
+    industry_candidate = None
+    if merchant_match:
+        industry_candidate = merchant_match.get('category')
+    if not industry_candidate:
+        industry_candidate = qinfo.get('merchant_industry_label') or qinfo.get('industry')
+    industry_labels = {
+        'cafe': '카페',
+        'restaurant': '음식점',
+        'retail': '소매',
+    }
+    industry = industry_labels.get(industry_candidate, industry_candidate or '—')
+
+    address = '—'
+    if merchant_match:
+        addr = merchant_match.get('address')
+        if isinstance(addr, (list, tuple)):
+            addr = ' / '.join([str(v) for v in addr if v])
+        if addr:
+            address = str(addr)
+
+    revisit = _format_percent_text((sanitized_snapshot or {}).get('revisit_pct'))
+    new = _format_percent_text((sanitized_snapshot or {}).get('new_pct'))
+    revisit_block = '—'
+    if revisit != '—' or new != '—':
+        revisit_block = f"신규 {new} / 재방문 {revisit}"
+
+    table = {
+        '업종': industry,
+        '주소': address,
+        '주요 고객층': _format_age_segments_debug((sanitized_snapshot or {}).get('age_top_segments')),
+        '고객 유형': _format_customer_mix_debug((sanitized_snapshot or {}).get('customer_mix_detail')),
+        '신규/재방문': revisit_block,
+        '객단가 구간': (sanitized_snapshot or {}).get('avg_ticket_band_label') or '—',
+    }
+    return table
+
 def build_panel(shinhan_dir, merchants_df=None, target_id=None):
     s1 = merchants_df if merchants_df is not None else load_set1(shinhan_dir)
     s2_all = load_set2(shinhan_dir)
@@ -239,19 +355,32 @@ def build_panel(shinhan_dir, merchants_df=None, target_id=None):
 
 
 def call_llm_for_mask(original_question: str | None, merchant_mask: str | None, sigungu: str | None):
+    meta = {
+        'used': False,
+        'model': 'models/gemini-2.5-flash',
+        'prompt_preview': '',
+        'resp_bytes': 0,
+        'safety_blocked': False,
+        'elapsed_ms': 0,
+        'error': None,
+    }
+
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         print('⚠️ GEMINI_API_KEY 미설정으로 LLM 보조 매칭을 건너뜁니다.')
-        return None
+        meta['error'] = 'missing_api_key'
+        return None, meta
     try:
         import google.generativeai as genai
     except ImportError:
         print('⚠️ google-generativeai 미설치로 LLM 보조 매칭을 건너뜁니다.')
-        return None
+        meta['error'] = 'missing_dependency'
+        return None, meta
 
     genai.configure(api_key=api_key)
+    model_name = meta['model']
     model = genai.GenerativeModel(
-        model_name='models/gemini-2.5-flash',
+        model_name=model_name,
         generation_config={
             'temperature': 0.1,
             'top_p': 0.8,
@@ -270,11 +399,16 @@ JSON 형식:
 {{"merchant_mask":"문자열 또는 null","sigungu":"문자열 또는 null","notes":"간단 메모"}}
 """
 
+    meta['prompt_preview'] = _mask_debug_preview(prompt)
+    t0 = tick()
+
     try:
         response = model.generate_content(prompt)
     except Exception as exc:
+        meta['elapsed_ms'] = to_ms(t0)
+        meta['error'] = str(exc)
         print('⚠️ LLM 보조 매칭 호출 실패:', exc)
-        return None
+        return None, meta
 
     def _response_text(resp):
         parts = []
@@ -287,22 +421,37 @@ JSON 형식:
         return '\n'.join(parts)
 
     text = _response_text(response)
+    meta['elapsed_ms'] = to_ms(t0)
+
+    prompt_feedback = getattr(response, 'prompt_feedback', None)
+    block_reason = None
+    if prompt_feedback is not None:
+        block_reason = getattr(prompt_feedback, 'block_reason', None)
+    meta['safety_blocked'] = bool(block_reason and str(block_reason).lower() != 'block_none')
+
     if not text:
         print('⚠️ LLM 보조 매칭 응답이 비었습니다.')
-        return None
+        meta['used'] = True
+        meta['error'] = 'empty_text'
+        return None, meta
+
+    meta['used'] = True
+    meta['resp_bytes'] = len(text.encode('utf-8'))
 
     match = re.search(r'\{[\s\S]*\}', text)
     if not match:
         print('⚠️ LLM 보조 매칭에서 JSON을 찾지 못했습니다.')
-        return None
+        meta['error'] = 'json_not_found'
+        return None, meta
 
     try:
         data = json.loads(match.group(0))
     except Exception as exc:
         print('⚠️ LLM 보조 매칭 JSON 파싱 실패:', exc)
-        return None
+        meta['error'] = f'json_parse_error: {exc}'
+        return None, meta
 
-    return data if isinstance(data, dict) else None
+    return (data if isinstance(data, dict) else None), meta
 
 
 def resolve_merchant(
@@ -464,10 +613,11 @@ def resolve_merchant(
 
     # Rule-2 failed → optional LLM assist
     if allow_llm:
-        llm_result = call_llm_for_mask(original_question, masked_name, sigungu)
+        llm_result, llm_meta = call_llm_for_mask(original_question, masked_name, sigungu)
         debug_info['notes'] = 'llm_invoked'
+        if llm_meta:
+            debug_info['llm'] = {'parsed': llm_result, **llm_meta}
         if llm_result:
-            debug_info['llm'] = llm_result
             new_mask = llm_result.get('merchant_mask') or masked_name
             new_prefix = (new_mask.split('*', 1)[0].strip() if new_mask else mask_prefix)
             new_sigungu = llm_result.get('sigungu') or sigungu
@@ -481,7 +631,8 @@ def resolve_merchant(
                     allow_llm=False,
                 )
                 if isinstance(nested_debug, dict):
-                    nested_debug.setdefault('llm', llm_result)
+                    if llm_meta:
+                        nested_debug.setdefault('llm', {'parsed': llm_result, **llm_meta})
                     nested_debug['notes'] = nested_debug.get('notes') or 'llm_invoked'
                     if not nested_debug.get('path'):
                         nested_debug['path'] = 'llm'
@@ -561,16 +712,23 @@ def parse_question(q):
         industry = 'restaurant'
 
     merchant_mask = None
+    pattern_used = 'none'
     brace_match = re.search(r'\{([^{}]+)\}', normalized)
     if brace_match:
         merchant_mask = brace_match.group(1).strip()
+        pattern_used = 'curly_brace'
 
     mask_prefix = None
     if merchant_mask:
         mask_prefix = merchant_mask.split('*', 1)[0].strip()
 
+    sigungu_pattern = 'hangul_gu_regex'
     sigungu_match = re.search(r'(?P<sigungu>[가-힣]{2,}구)', normalized)
-    merchant_sigungu = sigungu_match.group('sigungu') if sigungu_match else '성동구'
+    if sigungu_match:
+        merchant_sigungu = sigungu_match.group('sigungu')
+    else:
+        merchant_sigungu = '성동구'
+        sigungu_pattern = 'default_sigungu'
 
     merchant_info = {
         'masked_name': merchant_mask,
@@ -597,6 +755,8 @@ def parse_question(q):
         'merchant_sigungu': merchant_info['sigungu'],
         'merchant_industry_label': merchant_info['industry_label'],
         'merchant_explicit_id': explicit_id,
+        'merchant_pattern_used': pattern_used,
+        'merchant_sigungu_pattern': sigungu_pattern,
     }
 
 def subset_period(panel, months=DEFAULT_MONTHS):
@@ -734,8 +894,35 @@ def weather_effect(panel_sub, wx_monthly):
     return {'metric':'REVISIT_RATE','effect':float(corr), 'ci':[None,None], 'note':'피어슨 상관(월단위)'}
 
 def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR):
+    debug_block = {
+        'input': {
+            'original': _mask_debug_preview(question, limit=120),
+            'flags': {
+                'USE_LLM': USE_LLM,
+                'DEBUG_MAX_PREVIEW': DEBUG_MAX_PREVIEW,
+                'DEBUG_SHOW_RAW': DEBUG_SHOW_RAW,
+            },
+        },
+        'errors': [],
+    }
+
     merchants_df = load_set1(shinhan_dir)
-    qinfo = parse_question(question)
+
+    parse_t0 = tick()
+    try:
+        qinfo = parse_question(question)
+    except Exception as exc:
+        debug_block['errors'].append({'stage': 'parse', 'msg': str(exc)})
+        debug_block['parse'] = {'elapsed_ms': to_ms(parse_t0)}
+        raise
+    parse_elapsed = to_ms(parse_t0)
+    debug_block['parse'] = {
+        'merchant_mask': qinfo.get('merchant_masked_name'),
+        'mask_prefix': qinfo.get('merchant_mask_prefix'),
+        'sigungu': qinfo.get('merchant_sigungu'),
+        'pattern_used': qinfo.get('merchant_pattern_used'),
+        'elapsed_ms': parse_elapsed,
+    }
 
     run_id = datetime.datetime.utcnow().isoformat()
     parse_log = {
@@ -748,20 +935,6 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
     print("🆔 agent1_run:", run_id)
     print("🧾 question_fields:", json.dumps(parse_log, ensure_ascii=False))
 
-    print(
-        "🧪 parse_debug:",
-        json.dumps(
-            {
-                'original': qinfo.get('original_question'),
-                'normalized': qinfo.get('normalized_question'),
-                'merchant_mask': qinfo.get('merchant_masked_name'),
-                'mask_prefix': qinfo.get('merchant_mask_prefix'),
-                'sigungu': qinfo.get('merchant_sigungu'),
-            },
-            ensure_ascii=False,
-        ),
-    )
-
     merchant_match = None
     resolve_meta = {
         'candidates': [],
@@ -770,72 +943,137 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         'suggestions': None,
         'llm': None,
     }
-    explicit_id = qinfo.get('merchant_explicit_id')
-    if explicit_id:
-        lookup = merchants_df[merchants_df['ENCODED_MCT'] == explicit_id]
-        print(
-            "🏷 explicit_id_lookup:",
-            json.dumps({'explicit_id': explicit_id, 'row_count': int(len(lookup))}, ensure_ascii=False),
-        )
-        if not lookup.empty:
-            row = lookup.iloc[0]
-            merchant_match = {
-                'encoded_mct': str(row['ENCODED_MCT']),
-                'masked_name': row.get('MCT_NM'),
-                'address': row.get('ADDR_BASE'),
-                'sigungu': row.get('SIGUNGU'),
-                'category': row.get('CATEGORY'),
-                'score': None,
-            }
-            resolve_meta['path'] = 'explicit_id'
 
-    if merchant_match is None:
-        merchant_match, resolve_meta = resolve_merchant(
-            qinfo.get('merchant_masked_name'),
-            qinfo.get('merchant_mask_prefix'),
-            qinfo.get('merchant_sigungu'),
-            merchants_df,
-            original_question=qinfo.get('normalized_question') or question,
-            allow_llm=True,
-        )
+    resolve_stage = {
+        'path': 'none',
+        'candidates_top3': [],
+        'resolved_merchant_id': None,
+    }
+
+    resolve_t0 = tick()
+    try:
+        explicit_id = qinfo.get('merchant_explicit_id')
+        if explicit_id:
+            lookup = merchants_df[merchants_df['ENCODED_MCT'] == explicit_id]
+            print(
+                "🏷 explicit_id_lookup:",
+                json.dumps({'explicit_id': explicit_id, 'row_count': int(len(lookup))}, ensure_ascii=False),
+            )
+            if not lookup.empty:
+                row = lookup.iloc[0]
+                merchant_match = {
+                    'encoded_mct': str(row['ENCODED_MCT']),
+                    'masked_name': row.get('MCT_NM'),
+                    'address': row.get('ADDR_BASE'),
+                    'sigungu': row.get('SIGUNGU'),
+                    'category': row.get('CATEGORY'),
+                    'score': None,
+                }
+                resolve_meta['path'] = 'user'
+
+        if merchant_match is None:
+            merchant_match, resolve_meta = resolve_merchant(
+                qinfo.get('merchant_masked_name'),
+                qinfo.get('merchant_mask_prefix'),
+                qinfo.get('merchant_sigungu'),
+                merchants_df,
+                original_question=qinfo.get('normalized_question') or question,
+                allow_llm=USE_LLM,
+            )
+    except Exception as exc:
+        debug_block['errors'].append({'stage': 'resolve', 'msg': str(exc)})
+        raise
+    finally:
+        resolve_stage['elapsed_ms'] = to_ms(resolve_t0)
 
     target_id = None
     if merchant_match and merchant_match.get('encoded_mct') is not None:
         target_id = str(merchant_match['encoded_mct'])
         merchant_match['encoded_mct'] = target_id
 
-    panel, panel_stats = build_panel(shinhan_dir, merchants_df=merchants_df, target_id=target_id)
-    panel_focus = panel
-    print(
-        "📦 panel_filter:",
-        json.dumps({
-            'target_id': target_id,
-            **panel_stats,
-        }, ensure_ascii=False),
-    )
-    print("🏁 merchant_match:", json.dumps(merchant_match, ensure_ascii=False))
-    print(
-        "🧭 resolve_summary:",
-        json.dumps(
-            {
-                'path': resolve_meta.get('path'),
-                'notes': resolve_meta.get('notes'),
-                'candidates': resolve_meta.get('candidates'),
-            },
-            ensure_ascii=False,
-            default=str,
-        ),
-    )
+    if resolve_meta.get('path') is None:
+        resolve_meta['path'] = 'llm' if resolve_meta.get('llm') else 'none'
+    resolve_stage['path'] = resolve_meta.get('path') or 'none'
+    resolve_stage['resolved_merchant_id'] = target_id
 
-    sub = subset_period(panel_focus, months=qinfo['months'])
+    candidate_payload = []
+    for cand in resolve_meta.get('candidates') or []:
+        cid = cand.get('ENCODED_MCT') or cand.get('encoded_mct')
+        try:
+            score_val = cand.get('score')
+            score = round(float(score_val), 4) if score_val is not None else None
+        except (TypeError, ValueError):
+            score = None
+        candidate_payload.append({
+            'id': str(cid) if cid is not None else None,
+            'name': cand.get('MCT_NM') or cand.get('masked_name'),
+            'sigungu': cand.get('SIGUNGU') or cand.get('sigungu'),
+            'score': score,
+        })
+    resolve_stage['candidates_top3'] = candidate_payload[:3]
+    debug_block['resolve'] = resolve_stage
+
+    llm_meta = resolve_meta.get('llm') or {}
+    agent1_llm = {
+        'used': bool(llm_meta.get('used')),
+        'model': llm_meta.get('model'),
+        'prompt_preview': llm_meta.get('prompt_preview', ''),
+        'resp_bytes': llm_meta.get('resp_bytes'),
+        'safety_blocked': bool(llm_meta.get('safety_blocked')),
+        'elapsed_ms': llm_meta.get('elapsed_ms'),
+    }
+    debug_block['agent1_llm'] = agent1_llm
+
+    panel_stage = {}
+    panel_t0 = tick()
+    try:
+        panel, panel_stats = build_panel(shinhan_dir, merchants_df=merchants_df, target_id=target_id)
+    except Exception as exc:
+        panel_stage['elapsed_ms'] = to_ms(panel_t0)
+        debug_block['errors'].append({'stage': 'panel', 'msg': str(exc)})
+        debug_block['panel'] = panel_stage
+        raise
+    panel_elapsed = to_ms(panel_t0)
+    sub = subset_period(panel, months=qinfo['months'])
+    panel_stage.update({
+        'rows_before': int(len(panel)),
+        'rows_after': int(len(sub)),
+        'latest_ta_ym': str(sub['TA_YM'].max()) if not sub.empty and 'TA_YM' in sub.columns else None,
+        'elapsed_ms': panel_elapsed,
+        'stats': panel_stats,
+    })
+    debug_block['panel'] = panel_stage
 
     wxm = None
     try:
         wxm = load_weather_monthly(external_dir)
-    except Exception:
+    except Exception as exc:
+        debug_block['errors'].append({'stage': 'weather', 'msg': str(exc)})
         wxm = None
 
+    snapshot_t0 = tick()
     kpis, kpi_debug = kpi_summary(sub)
+    snapshot_elapsed = to_ms(snapshot_t0)
+
+    raw_snapshot = {}
+    raw_source = (kpi_debug or {}).get('latest_raw_snapshot') or {}
+    for key, value in raw_source.items():
+        if key.endswith('_raw'):
+            raw_snapshot[key[:-4]] = value
+        else:
+            raw_snapshot[key] = value
+    sanitized_snapshot = (kpi_debug or {}).get('sanitized_snapshot') or {}
+    debug_block['snapshot'] = {
+        'raw': raw_snapshot,
+        'sanitized': sanitized_snapshot,
+        'elapsed_ms': snapshot_elapsed,
+    }
+
+    render_table = _build_debug_table(qinfo, merchant_match, sanitized_snapshot)
+    debug_block['render'] = {
+        'table_dict': render_table,
+    }
+
     wfx = weather_effect(sub, wxm)
 
     notes = []
@@ -868,9 +1106,9 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
             'parsed': qinfo,
             'merchant_query': merchant_query,
             'run_id': run_id,
-            'panel_stats': panel_stats,
+            'panel_stats': panel_stage.get('stats', {}),
             'merchant_candidates': resolve_meta.get('candidates'),
-            'merchant_resolution_path': resolve_meta.get('path'),
+            'merchant_resolution_path': resolve_stage['path'],
         },
         'kpis': kpis,
         'weather_effect': wfx,
@@ -884,19 +1122,7 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         'sample': {
             'merchants_covered': merchants_covered
         },
-        'debug': {
-            'parsed': parse_log,
-            'resolved_merchant_id': target_id,
-            'resolve_path': resolve_meta.get('path'),
-            'resolve_candidates': resolve_meta.get('candidates'),
-            'resolve_notes': resolve_meta.get('notes'),
-            'resolve_suggestions': resolve_meta.get('suggestions'),
-            'llm_result': resolve_meta.get('llm'),
-            'latest_raw_snapshot': kpi_debug.get('latest_raw_snapshot'),
-            'sanitized_snapshot': kpi_debug.get('sanitized_snapshot'),
-            'panel_stats': panel_stats,
-            'merchants_covered': merchants_covered,
-        },
+        'debug': debug_block,
     }
 
     if merchant_match:
@@ -908,8 +1134,6 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         json.dump(out, f, ensure_ascii=False, indent=2)
     print('✅ Agent-1 JSON 저장:', out_path)
     return out
-
-
 
 def build_agent2_prompt(agent1_json):
     try:
