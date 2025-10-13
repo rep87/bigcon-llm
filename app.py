@@ -2,7 +2,12 @@ import os, json, traceback, re, hashlib
 from pathlib import Path
 import streamlit as st
 import pandas as pd
-from diagnostics import build_catalog, export_reports, load_set1, summarize_catalog
+from diagnostics.catalog import (
+    build_catalog,
+    export_reports,
+    load_set1,
+    summarize_catalog,
+)
 
 # ===== 페이지 기본 =====
 st.set_page_config(page_title="성동구 소상공인 비밀상담사 (MVP)", page_icon="💬", layout="wide")
