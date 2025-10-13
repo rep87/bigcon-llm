@@ -38,6 +38,32 @@ except ImportError as exc:  # pragma: no cover - startup guard
     )
     st.stop()
 
+try:
+    from diagnostics.catalog import load_set1, build_catalog, summarize_catalog
+    from diagnostics.report import export_reports
+    try:
+        from diagnostics.resolver_audit import (
+            run_resolver_audit,
+            summarize_audit,
+            export_audit,
+        )
+    except ImportError:
+        run_resolver_audit = summarize_audit = export_audit = None
+    try:
+        from diagnostics.access_audit import (
+            run_access_audit,
+            summarize_access,
+            export_access,
+        )
+    except ImportError:
+        run_access_audit = summarize_access = export_access = None
+except ImportError as exc:  # pragma: no cover - startup guard
+    st.error(
+        "진단 모듈 임포트 실패: "
+        f"{exc.__class__.__name__}. 브랜치가 최신인지, 파일이 커밋/배포되었는지 확인하세요."
+    )
+    st.stop()
+
 # ===== 페이지 기본 =====
 st.set_page_config(page_title="성동구 소상공인 비밀상담사 (MVP)", page_icon="💬", layout="wide")
 st.title("성동구 소상공인 비밀상담사 (MVP)")

@@ -3,14 +3,10 @@
 
 from __future__ import annotations
 
-import json
-from datetime import datetime
-from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 
-from .report import ensure_directory
 
 _REQUIRED_COLS = {
     "ENCODED_MCT": ["ENCODED_MCT", "ENCODED-MCT", "MCT_ID", "STORE_ID"],
@@ -203,26 +199,3 @@ def summarize_catalog(cat_df: "pd.DataFrame") -> dict:
         "pct_duplicate_name": pct_duplicate,
         "top_duplicated": top,
     }
-
-
-def export_reports(
-    cat_df: "pd.DataFrame",
-    summary: dict,
-    out_dir: str = "diagnostics/results",
-) -> dict:
-    """CSV/JSON 저장.
-    - {out_dir}/catalog_<timestamp>.csv
-    - {out_dir}/catalog_summary_<timestamp>.json
-    반환: {'catalog_csv': path, 'summary_json': path}
-    """
-
-    ensure_directory(out_dir)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    catalog_path = Path(out_dir) / f"catalog_{timestamp}.csv"
-    summary_path = Path(out_dir) / f"catalog_summary_{timestamp}.json"
-
-    cat_df.to_csv(catalog_path, index=False)
-    with summary_path.open("w", encoding="utf-8") as fp:
-        json.dump(summary, fp, ensure_ascii=False, indent=2)
-
-    return {"catalog_csv": str(catalog_path), "summary_json": str(summary_path)}
