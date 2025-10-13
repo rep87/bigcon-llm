@@ -2,10 +2,13 @@ import os, json, traceback, re, hashlib
 from pathlib import Path
 import streamlit as st
 import pandas as pd
-from diagnostics.catalog import (
+from diagnostics import (
     build_catalog,
     export_reports,
+    export_access,
     load_set1,
+    run_access_audit,
+    summarize_access,
     summarize_catalog,
 )
 
@@ -751,6 +754,217 @@ with diagnostics_tab:
             with open(json_path, "rb") as fp:
                 dl_cols[1].download_button(
                     "요약 JSON 다운로드",
+                    data=fp.read(),
+                    file_name=Path(json_path).name,
+                    mime="application/json",
+                )
+        else:
+            dl_cols[1].write("JSON 파일이 아직 생성되지 않았습니다.")
+
+    st.markdown("---")
+    st.subheader("접근 감사 (Access Audit)")
+
+    audit_default_index = sigungu_options.index(default_sigungu)
+    audit_sigungu = st.selectbox(
+        "시군구 선택 (접근 감사)",
+        options=sigungu_options,
+        index=audit_default_index,
+        key="audit_sigungu",
+    )
+
+    audit_mode = st.radio(
+        "샘플 모드",
+        options=["Random", "Search"],
+        key="audit_mode",
+        horizontal=True,
+    )
+
+    audit_terms: list[str] | None = None
+    if audit_mode == "Random":
+        audit_n = int(
+            st.number_input(
+                "샘플 수",
+                min_value=1,
+                max_value=200,
+                value=10,
+                step=1,
+                key="audit_sample_count",
+            )
+        )
+        audit_prefix = int(
+            st.number_input(
+                "마스킹 접두 길이",
+                min_value=1,
+                max_value=4,
+                value=2,
+                step=1,
+                key="audit_prefix_len",
+            )
+        )
+    else:
+        search_input = st.text_area(
+            "상호 검색어 (줄당 1개, {고향***} 형식)",
+            value="",
+            key="audit_search_terms",
+            height=120,
+        )
+        audit_terms = [line.strip() for line in search_input.splitlines() if line.strip()]
+        audit_n = 0
+        audit_prefix = 2
+
+    audit_brand_match = st.checkbox(
+        "동일 브랜드를 정답으로 인정", value=True, key="audit_brand_match"
+    )
+
+    if st.button("접근 감사 실행", key="btn_access_audit"):
+        if audit_mode == "Search" and not audit_terms:
+            st.warning("검색 모드에서는 최소 1개의 검색어를 입력해 주세요.")
+        else:
+            try:
+                with st.spinner("접근 감사를 수행하는 중입니다..."):
+                    progress = st.progress(0)
+                    audit_df = run_access_audit(
+                        mode=audit_mode.lower(),
+                        sigungu=None if audit_sigungu == "전체" else audit_sigungu,
+                        n=audit_n or 10,
+                        search_terms=audit_terms,
+                        mask_prefix_len=audit_prefix,
+                        brand_match=audit_brand_match,
+                        seed=42,
+                    )
+                    progress.progress(100)
+                summary = summarize_access(audit_df)
+                signature = _hash_dataframe(audit_df)
+                audit_state = {
+                    "df": audit_df,
+                    "summary": summary,
+                    "sigungu": audit_sigungu,
+                    "mode": audit_mode,
+                    "signature": signature,
+                    "exports": None,
+                }
+                st.session_state['diagnostics_access_audit'] = audit_state
+                st.success("접근 감사가 완료되었습니다.")
+            except FileNotFoundError:
+                st.error("Shinhan CSV 파일을 찾을 수 없습니다. (Set1/2/3)")
+            except Exception:
+                st.error("접근 감사 실행 중 오류가 발생했습니다.")
+                st.code(traceback.format_exc())
+
+    audit_state = st.session_state.get('diagnostics_access_audit')
+    if not audit_state or audit_state.get('df') is None:
+        st.info("상단의 [접근 감사 실행] 버튼을 눌러 결과를 생성하세요.")
+    else:
+        audit_df = audit_state['df']
+        summary = audit_state.get('summary', {})
+        signature = _hash_dataframe(audit_df)
+        if signature != audit_state.get('signature'):
+            audit_state['signature'] = signature
+            audit_state['exports'] = None
+            st.session_state['diagnostics_access_audit'] = audit_state
+
+        if audit_df is not None and not audit_df.empty and not audit_state.get('exports'):
+            audit_state['exports'] = export_access(audit_df, summary)
+            st.session_state['diagnostics_access_audit'] = audit_state
+
+        st.markdown(
+            f"총 {len(audit_df):,}건 샘플 · Resolver 성공률 {summary.get('resolved_rate', 0.0):.1f}%"
+        )
+
+        metric_rows = [
+            [
+                ("Resolver 성공률", f"{summary.get('resolved_rate', 0.0):.1f}%"),
+                ("정확도", f"{summary.get('accuracy', 0.0):.1f}%"),
+                ("Out-of-range 건수", f"{summary.get('out_of_range_count', 0)}"),
+            ],
+            [
+                ("S1 접근률", f"{summary.get('s1_access_rate', 0.0):.1f}%"),
+                ("S2 접근률", f"{summary.get('s2_access_rate', 0.0):.1f}%"),
+                ("S3 접근률", f"{summary.get('s3_access_rate', 0.0):.1f}%"),
+            ],
+            [
+                ("S1 컬럼 커버리지", f"{summary.get('s1_coverage', 0.0):.1f}%"),
+                ("S2 컬럼 커버리지", f"{summary.get('s2_coverage', 0.0):.1f}%"),
+                ("S3 컬럼 커버리지", f"{summary.get('s3_coverage', 0.0):.1f}%"),
+            ],
+            [
+                ("S1 NaN 중간값", f"{summary.get('s1_nan_median', 0.0):.1f}%"),
+                ("S2 NaN 중간값", f"{summary.get('s2_nan_median', 0.0):.1f}%"),
+                ("S3 NaN 중간값", f"{summary.get('s3_nan_median', 0.0):.1f}%"),
+            ],
+        ]
+
+        for items in metric_rows:
+            cols = st.columns(len(items))
+            for col, (label, value) in zip(cols, items):
+                col.metric(label, value)
+
+        warn_conditions = []
+        if 'is_correct' in audit_df.columns:
+            warn_conditions.append(~audit_df['is_correct'].astype(bool))
+        if 's1_found' in audit_df.columns:
+            warn_conditions.append(~audit_df['s1_found'].astype(bool))
+        if 's2_found' in audit_df.columns:
+            warn_conditions.append(~audit_df['s2_found'].astype(bool))
+        if 's3_found' in audit_df.columns:
+            warn_conditions.append(~audit_df['s3_found'].astype(bool))
+        if 'out_of_range_flags' in audit_df.columns:
+            warn_conditions.append(audit_df['out_of_range_flags'].fillna("") != "")
+
+        warn_mask = None
+        for cond in warn_conditions:
+            warn_mask = cond if warn_mask is None else (warn_mask | cond)
+
+        if warn_mask is None:
+            warn_df = audit_df.iloc[0:0]
+        else:
+            warn_df = audit_df[warn_mask]
+
+        warn_cols = [
+            "input_text",
+            "resolved_id",
+            "truth_id",
+            "truth_brand",
+            "is_correct",
+            "s1_found",
+            "s2_found",
+            "s3_found",
+            "s1_cols_present",
+            "s1_cols_expected",
+            "s2_cols_present",
+            "s2_cols_expected",
+            "s3_cols_present",
+            "s3_cols_expected",
+            "out_of_range_flags",
+            "path",
+        ]
+        if warn_df.empty:
+            st.success("경고 항목이 없습니다. 모든 샘플이 정상 접근되었습니다.")
+        else:
+            for col in warn_cols:
+                if col not in warn_df.columns:
+                    warn_df[col] = pd.NA
+            st.markdown("**실패/경고 샘플 (상위 100건)**")
+            st.dataframe(warn_df[warn_cols].head(100))
+
+        exports = audit_state.get('exports') or {}
+        dl_cols = st.columns(2)
+        csv_path = exports.get('csv') if isinstance(exports, dict) else None
+        json_path = exports.get('summary') if isinstance(exports, dict) else None
+        if csv_path and Path(csv_path).exists():
+            with open(csv_path, "rb") as fp:
+                dl_cols[0].download_button(
+                    "접근 감사 CSV 다운로드",
+                    data=fp.read(),
+                    file_name=Path(csv_path).name,
+                    mime="text/csv",
+                )
+        else:
+            dl_cols[0].write("CSV 파일이 아직 생성되지 않았습니다.")
+        if json_path and Path(json_path).exists():
+            with open(json_path, "rb") as fp:
+                dl_cols[1].download_button(
+                    "접근 감사 요약 JSON 다운로드",
                     data=fp.read(),
                     file_name=Path(json_path).name,
                     mime="application/json",
