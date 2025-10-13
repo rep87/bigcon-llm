@@ -2,6 +2,15 @@ import os, json, traceback, re, hashlib
 from pathlib import Path
 import streamlit as st
 import pandas as pd
+from diagnostics import (
+    build_catalog,
+    export_reports,
+    export_access,
+    load_set1,
+    run_access_audit,
+    summarize_access,
+    summarize_catalog,
+)
 
 try:
     from diagnostics.catalog import load_set1, build_catalog, summarize_catalog
