@@ -1165,36 +1165,162 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
     print('✅ Agent-1 JSON 저장:', out_path)
     return out
 
-def build_agent2_prompt(agent1_json):
+QUESTION_TYPE_INFO = {
+    "Q1_CAFE_CHANNELS": {
+        "label": "주요 방문 고객 특성에 따른 채널 추천 및 홍보안",
+        "instructions": [
+            "연령/성별·유동/거주 구성 비중을 활용해 채널과 메시지를 제시합니다.",
+            "온·오프라인 3~4개 홍보 아이디어를 간결하게 작성합니다.",
+            "각 아이디어는 고객군 → 채널 → 실행 요약을 포함합니다.",
+        ],
+    },
+    "Q2_LOW_RETENTION": {
+        "label": "재방문률 30% 이하 개선 아이디어",
+        "instructions": [
+            "재방문·신규 비중을 근거로 재방문 촉진 액션을 제시합니다.",
+            "3~4개의 프로모션/멤버십/CRM 아이디어를 제공합니다.",
+            "각 아이디어는 타깃 고객과 실행 단계를 분명히 합니다.",
+        ],
+    },
+    "Q3_FOOD_ISSUE": {
+        "label": "요식업의 가장 큰 문제 가설 + 보완 아이디어",
+        "instructions": [
+            "식음업 특성(방문 고객/시간대/유동)을 근거로 문제 가설을 세웁니다.",
+            "3~4개의 개선 아이디어를 제시하고 실행 단계를 나열합니다.",
+            "문제 가설과 해결 아이디어를 한 세트로 서술합니다.",
+        ],
+    },
+    "GENERIC": {
+        "label": "일반 컨설팅 질문",
+        "instructions": [
+            "핵심 고객·성과 데이터를 근거로 3~4개의 실행 아이디어를 제공합니다.",
+            "각 아이디어는 대상, 채널, 실행 단계, 측정 지표를 포함합니다.",
+        ],
+    },
+}
+
+
+def infer_question_type(question_text: str | None) -> str:
+    text = (question_text or "").lower()
+    if not text:
+        return "GENERIC"
+    if any(keyword in text for keyword in ["채널", "홍보", "sns", "캠페인"]):
+        return "Q1_CAFE_CHANNELS"
+    if any(keyword in text for keyword in ["재방문", "retention", "재구매", "단골"]):
+        return "Q2_LOW_RETENTION"
+    if any(keyword in text for keyword in ["요식", "식당", "food", "맛집"]):
+        return "Q3_FOOD_ISSUE"
+    return "GENERIC"
+
+
+def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
+    if not isinstance(rag_context, dict):
+        return ("RAG 비활성화: 컨텍스트가 전달되지 않았습니다.", "")
+
+    enabled = bool(rag_context.get("enabled"))
+    threshold = rag_context.get("threshold")
+    max_score = rag_context.get("max_score")
+    raw_hits = rag_context.get("hits")
+    chunks_for_hits = rag_context.get("chunks") if isinstance(rag_context.get("chunks"), list) else []
+    hits = int(raw_hits if raw_hits is not None else len(chunks_for_hits))
+    selected_docs = rag_context.get("selected_doc_ids") or []
+    mode = rag_context.get("mode") or "auto"
+    reason_lines: list[str] = []
+
+    if not enabled:
+        if rag_context.get("selection_missing"):
+            reason_lines.append("RAG 요청됨이나 선택된 문서가 없습니다.")
+        elif rag_context.get("requested") and rag_context.get("error"):
+            reason_lines.append(f"오류: {rag_context['error']}")
+        else:
+            reason_lines.append("UI 토글 또는 모드로 인해 비활성화되었습니다.")
+    else:
+        reason_lines.append(f"모드={mode}, 선택 문서={selected_docs or '없음'}")
+        if max_score is None:
+            reason_lines.append("최고 점수를 계산하지 못했습니다.")
+        elif threshold is not None and max_score < threshold and mode != "always":
+            reason_lines.append(f"최고 점수 {max_score:.2f} < 임계값 {threshold:.2f}")
+
+    include_rag = bool(
+        enabled
+        and hits > 0
+        and (mode == "always" or threshold is None or (max_score is not None and max_score >= threshold))
+    )
+
+    if include_rag:
+        snippets = []
+        for chunk in (rag_context.get("chunks") or [])[: hits or 5]:
+            text = str(chunk.get("text") or "").strip()
+            if len(text) > 220:
+                text = text[:220].rstrip() + "…"
+            snippets.append(
+                {
+                    "doc_id": chunk.get("doc_id"),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "score": float(chunk.get("score") or 0.0),
+                    "snippet": text,
+                }
+            )
+        rag_payload = json.dumps(snippets, ensure_ascii=False, indent=2)
+        summary = f"RAG 포함: hits={hits}, max_score={max_score}, threshold={threshold}, mode={mode}"
+        block = f"{summary}\n{rag_payload}"
+    else:
+        reason = " ; ".join(reason_lines) if reason_lines else "근거 없음"
+        block = f"RAG 제외: {reason}"
+    rag_context['prompt_note'] = block
+    return block, "\n- ".join(reason_lines)
+
+
+def build_agent2_prompt(
+    agent1_json,
+    *,
+    question_text: str | None = None,
+    question_type: str | None = None,
+    rag_context: dict | None = None,
+):
     try:
         schema, _ = load_actioncard_schema()
         schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
     except Exception as e:
         schema_text = json.dumps({"schema_error": str(e)}, ensure_ascii=False, indent=2)
 
-    rules = [
-        "Agent-1 JSON만 근거로 활용하고 외부 추정은 금지합니다.",
-        "모든 카드에 타겟 → 채널 → 방법 → 카피(2개 이상) → KPI → 리스크/완화 → 근거를 채웁니다.",
-        "근거 문장은 반드시 숫자+컬럼명+기간 형식이며 정보가 없으면 null 또는 '—'로 둡니다.",
-        "품질이 낮거나 데이터가 부족하면 마지막 카드에 '데이터 보강 제안'을 추가합니다.",
-        "상호명은 항상 마스킹된 형태로 유지합니다.",
-        "KPI.expected_uplift와 range는 근거가 있을 때만 값을 넣고, 없으면 null을 유지합니다."
+    inferred_type = question_type or infer_question_type(question_text)
+    info = QUESTION_TYPE_INFO.get(inferred_type, QUESTION_TYPE_INFO["GENERIC"])
+    type_rules = "- " + "\n- ".join(info.get("instructions", [])) if info.get("instructions") else ""
+
+    base_rules = [
+        "질문에 직접 답하라. 목표치·범위를 추정하지 말라.",
+        "주요 근거는 Agent-1 JSON이며, RAG가 활성화되고 관련도가 임계값 이상이면 RAG 근거를 추가로 포함한다.",
+        "근거의 출처(STRUCTURED/RAG)와 핵심 수치·스니펫을 명시한다.",
+        "모든 아이디어에 최소 1개 근거를 붙여라. 없으면 '근거 없음'을 기재한다.",
+        "상호명은 항상 마스킹 상태를 유지한다.",
+        "3~4개의 간결한 아이디어를 answers 배열로 작성한다.",
     ]
 
-    rules_text = "- " + "\n- ".join(rules)
+    rag_block, rag_reason = _summarise_rag_context(rag_context)
 
-    guide = f"""당신은 한국어 소상공인 컨설턴트입니다. 아래 Agent-1 JSON만 근거로 사용하여,
-반드시 액션카드 스키마(JSON)로만 답하세요. 불확실한 수치는 null 또는 '—'로 남겨두세요.
+    sections = [
+        "당신은 한국어 소상공인 컨설턴트입니다.",
+        f"질문 유형: {info['label']} ({inferred_type})",
+        f"질문 원문: {question_text or '—'}",
+        "[출력 규칙]",
+        "- " + "\n- ".join(base_rules),
+    ]
 
-[출력 규칙]
-{rules_text}
+    if type_rules:
+        sections.append("[질문 유형별 지침]")
+        sections.append(type_rules)
 
-[액션카드 스키마(JSON)]
-{schema_text}
+    sections.append("[출력 스키마(JSON)]")
+    sections.append(schema_text)
+    sections.append("[Agent-1 JSON]")
+    sections.append(json.dumps(agent1_json, ensure_ascii=False, indent=2))
+    sections.append("[RAG 근거 후보]")
+    sections.append(rag_block)
+    if rag_reason:
+        sections.append(f"[RAG 참고 메모]\n- {rag_reason}")
 
-[데이터(JSON)]
-{json.dumps(agent1_json, ensure_ascii=False, indent=2)}
-"""
+    guide = "\n\n".join(sections)
     return guide
 
 def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
@@ -1386,21 +1512,32 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
 
     # 모두 실패 → 폴백(앱 다운 방지)
     fallback = {
-        "recommendations": [{
-            "title": "데이터 보강 제안",
-            "what": "모델 가용성/세이프티/쿼터로 카드 생성을 보류합니다.",
-            "when": "환경 확인 후 재시도",
-            "where": ["대시보드"],
-            "how": ["2.5 flash 가용성 확인", "API 키/쿼터 확인", "프롬프트 길이 축소"],
-            "copy": ["데이터를 조금만 더 주세요!"],
-            "kpi": {"target": "revisit_rate", "expected_uplift": None, "range": [None, None]},
-            "risks": ["LLM 안전 필터/쿼터/모델 가용성"],
-            "checklist": ["App secrets 확인", "list_models() 결과에서 2.5 flash 검색"],
-            "evidence": [
-                "gemini_debug.json 로그 참조",
-                f"사유: {last_error or '원인 미상'}"
-            ]
-        }]
+        "answers": [
+            {
+                "idea_title": "데이터 보강 제안",
+                "audience": "내부 운영팀",
+                "channels": ["대시보드"],
+                "execution": [
+                    "Gemini 2.5 Flash 가용성 확인",
+                    "API 키 및 호출 한도 점검",
+                    "프롬프트 길이 축소 후 재시도",
+                ],
+                "copy_samples": ["데이터를 조금만 더 주세요!"],
+                "measurement": ["LLM 호출 성공 여부"],
+                "evidence": [
+                    {
+                        "source": "STRUCTURED",
+                        "key": "근거",
+                        "value": "근거 없음",
+                        "period": None,
+                        "snippet": f"LLM 호출 실패: {last_error or '원인 미상'}",
+                        "doc_id": None,
+                        "chunk_id": None,
+                        "score": None,
+                    }
+                ],
+            }
+        ]
     }
     try:
         debug = {
@@ -1439,7 +1576,7 @@ def main():
 
     try:
         a1 = agent1_pipeline(q, SHINHAN_DIR, EXTERNAL_DIR)
-        prompt_text = build_agent2_prompt(a1)
+        prompt_text = build_agent2_prompt(a1, question_text=q)
         print('\n==== Gemini Prompt Preview (앞부분) ====')
         print(prompt_text[:800] + ('\n... (생략)' if len(prompt_text)>800 else ''))
         a2 = call_gemini_agent2(prompt_text, model_name=args.model)

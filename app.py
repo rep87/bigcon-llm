@@ -120,6 +120,123 @@ def _get_debug_snapshot(agent1_json: dict | None) -> dict:
     return legacy if isinstance(legacy, dict) else {}
 
 
+def _compute_rag_info(question_text: str, flags_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    selected_docs = [
+        str(doc_id)
+        for doc_id in (flags_snapshot.get("rag_selected_ids") or [])
+        if str(doc_id)
+    ]
+    rag_requested = bool(flags_snapshot.get("use_rag", False))
+    rag_mode = str(flags_snapshot.get("rag_mode", "auto"))
+    rag_threshold = float(flags_snapshot.get("rag_threshold", 0.4))
+    rag_top_k = int(flags_snapshot.get("rag_top_k", 5))
+    return rag_adapter(
+        question_text,
+        RETRIEVAL_TOOL,
+        enabled=rag_requested and bool(selected_docs),
+        top_k=rag_top_k,
+        threshold=rag_threshold,
+        mode=rag_mode,
+        requested=rag_requested,
+        doc_ids=selected_docs,
+    )
+
+
+def _prepare_rag_prompt_context(rag_info: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if not isinstance(rag_info, dict):
+        return None
+    payload = rag_info.get("payload") or {}
+    chunks = payload.get("chunks") or []
+    evidence = payload.get("evidence") or []
+    context = {
+        "enabled": bool(rag_info.get("enabled")),
+        "requested": bool(rag_info.get("requested")),
+        "selection_missing": bool(rag_info.get("selection_missing")),
+        "selected_doc_ids": list(rag_info.get("selected_doc_ids") or []),
+        "threshold": rag_info.get("threshold"),
+        "mode": rag_info.get("mode"),
+        "max_score": rag_info.get("max_score"),
+        "hits": len(chunks),
+        "chunks": [dict(chunk) for chunk in chunks],
+        "evidence": [dict(item) for item in evidence],
+        "error": rag_info.get("error"),
+        "catalog_size": rag_info.get("catalog_size"),
+    }
+    return context
+
+
+def _shorten_snippet(text: Any, limit: int = 140) -> str:
+    snippet = str(text or "").strip()
+    if len(snippet) > limit:
+        snippet = snippet[:limit].rstrip() + "…"
+    return snippet
+
+
+def _format_evidence_line(entry: Dict[str, Any]) -> str:
+    source = str(entry.get("source") or "NONE").upper()
+    key = entry.get("key") or "—"
+    value = entry.get("value")
+    if value is None:
+        value_text = "—"
+    else:
+        value_text = str(value)
+    period = entry.get("period")
+    snippet = entry.get("snippet")
+    parts = [f"[{source}] {key}: {value_text}"]
+    if period:
+        parts.append(f"({period})")
+    line = " ".join(parts)
+    if snippet:
+        line += f" — {_shorten_snippet(snippet)}"
+    return f"- {line}"
+
+
+def _match_evidence_chunk(
+    entry: Dict[str, Any],
+    retrieval_payload: Dict[str, Any] | None,
+) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
+    if not isinstance(entry, dict) or not retrieval_payload:
+        return None, None
+    doc_id = entry.get("doc_id")
+    if not doc_id:
+        return None, None
+    chunk_id = entry.get("chunk_id")
+    chunks = retrieval_payload.get("chunks") or []
+    evidence_list = retrieval_payload.get("evidence") or []
+    target_chunk = None
+    target_meta = None
+    chunk_id_str = str(chunk_id) if chunk_id is not None else None
+
+    for chunk in chunks:
+        if str(chunk.get("doc_id")) != str(doc_id):
+            continue
+        current_chunk_id = chunk.get("chunk_id")
+        if chunk_id_str is not None and str(current_chunk_id) != chunk_id_str:
+            continue
+        target_chunk = chunk
+        break
+
+    if target_chunk is None:
+        for chunk in chunks:
+            if str(chunk.get("doc_id")) == str(doc_id):
+                target_chunk = chunk
+                break
+
+    if target_chunk is not None:
+        for meta in evidence_list:
+            if str(meta.get("doc_id")) != str(doc_id):
+                continue
+            if chunk_id_str is not None:
+                if str(meta.get("chunk_id")) == chunk_id_str:
+                    target_meta = meta
+                    break
+            else:
+                target_meta = meta
+                break
+
+    return target_chunk, target_meta
+
+
 def _get_debug_raw_snapshot(agent1_json: dict | None) -> dict:
     debug = _get_debug_section(agent1_json)
     snap = debug.get("snapshot")
@@ -135,24 +252,17 @@ def _render_main_views(
     question_text: str,
     agent1_payload: dict | None,
     agent2_payload: dict | None,
+    *,
+    rag_info_override: Dict[str, Any] | None = None,
 ) -> None:
     flags_snapshot = st.session_state.get("_data_flags", {}).copy()
     structured_payload = structured_adapter(agent1_payload)
     weather_payload = weather_adapter(question_text, enabled=flags_snapshot.get("use_weather", False))
     external_payload = external_adapter(question_text, enabled=flags_snapshot.get("use_external", False))
-    selected_docs = flags_snapshot.get("rag_selected_ids") or []
-    selected_docs = [str(doc_id) for doc_id in selected_docs if str(doc_id)]
-    rag_requested = bool(flags_snapshot.get("use_rag", False))
-    rag_info = rag_adapter(
-        question_text,
-        RETRIEVAL_TOOL,
-        enabled=rag_requested and bool(selected_docs),
-        top_k=int(flags_snapshot.get("rag_top_k", 5)),
-        threshold=float(flags_snapshot.get("rag_threshold", 0.4)),
-        mode=str(flags_snapshot.get("rag_mode", "auto")),
-        requested=rag_requested,
-        doc_ids=selected_docs,
-    )
+    if rag_info_override is not None:
+        rag_info = rag_info_override
+    else:
+        rag_info = _compute_rag_info(question_text, flags_snapshot)
 
     retrieval_payload = rag_info.get("payload") if isinstance(rag_info, dict) else None
     if rag_info.get("error"):
@@ -161,6 +271,8 @@ def _render_main_views(
         st.session_state['_latest_retrieval'] = retrieval_payload
     else:
         st.session_state['_latest_retrieval'] = None
+    st.session_state['_latest_rag_info'] = rag_info
+    st.session_state['_latest_rag_prompt_context'] = _prepare_rag_prompt_context(rag_info)
 
     fail_soft_payload = compose_fail_soft_answer(
         question_text,
@@ -306,6 +418,40 @@ def render_debug_view(agent1_json: dict | None, show_raw: bool = DEBUG_SHOW_RAW)
     if isinstance(table_dict, dict) and table_dict:
         st.markdown("#### 렌더 테이블")
         st.table(pd.DataFrame([table_dict]))
+
+    rag_info_state = st.session_state.get("_latest_rag_info")
+    rag_prompt_state = st.session_state.get("_latest_rag_prompt_context") or {}
+    st.markdown("#### RAG 상태")
+    if isinstance(rag_info_state, dict):
+        summary = {
+            "requested": rag_info_state.get("requested"),
+            "enabled": rag_info_state.get("enabled"),
+            "selected_doc_ids": rag_info_state.get("selected_doc_ids"),
+            "threshold": rag_info_state.get("threshold"),
+            "max_score": rag_info_state.get("max_score"),
+            "mode": rag_info_state.get("mode"),
+            "error": rag_info_state.get("error"),
+        }
+        st.write(summary)
+        payload = rag_info_state.get("payload") or {}
+        chunk_rows = []
+        for chunk in (payload.get("chunks") or [])[:5]:
+            chunk_rows.append(
+                {
+                    "doc_id": chunk.get("doc_id"),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "score": chunk.get("score"),
+                }
+            )
+        if chunk_rows:
+            st.table(pd.DataFrame(chunk_rows))
+        else:
+            st.write("근거 없음 또는 임계값 미달")
+        prompt_note = rag_prompt_state.get("prompt_note")
+        if prompt_note:
+            st.caption(_shorten_snippet(prompt_note, limit=200))
+    else:
+        st.write("RAG 정보가 없습니다.")
 
     st.markdown("#### Agent-1 LLM")
     st.write({
@@ -712,35 +858,6 @@ def _format_list(values) -> str:
     return str(values)
 
 
-def _format_kpi(kpi_obj: dict) -> str:
-    if not isinstance(kpi_obj, dict):
-        return "—"
-    target = kpi_obj.get("target") or "—"
-    uplift = kpi_obj.get("expected_uplift")
-    rng = kpi_obj.get("range")
-    parts = [f"타깃: {target}"]
-    if uplift is not None:
-        parts.append(f"기대 상승 {uplift}")
-    if isinstance(rng, (list, tuple)) and len(rng) == 2 and any(r is not None for r in rng):
-        parts.append(f"목표 구간 {rng[0]}~{rng[1]}")
-    else:
-        parts.append("목표 구간 —")
-    return " · ".join(parts)
-
-
-def _split_cards(cards: list[dict]) -> tuple[list[dict], list[dict]]:
-    if not cards:
-        return [], []
-    main, booster = [], []
-    for card in cards:
-        title = str(card.get("title", ""))
-        if "보강" in title or "데이터" in title:
-            booster.append(card)
-        else:
-            main.append(card)
-    return main, booster
-
-
 def render_summary_view(
     agent1_json: dict,
     agent2_json: dict,
@@ -800,37 +917,58 @@ def render_summary_view(
     for line in goal_lines:
         st.markdown(f"- {line}")
 
-    cards = (agent2_json or {}).get("recommendations", [])
-    main_cards, booster_cards = _split_cards(cards)
-    display_cards = main_cards[:2]
-    if booster_cards:
-        display_cards.extend(booster_cards[:1])
+    answers = (agent2_json or {}).get("answers") or []
 
-    st.subheader("실행 카드")
-    if not display_cards:
-        st.info("실행 카드가 제공되지 않았습니다.")
-    for idx, card in enumerate(display_cards):
+    st.subheader("아이디어 제안")
+    if not answers:
+        st.info("아이디어 제안이 제공되지 않았습니다.")
+    for idx, answer in enumerate(answers[:4], start=1):
         with st.container():
-            st.markdown(f"**{card.get('title', '—')}**")
-            st.markdown(f"- 타겟: {card.get('what', '—')}")
-            st.markdown(f"- 채널: {_format_list(card.get('where'))}")
-            st.markdown(f"- 방법: {_format_list(card.get('how'))}")
-            st.markdown(f"- 카피: {_format_list(card.get('copy'))}")
-            st.markdown(f"- KPI: {_format_kpi(card.get('kpi'))}")
-            st.markdown(f"- 리스크/완화: {_format_list(card.get('risks'))}")
-            st.markdown(f"- 근거: {_format_list(card.get('evidence'))}")
-            if retrieval_payload and len(retrieval_payload.get("chunks", [])) > idx + 1:
-                chunk = retrieval_payload["chunks"][idx + 1]
-                evidence_meta = None
-                for item in retrieval_payload.get("evidence", []):
-                    if item.get("doc_id") == chunk.get("doc_id") and item.get("chunk_id") == chunk.get("chunk_id"):
-                        evidence_meta = item
-                        break
-                badge_cols = st.columns([12, 1])
-                with badge_cols[0]:
-                    st.caption("참고 근거")
-                with badge_cols[1]:
-                    _render_evidence_badge(chunk, evidence_meta)
+            st.markdown(f"**{idx}. {answer.get('idea_title', '—')}**")
+            st.markdown(f"- 대상: {answer.get('audience', '—')}")
+            st.markdown(f"- 채널: {_format_list(answer.get('channels'))}")
+            st.markdown(f"- 실행: {_format_list(answer.get('execution'))}")
+            st.markdown(f"- 카피 샘플: {_format_list(answer.get('copy_samples'))}")
+            st.markdown(f"- 측정: {_format_list(answer.get('measurement'))}")
+
+            evidence_items = answer.get("evidence") or []
+            if evidence_items:
+                st.markdown("**근거**")
+                for entry in evidence_items:
+                    line = _format_evidence_line(entry)
+                    cols = st.columns([12, 1])
+                    with cols[0]:
+                        st.markdown(line)
+                    with cols[1]:
+                        source = str(entry.get("source") or "").upper()
+                        if source == "RAG":
+                            chunk, meta = _match_evidence_chunk(entry, retrieval_payload)
+                            if chunk:
+                                _render_evidence_badge(chunk, meta)
+                            else:
+                                _render_evidence_badge(
+                                    None,
+                                    None,
+                                    disabled=True,
+                                    tooltip="RAG 근거 매칭 실패",
+                                )
+                        elif source in {"STRUCTURED", "WEATHER", "EXTERNAL"}:
+                            _render_evidence_badge(
+                                None,
+                                None,
+                                disabled=True,
+                                tooltip=f"{source} 근거",
+                            )
+                        else:
+                            tooltip = "근거 없음" if source in {"NONE", ""} else source
+                            _render_evidence_badge(None, None, disabled=True, tooltip=tooltip)
+            else:
+                st.markdown("**근거**")
+                cols = st.columns([12, 1])
+                with cols[0]:
+                    st.markdown("- 근거 없음")
+                with cols[1]:
+                    _render_evidence_badge(None, None, disabled=True, tooltip="근거 없음")
 
     limits = (agent1_json or {}).get("limits", [])
     st.subheader("한계/데이터 보강")
@@ -1025,7 +1163,12 @@ with analysis_tab:
 
     run_analysis = st.button("분석 실행", type="primary")
     if run_analysis:
-        from bigcon_2agent_mvp_v3 import agent1_pipeline, build_agent2_prompt, call_gemini_agent2
+        from bigcon_2agent_mvp_v3 import (
+            agent1_pipeline,
+            build_agent2_prompt,
+            call_gemini_agent2,
+            infer_question_type,
+        )
 
         with st.spinner("Agent-1: 데이터 집계/요약 중..."):
             try:
@@ -1047,10 +1190,23 @@ with analysis_tab:
                 st.code(traceback.format_exc())
                 st.stop()
 
+        flags_snapshot = st.session_state.get("_data_flags", {}).copy()
+        rag_info_for_prompt = _compute_rag_info(question, flags_snapshot)
+        rag_prompt_context = _prepare_rag_prompt_context(rag_info_for_prompt)
+        st.session_state['_latest_rag_info'] = rag_info_for_prompt
+        question_type = infer_question_type(question)
+        st.session_state['_latest_question_type'] = question_type
+        st.session_state['_latest_rag_prompt_context'] = rag_prompt_context
+
         with st.spinner("Agent-2: 카드 생성 중..."):
             try:
                 os.environ["GEMINI_API_KEY"] = API_KEY
-                prompt_text = build_agent2_prompt(a1)
+                prompt_text = build_agent2_prompt(
+                    a1,
+                    question_text=question,
+                    question_type=question_type,
+                    rag_context=rag_prompt_context,
+                )
                 result = call_gemini_agent2(prompt_text)
                 st.success("Agent-2 카드 생성 완료")
                 st.session_state['_latest_agent2'] = result
@@ -1059,7 +1215,7 @@ with analysis_tab:
                 st.code(traceback.format_exc())
                 st.stop()
 
-        _render_main_views(question, a1, result)
+        _render_main_views(question, a1, result, rag_info_override=rag_info_for_prompt)
 
     elif st.session_state.get('_latest_agent1') and st.session_state.get('_latest_agent2'):
         latest_agent1 = st.session_state.get('_latest_agent1')
