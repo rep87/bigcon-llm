@@ -35,10 +35,22 @@ def _env_flag(name: str, default: str) -> str:
 
 DEBUG_SHOW_RAW = _env_flag("DEBUG_SHOW_RAW", "true").lower() in {"1", "true", "yes"}
 
-RAG_ROOT = os.getenv("RAG_ROOT") or "."
+
+def _secret_value(name: str, default: str | None = None) -> str | None:
+    try:
+        return st.secrets.get(name, default)
+    except Exception:  # pragma: no cover - Streamlit secrets unavailable
+        return default
+
+
+DEFAULT_RAG_ROOT = "data/rag"
+RAG_ROOT = _secret_value("RAG_ROOT") or os.getenv("RAG_ROOT") or DEFAULT_RAG_ROOT
 RAG_EMBED_VERSION = os.getenv("RAG_EMBED_VERSION", "embed_v1")
+RAG_ROOT_PATH = Path(RAG_ROOT).expanduser()
 RETRIEVAL_INIT_ERROR: str | None = None
 RETRIEVAL_TOOL: object | None = None
+RAG_CATALOG: list[Dict[str, Any]] = []
+RAG_CATALOG_ERROR: str | None = None
 
 if RetrievalTool is not None:
     try:
@@ -47,6 +59,36 @@ if RetrievalTool is not None:
         RETRIEVAL_INIT_ERROR = str(exc)
 else:  # pragma: no cover - module missing
     RETRIEVAL_INIT_ERROR = "rag.RetrievalTool 모듈을 불러오지 못했습니다."
+
+if RETRIEVAL_TOOL is not None and RETRIEVAL_INIT_ERROR is None:
+    if not RAG_ROOT_PATH.exists():
+        RAG_CATALOG_ERROR = f"RAG_ROOT 경로({RAG_ROOT_PATH})가 존재하지 않습니다."
+    else:
+        try:
+            catalog_entries = RETRIEVAL_TOOL.load_catalog()
+            for entry in catalog_entries:
+                origin_path = entry.origin_path
+                origin_uri = origin_path
+                if origin_path:
+                    path_obj = Path(origin_path)
+                    if not path_obj.is_absolute():
+                        origin_uri = (RAG_ROOT_PATH / path_obj).as_posix()
+                    else:
+                        origin_uri = path_obj.as_posix()
+                RAG_CATALOG.append(
+                    {
+                        "document_id": entry.doc_id,
+                        "title": entry.title,
+                        "num_chunks": entry.num_chunks,
+                        "embedding_model": entry.embedding_model,
+                        "created_at": entry.created_at,
+                        "origin_path": origin_uri,
+                        "tags": list(entry.tags or []),
+                        "year": entry.year,
+                    }
+                )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            RAG_CATALOG_ERROR = str(exc)
 
 
 def _get_debug_section(agent1_json: dict | None) -> dict:
@@ -62,6 +104,8 @@ if "_data_flags" not in st.session_state:
         "rag_threshold": 0.4,
         "rag_top_k": 5,
         "rag_mode": "auto",
+        "rag_filter": "",
+        "rag_selected_ids": [],
     }
 
 
@@ -96,13 +140,18 @@ def _render_main_views(
     structured_payload = structured_adapter(agent1_payload)
     weather_payload = weather_adapter(question_text, enabled=flags_snapshot.get("use_weather", False))
     external_payload = external_adapter(question_text, enabled=flags_snapshot.get("use_external", False))
+    selected_docs = flags_snapshot.get("rag_selected_ids") or []
+    selected_docs = [str(doc_id) for doc_id in selected_docs if str(doc_id)]
+    rag_requested = bool(flags_snapshot.get("use_rag", False))
     rag_info = rag_adapter(
         question_text,
         RETRIEVAL_TOOL,
-        enabled=flags_snapshot.get("use_rag", False),
+        enabled=rag_requested and bool(selected_docs),
         top_k=int(flags_snapshot.get("rag_top_k", 5)),
         threshold=float(flags_snapshot.get("rag_threshold", 0.4)),
         mode=str(flags_snapshot.get("rag_mode", "auto")),
+        requested=rag_requested,
+        doc_ids=selected_docs,
     )
 
     retrieval_payload = rag_info.get("payload") if isinstance(rag_info, dict) else None
@@ -297,6 +346,11 @@ def _render_sources_footer(used_data: Dict[str, Any]) -> None:
     mode = rag_info.get("mode")
     if mode:
         rag_details.append(str(mode))
+    selected_docs = rag_info.get("selected_docs") or []
+    if selected_docs:
+        rag_details.append(f"docs={len(selected_docs)}")
+    elif rag_info.get("requested") and not rag_enabled:
+        rag_details.append("docs=0")
     rag_text = rag_label + (" (" + ", ".join(rag_details) + ")" if rag_details else "")
 
     cols[0].markdown(structured_text)
@@ -844,7 +898,21 @@ data_flags["use_external"] = st.sidebar.toggle(
     value=bool(data_flags.get("use_external", False)),
 )
 
-rag_toggle_disabled = RETRIEVAL_TOOL is None or RETRIEVAL_INIT_ERROR is not None
+rag_root_exists = RAG_ROOT_PATH.exists()
+if rag_root_exists:
+    st.sidebar.caption(f"RAG Root: {RAG_ROOT_PATH}")
+else:
+    st.sidebar.info(f"RAG_ROOT 경로({RAG_ROOT_PATH})가 없어 RAG를 사용할 수 없습니다.")
+
+if RAG_CATALOG_ERROR:
+    st.sidebar.warning(RAG_CATALOG_ERROR)
+
+rag_toggle_disabled = (
+    RETRIEVAL_TOOL is None
+    or RETRIEVAL_INIT_ERROR is not None
+    or not rag_root_exists
+    or RAG_CATALOG_ERROR is not None
+)
 if rag_toggle_disabled:
     data_flags["use_rag"] = False
     st.sidebar.toggle(
@@ -853,6 +921,7 @@ if rag_toggle_disabled:
         disabled=True,
         help="RetrievalTool이 준비되지 않아 비활성화되었습니다.",
     )
+    data_flags["rag_selected_ids"] = []
 else:
     data_flags["use_rag"] = st.sidebar.toggle(
         "Use RAG (Embedded Docs)",
@@ -890,6 +959,60 @@ data_flags["rag_mode"] = st.sidebar.selectbox(
     index=rag_modes.index(rag_mode_value),
     disabled=rag_toggle_disabled,
 )
+
+if not rag_toggle_disabled and data_flags.get("use_rag"):
+    current_filter = data_flags.get("rag_filter", "")
+    current_filter = st.sidebar.text_input(
+        "RAG Search Filter (optional)",
+        value=current_filter,
+        placeholder="문서명, 태그, ID 검색",
+    )
+    data_flags["rag_filter"] = current_filter
+
+    def _matches_filter(record: Dict[str, Any], query: str) -> bool:
+        if not query:
+            return True
+        haystack_parts = [
+            str(record.get("title") or ""),
+            str(record.get("document_id") or ""),
+        ]
+        tags = record.get("tags") or []
+        haystack_parts.extend(str(tag) for tag in tags)
+        haystack = " ".join(haystack_parts).lower()
+        return query.lower() in haystack
+
+    filtered_catalog = [
+        item for item in RAG_CATALOG if _matches_filter(item, current_filter.strip())
+    ]
+
+    if not filtered_catalog:
+        st.sidebar.info("필터와 일치하는 문서가 없습니다. 필터를 비워주세요.")
+
+    label_map = {
+        f"{item['title']} ({item['document_id']})": item["document_id"]
+        for item in filtered_catalog
+    }
+    options = list(label_map.keys())
+
+    previous_selection = data_flags.get("rag_selected_ids") or []
+    default_labels = [label for label, doc_id in label_map.items() if doc_id in previous_selection]
+    if not default_labels and not previous_selection and len(options) <= 20:
+        default_labels = options
+
+    selected_labels = st.sidebar.multiselect(
+        "Select RAG Documents",
+        options,
+        default=default_labels,
+    )
+    selected_ids = [label_map[label] for label in selected_labels]
+    data_flags["rag_selected_ids"] = selected_ids
+
+    if data_flags.get("use_rag") and not selected_ids:
+        st.sidebar.info("선택된 RAG 문서가 없어 이번 실행에서는 RAG를 사용하지 않습니다.")
+elif not rag_toggle_disabled:
+    # Toggle가 꺼져 있으면 기존 선택을 유지하되 필터 입력만 초기화하지 않습니다.
+    data_flags.setdefault("rag_selected_ids", data_flags.get("rag_selected_ids", []))
+
 st.session_state["_data_flags"] = data_flags
 
 # ===== 탭 구성 =====
@@ -980,30 +1103,31 @@ with analysis_tab:
 
 with sources_tab:
     st.subheader("임베디드 소스 카탈로그")
+    st.caption(f"RAG Root: {RAG_ROOT_PATH}")
     if RETRIEVAL_INIT_ERROR:
         st.error(f"RetrievalTool 초기화 실패: {RETRIEVAL_INIT_ERROR}")
     elif RETRIEVAL_TOOL is None:
         st.info("RetrievalTool이 비활성화되어 있습니다.")
+    elif not RAG_ROOT_PATH.exists():
+        st.info("data/rag 경로가 존재하지 않습니다. corpus/와 indices/를 구성한 뒤 다시 시도하세요.")
+    elif RAG_CATALOG_ERROR:
+        st.warning(RAG_CATALOG_ERROR)
     else:
-        try:
-            catalog_df = RETRIEVAL_TOOL.get_doc_list()
-        except Exception as exc:  # pragma: no cover - UI safeguard
-            catalog_df = pd.DataFrame()
-            st.error(f"카탈로그를 불러오는 중 오류가 발생했습니다: {exc}")
+        catalog_df = pd.DataFrame(RAG_CATALOG)
         if catalog_df.empty:
-            st.info("등록된 임베디드 문서가 없습니다.")
+            st.info("등록된 임베디드 문서가 없습니다. data/rag/indices 폴더를 확인하세요.")
         else:
+            display_columns = [
+                "title",
+                "document_id",
+                "num_chunks",
+                "embedding_model",
+                "created_at",
+                "origin_path",
+            ]
+            optional_cols = [col for col in ["tags", "year"] if col in catalog_df.columns]
             st.dataframe(
-                catalog_df[
-                    [
-                        "title",
-                        "document_id",
-                        "num_chunks",
-                        "embedding_model",
-                        "created_at",
-                        "origin_path",
-                    ]
-                ],
+                catalog_df[display_columns + optional_cols],
                 use_container_width=True,
             )
             doc_ids = catalog_df["document_id"].tolist()
@@ -1015,6 +1139,9 @@ with sources_tab:
                 origin_path = manifest_row.get("origin_path")
                 if origin_path:
                     st.markdown(f"[원본 열기]({origin_path})")
+                tags = manifest_row.get("tags") or []
+                if tags:
+                    st.caption("태그: " + ", ".join(str(tag) for tag in tags))
                 if not preview_chunks:
                     st.info("프리뷰 가능한 청크가 없습니다.")
                 else:

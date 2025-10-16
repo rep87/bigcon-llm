@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 SANITIZED_METRIC_MAP: Dict[str, str] = {
     "revisit_pct": "MCT_UE_CLN_REU_RAT",
@@ -69,10 +69,13 @@ def rag_adapter(
     top_k: int,
     threshold: float,
     mode: str,
+    requested: bool | None = None,
+    doc_ids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     info: Dict[str, Any] = {
-        "requested": bool(enabled),
-        "enabled": bool(enabled) and mode != "off" and retrieval_tool is not None,
+        "requested": bool(requested if requested is not None else enabled),
+        "selected_doc_ids": list(dict.fromkeys([str(item) for item in (doc_ids or []) if str(item)])),
+        "enabled": False,
         "mode": mode,
         "threshold": threshold,
         "top_k": top_k,
@@ -81,11 +84,31 @@ def rag_adapter(
         "available": False,
         "max_score": None,
         "include_evidence": False,
+        "selection_missing": False,
+        "catalog_size": None,
     }
+
+    try:
+        info["catalog_size"] = len(retrieval_tool.load_catalog()) if retrieval_tool else 0
+    except Exception:  # pragma: no cover - defensive guard
+        info["catalog_size"] = None
+
+    info["selection_missing"] = bool(info["requested"] and not info["selected_doc_ids"])
+    effective_mode = mode if mode in {"auto", "always"} else "auto"
+    info["mode"] = effective_mode
+
+    info["enabled"] = (
+        bool(enabled)
+        and bool(retrieval_tool)
+        and not info["selection_missing"]
+        and effective_mode != "off"
+    )
 
     if not info["enabled"]:
         if info["requested"] and retrieval_tool is None:
             info["error"] = "RetrievalTool 미구성"
+        elif info["requested"] and info["selection_missing"]:
+            info["error"] = info.get("error")
         return info
 
     try:
@@ -93,7 +116,8 @@ def rag_adapter(
             question,
             top_k=int(top_k),
             threshold=threshold,
-            mode=mode if mode in {"auto", "always"} else "auto",
+            mode=effective_mode,
+            doc_ids=info["selected_doc_ids"],
         )
     except Exception as exc:  # pragma: no cover - UI safeguard
         info["error"] = str(exc)
@@ -103,6 +127,9 @@ def rag_adapter(
     info["available"] = bool(payload.get("chunks"))
     info["max_score"] = payload.get("max_score")
     info["include_evidence"] = bool(payload.get("include_evidence"))
+    if payload.get("selected_doc_ids"):
+        info["selected_doc_ids"] = payload.get("selected_doc_ids")
+    return info
     return info
 
 
@@ -200,6 +227,8 @@ def compose_fail_soft_answer(
     rag_evidence_list = rag_payload.get("evidence") or []
     rag_enabled = bool(rag_info.get("enabled"))
     rag_requested = bool(rag_info.get("requested"))
+    rag_selected_docs = rag_info.get("selected_doc_ids") or []
+    selection_missing = bool(rag_info.get("selection_missing"))
     rag_threshold = flags.get("rag_threshold")
     if rag_chunks:
         for chunk in rag_chunks[:2]:
@@ -226,12 +255,17 @@ def compose_fail_soft_answer(
         elif rag_enabled and rag_threshold is not None:
             caveats.append(f"RAG 임계값 {rag_threshold:.2f}: 관련 근거 없음")
         elif rag_requested and not rag_enabled:
-            caveats.append("RAG 데이터 OFF: 문서 근거 제외")
+            if selection_missing:
+                caveats.append("선택된 RAG 문서가 없어 이번 실행에서는 문서 근거가 제외되었습니다.")
+            else:
+                caveats.append("RAG 데이터 OFF: 문서 근거 제외")
 
     if not rag_requested:
         msg = "RAG 데이터 OFF: 문서 근거 제외"
         if msg not in caveats:
             caveats.append(msg)
+    elif selection_missing and "선택된 RAG 문서가 없어 이번 실행에서는 문서 근거가 제외되었습니다." not in caveats:
+        caveats.append("선택된 RAG 문서가 없어 이번 실행에서는 문서 근거가 제외되었습니다.")
 
     used_data = {
         "structured": structured_available,
@@ -239,10 +273,12 @@ def compose_fail_soft_answer(
         "external": bool(external and external.get("available")),
         "rag": {
             "enabled": rag_enabled,
+            "requested": rag_requested,
             "hits": len(rag_chunks),
             "max_score": rag_info.get("max_score"),
             "threshold": rag_threshold,
             "mode": rag_info.get("mode"),
+            "selected_docs": list(rag_selected_docs),
         },
     }
 

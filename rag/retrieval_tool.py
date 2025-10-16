@@ -1,9 +1,11 @@
 """Minimal file-based retrieval tool for embedded corpora.
 
 The retrieval tool scans embedding indices stored under ``indices/<version>``
-inside the repository root. Each indexed document has a folder containing
-``manifest.json``, ``chunks.parquet`` (with chunk metadata), and ``vectors.npy``
-(with L2-normalised embedding vectors).
+inside a configurable RAG data root. Each indexed document has a folder
+containing ``manifest.json``, ``chunks.parquet`` (with chunk metadata), and
+``vectors.npy`` (with L2-normalised embedding vectors). Originals remain under
+``corpus/`` beneath the same root so evidence can link back to the source
+files.
 
 This module keeps the implementation intentionally lightweight so the main
 Streamlit app can import and query it without additional services.
@@ -11,12 +13,13 @@ Streamlit app can import and query it without additional services.
 
 from __future__ import annotations
 
+import os
 import hashlib
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -34,17 +37,29 @@ class _DocumentEntry:
     created_at: str | None
     num_chunks: int
     manifest_path: Path
+    tags: tuple[str, ...] | None = None
+    year: int | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "document_id": self.doc_id,
+            "title": self.title,
+            "num_chunks": self.num_chunks,
+            "embedding_model": self.embedding_model,
+            "created_at": self.created_at,
+            "origin_path": self.origin_path,
+            "tags": list(self.tags or ()),
+            "year": self.year,
+        }
 
 
 class RetrievalTool:
     """A small helper around local embedding indices."""
 
-    def __init__(self, root: str | Path = "repo", embed_version: str = "embed_v1") -> None:
-        root_path = Path(root).expanduser()
-        if not root_path.exists():
-            # Fallback to current working directory when the provided root is missing.
-            root_path = Path.cwd()
-        self.root_path = root_path.resolve()
+    def __init__(self, root: str | Path | None = None, embed_version: str = "embed_v1") -> None:
+        resolved_root = root or os.getenv("RAG_ROOT") or "data/rag"
+        root_path = Path(resolved_root).expanduser().resolve()
+        self.root_path = root_path
         self.embed_version = embed_version
         self.indices_dir = self.root_path / "indices" / embed_version
         self.corpus_dir = self.root_path / "corpus"
@@ -73,9 +88,12 @@ class RetrievalTool:
             doc_id = str(data.get("document_id") or folder.name)
             title = str(data.get("title") or doc_id)
             origin_path = str(data.get("origin_path") or data.get("source_path") or "")
+            origin_path = origin_path.replace("\\", "/")
             embedding_model = data.get("embedding_model")
             created_at = data.get("created_at")
             num_chunks = int(data.get("num_chunks") or self._count_chunks(folder))
+            tags = self._normalise_tags(data.get("tags"))
+            year = self._normalise_year(data.get("year"), created_at)
             entries.append(
                 _DocumentEntry(
                     doc_id=doc_id,
@@ -85,6 +103,8 @@ class RetrievalTool:
                     created_at=created_at,
                     num_chunks=num_chunks,
                     manifest_path=manifest_path,
+                    tags=tags,
+                    year=year,
                 )
             )
         self._catalog = entries
@@ -92,17 +112,7 @@ class RetrievalTool:
 
     def get_doc_list(self) -> pd.DataFrame:
         """Return the catalog as a dataframe for UI rendering."""
-        records = [
-            {
-                "document_id": entry.doc_id,
-                "title": entry.title,
-                "num_chunks": entry.num_chunks,
-                "embedding_model": entry.embedding_model,
-                "created_at": entry.created_at,
-                "origin_path": entry.origin_path,
-            }
-            for entry in self.load_catalog()
-        ]
+        records = [entry.as_dict() for entry in self.load_catalog()]
         if not records:
             return pd.DataFrame(
                 columns=[
@@ -112,6 +122,8 @@ class RetrievalTool:
                     "embedding_model",
                     "created_at",
                     "origin_path",
+                    "tags",
+                    "year",
                 ]
             )
         return pd.DataFrame(records)
@@ -127,6 +139,7 @@ class RetrievalTool:
         *,
         threshold: float | None = None,
         mode: str = "auto",
+        doc_ids: Optional[Sequence[str]] = None,
     ) -> dict:
         """Retrieve the most relevant chunks for ``query``.
 
@@ -148,13 +161,23 @@ class RetrievalTool:
         """
         query = (query or "").strip()
         if not query:
-            return {"chunks": [], "evidence": [], "used_k": 0}
+            return {"chunks": [], "evidence": [], "used_k": 0, "selected_doc_ids": []}
 
         doc_entries = self.load_catalog()
         if not doc_entries:
-            return {"chunks": [], "evidence": [], "used_k": 0}
+            return {"chunks": [], "evidence": [], "used_k": 0, "selected_doc_ids": []}
 
         allowed_docs: Optional[set[str]] = None
+        if doc_ids is not None:
+            cleaned = [str(item) for item in doc_ids if str(item)]
+            if not cleaned:
+                return {
+                    "chunks": [],
+                    "evidence": [],
+                    "used_k": 0,
+                    "selected_doc_ids": [],
+                }
+            allowed_docs = set(cleaned)
         if filters:
             ids = filters.get("doc_ids") or filters.get("doc_id")
             if isinstance(ids, str):
@@ -200,12 +223,17 @@ class RetrievalTool:
                 )
 
         if not vectors_list or dim is None:
-            return {"chunks": [], "evidence": [], "used_k": 0}
+            return {"chunks": [], "evidence": [], "used_k": 0, "selected_doc_ids": sorted(allowed_docs or [])}
 
         all_vectors = np.vstack(vectors_list)
         query_vec = self._embed_query(tokenised_query, dim)
         if query_vec is None:
-            return {"chunks": [], "evidence": [], "used_k": 0}
+            return {
+                "chunks": [],
+                "evidence": [],
+                "used_k": 0,
+                "selected_doc_ids": sorted(allowed_docs or []),
+            }
 
         scores = all_vectors @ query_vec
         query_tokens = set(tokenised_query)
@@ -280,6 +308,8 @@ class RetrievalTool:
             "max_score": max_score_value,
             "threshold": threshold,
             "mode": mode,
+            "selected_doc_ids": sorted(allowed_docs or []),
+            "catalog_size": len(doc_entries),
         }
 
     # ------------------------------------------------------------------
@@ -356,4 +386,33 @@ class RetrievalTool:
         if norm == 0:
             return vec
         return vec / norm
+
+    def _normalise_tags(self, value: Any) -> tuple[str, ...] | None:
+        if not value:
+            return None
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",") if item.strip()]
+        elif isinstance(value, Iterable):
+            items = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            items = []
+        return tuple(dict.fromkeys(items)) if items else None
+
+    def _normalise_year(self, value: Any, created_at: Any) -> int | None:
+        try:
+            if isinstance(value, (int, float)):
+                year = int(value)
+                return year if 1900 <= year <= 2100 else None
+            if isinstance(value, str) and value.isdigit() and len(value) == 4:
+                year = int(value)
+                return year if 1900 <= year <= 2100 else None
+        except Exception:  # pragma: no cover - defensive guard
+            pass
+        if isinstance(created_at, str) and len(created_at) >= 4 and created_at[:4].isdigit():
+            try:
+                year = int(created_at[:4])
+                return year if 1900 <= year <= 2100 else None
+            except Exception:  # pragma: no cover - defensive guard
+                return None
+        return None
 
