@@ -80,7 +80,7 @@ def _wildcard_to_regex(masked: str | None) -> re.Pattern | None:
     except re.error:
         return None
 
-def load_actioncard_schema():
+def load_actioncard_schema_current():
     global _SCHEMA_CACHE, _SCHEMA_VALIDATOR
     if _SCHEMA_CACHE is not None and _SCHEMA_VALIDATOR is not None:
         return _SCHEMA_CACHE, _SCHEMA_VALIDATOR
@@ -1271,7 +1271,7 @@ def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
     return block, "\n- ".join(reason_lines)
 
 
-def build_agent2_prompt(
+def build_agent2_prompt_overhauled(
     agent1_json,
     *,
     question_text: str | None = None,
@@ -1279,7 +1279,7 @@ def build_agent2_prompt(
     rag_context: dict | None = None,
 ):
     try:
-        schema, _ = load_actioncard_schema()
+        schema, _ = load_actioncard_schema_current()
         schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
     except Exception as e:
         schema_text = json.dumps({"schema_error": str(e)}, ensure_ascii=False, indent=2)
@@ -1323,7 +1323,7 @@ def build_agent2_prompt(
     guide = "\n\n".join(sections)
     return guide
 
-def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
+def call_gemini_agent2_overhauled(prompt_text, model_name='models/gemini-2.5-flash'):
     """
     Gemini 2.5 Flash 전용 호출:
     - google-generativeai==0.8.3 기준
@@ -1426,7 +1426,7 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
         return text, info, name
 
     try:
-        _, schema_validator = load_actioncard_schema()
+        _, schema_validator = load_actioncard_schema_current()
         schema_error = None
     except Exception as e:
         schema_validator = None
@@ -1557,6 +1557,26 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
     print('⚠️ Agent-2: 2.5 flash 가용성/세이프티 문제 → 폴백 카드 반환')
     return fallback
 
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility shims
+# ---------------------------------------------------------------------------
+
+def load_actioncard_schema(*args, **kwargs):
+    """Backward-compatible wrapper for legacy imports."""
+    return load_actioncard_schema_current(*args, **kwargs)
+
+
+def build_agent2_prompt(*args, **kwargs):
+    """Backward-compatible wrapper for the overhauled Agent-2 prompt builder."""
+    return build_agent2_prompt_overhauled(*args, **kwargs)
+
+
+def call_gemini_agent2(*args, **kwargs):
+    """Backward-compatible wrapper that delegates to the updated Gemini caller."""
+    return call_gemini_agent2_overhauled(*args, **kwargs)
+
+
 def main():
     import argparse
     a1 = None; prompt_text = ''; a2 = None
@@ -1576,10 +1596,10 @@ def main():
 
     try:
         a1 = agent1_pipeline(q, SHINHAN_DIR, EXTERNAL_DIR)
-        prompt_text = build_agent2_prompt(a1, question_text=q)
+        prompt_text = build_agent2_prompt_overhauled(a1, question_text=q)
         print('\n==== Gemini Prompt Preview (앞부분) ====')
         print(prompt_text[:800] + ('\n... (생략)' if len(prompt_text)>800 else ''))
-        a2 = call_gemini_agent2(prompt_text, model_name=args.model)
+        a2 = call_gemini_agent2_overhauled(prompt_text, model_name=args.model)
         print('\n==== Agent-2 결과 (앞부분) ====')
         print(json.dumps(a2, ensure_ascii=False, indent=2)[:800] + '\n...')
     except FileNotFoundError as e:
