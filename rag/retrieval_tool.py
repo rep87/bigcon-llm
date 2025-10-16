@@ -124,8 +124,28 @@ class RetrievalTool:
         query: str,
         top_k: int = 5,
         filters: Optional[Dict[str, Any]] = None,
+        *,
+        threshold: float | None = None,
+        mode: str = "auto",
     ) -> dict:
-        """Retrieve the most relevant chunks for ``query``."""
+        """Retrieve the most relevant chunks for ``query``.
+
+        Parameters
+        ----------
+        query:
+            User query text.
+        top_k:
+            Maximum number of chunks to surface.
+        filters:
+            Optional doc-level filters. Supports ``doc_id`` or ``doc_ids``.
+        threshold:
+            Minimum cosine score required for evidence to be considered when
+            ``mode`` is ``"auto"``. When ``None`` the check is skipped.
+        mode:
+            ``"auto"`` (default) hides evidence when the best score is below the
+            threshold, ``"always"`` surfaces evidence regardless, and any other
+            value behaves like ``"auto"``.
+        """
         query = (query or "").strip()
         if not query:
             return {"chunks": [], "evidence": [], "used_k": 0}
@@ -217,23 +237,50 @@ class RetrievalTool:
                 }
             )
 
-        evidence_map: dict[str, dict[str, Any]] = {}
-        for idx, chunk in enumerate(chunks):
-            doc_id = chunk["doc_id"]
-            meta = meta_rows[top_indices[idx]]
-            ev = evidence_map.get(doc_id)
-            if (ev is None) or (chunk["score"] > ev["score"]):
-                uri = meta.get("origin_path") or ""
-                evidence_map[doc_id] = {
-                    "doc_id": doc_id,
-                    "title": meta.get("title") or doc_id,
-                    "uri": uri,
-                    "score": chunk["score"],
-                    "chunk_id": chunk["chunk_id"],
-                }
+        max_score_value = None
+        if chunks:
+            max_score_value = float(max(chunk["score"] for chunk in chunks))
+        threshold = threshold if threshold is not None else None
+        raw_used_k = len(chunks)
+        include_evidence = True
+        if mode != "always":
+            if threshold is not None:
+                if not chunks:
+                    include_evidence = False
+                elif max_score_value is None or not (max_score_value >= threshold):
+                    include_evidence = False
 
-        evidence = sorted(evidence_map.values(), key=lambda item: item["score"], reverse=True)
-        return {"chunks": chunks, "evidence": evidence, "used_k": len(chunks)}
+        evidence: list[dict[str, Any]] = []
+        if include_evidence:
+            evidence_map: dict[str, dict[str, Any]] = {}
+            for idx, chunk in enumerate(chunks):
+                doc_id = chunk["doc_id"]
+                meta = meta_rows[top_indices[idx]]
+                ev = evidence_map.get(doc_id)
+                if (ev is None) or (chunk["score"] > ev["score"]):
+                    uri = meta.get("origin_path") or ""
+                    evidence_map[doc_id] = {
+                        "doc_id": doc_id,
+                        "title": meta.get("title") or doc_id,
+                        "uri": uri,
+                        "score": chunk["score"],
+                        "chunk_id": chunk["chunk_id"],
+                    }
+
+            evidence = sorted(evidence_map.values(), key=lambda item: item["score"], reverse=True)
+        else:
+            chunks = []
+
+        return {
+            "chunks": chunks,
+            "evidence": evidence,
+            "used_k": len(chunks),
+            "raw_used_k": raw_used_k,
+            "include_evidence": include_evidence,
+            "max_score": max_score_value,
+            "threshold": threshold,
+            "mode": mode,
+        }
 
     # ------------------------------------------------------------------
     # helpers

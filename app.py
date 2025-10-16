@@ -3,6 +3,15 @@ import os
 import re
 import traceback
 from pathlib import Path
+from typing import Any, Dict, Optional
+
+from app_core.failsoft import (
+    compose_fail_soft_answer,
+    external_adapter,
+    rag_adapter,
+    structured_adapter,
+    weather_adapter,
+)
 
 import pandas as pd
 import streamlit as st
@@ -45,6 +54,17 @@ def _get_debug_section(agent1_json: dict | None) -> dict:
     return debug if isinstance(debug, dict) else {}
 
 
+if "_data_flags" not in st.session_state:
+    st.session_state["_data_flags"] = {
+        "use_weather": False,
+        "use_external": False,
+        "use_rag": True,
+        "rag_threshold": 0.4,
+        "rag_top_k": 5,
+        "rag_mode": "auto",
+    }
+
+
 def _get_debug_snapshot(agent1_json: dict | None) -> dict:
     debug = _get_debug_section(agent1_json)
     snap = debug.get("snapshot")
@@ -66,6 +86,63 @@ def _get_debug_raw_snapshot(agent1_json: dict | None) -> dict:
     legacy = debug.get("latest_raw_snapshot")
     return legacy if isinstance(legacy, dict) else {}
 
+
+def _render_main_views(
+    question_text: str,
+    agent1_payload: dict | None,
+    agent2_payload: dict | None,
+) -> None:
+    flags_snapshot = st.session_state.get("_data_flags", {}).copy()
+    structured_payload = structured_adapter(agent1_payload)
+    weather_payload = weather_adapter(question_text, enabled=flags_snapshot.get("use_weather", False))
+    external_payload = external_adapter(question_text, enabled=flags_snapshot.get("use_external", False))
+    rag_info = rag_adapter(
+        question_text,
+        RETRIEVAL_TOOL,
+        enabled=flags_snapshot.get("use_rag", False),
+        top_k=int(flags_snapshot.get("rag_top_k", 5)),
+        threshold=float(flags_snapshot.get("rag_threshold", 0.4)),
+        mode=str(flags_snapshot.get("rag_mode", "auto")),
+    )
+
+    retrieval_payload = rag_info.get("payload") if isinstance(rag_info, dict) else None
+    if rag_info.get("error"):
+        st.warning(f"RetrievalTool 오류: {rag_info['error']}")
+    if retrieval_payload is not None:
+        st.session_state['_latest_retrieval'] = retrieval_payload
+    else:
+        st.session_state['_latest_retrieval'] = None
+
+    fail_soft_payload = compose_fail_soft_answer(
+        question_text,
+        structured_payload,
+        weather_payload,
+        external_payload,
+        rag_info,
+        flags_snapshot,
+    )
+    st.session_state['_latest_failsoft'] = fail_soft_payload
+
+    try:
+        overview_cached = st.session_state.get('_latest_overview', (None, None))
+        if isinstance(agent2_payload, dict):
+            if retrieval_payload:
+                agent2_payload.setdefault("evidence", retrieval_payload.get("evidence", []))
+                agent2_payload.setdefault("retrieval_chunks", retrieval_payload.get("chunks", []))
+            agent2_payload.setdefault("used_data", fail_soft_payload.get("used_data"))
+            agent2_payload.setdefault("caveats", fail_soft_payload.get("caveats"))
+
+        render_fail_soft_answer(fail_soft_payload, rag_info=rag_info)
+        render_summary_view(
+            agent1_payload,
+            agent2_payload or {},
+            overview_df=overview_cached[0],
+            table_dict=overview_cached[1],
+            retrieval_payload=retrieval_payload,
+        )
+    except Exception:
+        st.error("요약 뷰를 렌더링하는 중 오류가 발생했습니다.")
+        st.code(traceback.format_exc())
 
 def render_debug_view(agent1_json: dict | None, show_raw: bool = DEBUG_SHOW_RAW) -> None:
     debug = _get_debug_section(agent1_json)
@@ -195,9 +272,108 @@ def render_debug_view(agent1_json: dict | None, show_raw: bool = DEBUG_SHOW_RAW)
         st.code(preview)
 
 
-def _render_evidence_badge(chunk: dict | None, evidence_meta: dict | None) -> None:
+def _render_sources_footer(used_data: Dict[str, Any]) -> None:
+    if not used_data:
+        return
+
+    st.caption("Sources Used")
+    cols = st.columns(4)
+    structured_text = "✅ Structured" if used_data.get("structured") else "⚪️ Structured"
+    weather_text = "✅ Weather" if used_data.get("weather") else "⚪️ Weather"
+    external_text = "✅ External" if used_data.get("external") else "⚪️ External"
+    rag_info = used_data.get("rag") or {}
+    rag_enabled = bool(rag_info.get("enabled"))
+    rag_hits = rag_info.get("hits") or 0
+    rag_label = "✅ RAG" if rag_enabled and rag_hits else ("⚪️ RAG" if rag_enabled else "🚫 RAG")
+    rag_details = []
+    if rag_hits:
+        rag_details.append(f"hits={rag_hits}")
+    max_score = rag_info.get("max_score")
+    if isinstance(max_score, (int, float)):
+        rag_details.append(f"max={max_score:.2f}")
+    threshold = rag_info.get("threshold")
+    if isinstance(threshold, (int, float)):
+        rag_details.append(f"θ={threshold:.2f}")
+    mode = rag_info.get("mode")
+    if mode:
+        rag_details.append(str(mode))
+    rag_text = rag_label + (" (" + ", ".join(rag_details) + ")" if rag_details else "")
+
+    cols[0].markdown(structured_text)
+    cols[1].markdown(weather_text)
+    cols[2].markdown(external_text)
+    cols[3].markdown(rag_text)
+
+
+def render_fail_soft_answer(
+    payload: Optional[Dict[str, Any]],
+    *,
+    rag_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    st.subheader("Fail-soft 응답")
+    if not payload:
+        st.info("응답이 생성되지 않았습니다.")
+        return
+
+    segments = payload.get("segments") or []
+    if not segments:
+        st.info("응답이 생성되지 않았습니다.")
+    rag_error = (rag_info or {}).get("error") if rag_info else None
+
+    for segment in segments:
+        cols = st.columns([12, 1])
+        with cols[0]:
+            st.markdown(f"- {segment.get('text')}")
+        with cols[1]:
+            evidence_chunk = segment.get("evidence")
+            evidence_meta = segment.get("evidence_meta")
+            source = segment.get("source")
+            if evidence_chunk:
+                _render_evidence_badge(evidence_chunk, evidence_meta)
+            elif source == "rag":
+                rag_enabled = bool((rag_info or {}).get("enabled"))
+                if rag_enabled:
+                    _render_evidence_badge(None, None, tooltip="관련 근거 없음")
+                elif rag_error:
+                    _render_evidence_badge(None, None, tooltip=f"RAG 오류: {rag_error}")
+                else:
+                    _render_evidence_badge(None, None, disabled=True, tooltip="RAG 비활성화")
+
+    caveats = payload.get("caveats") or []
+    if caveats:
+        unique_caveats = []
+        for item in caveats:
+            if item and item not in unique_caveats:
+                unique_caveats.append(item)
+        if unique_caveats:
+            st.caption("주의 사항")
+            for item in unique_caveats:
+                st.markdown(f"- {item}")
+
+    if rag_error and all("RAG 오류" not in item for item in caveats):
+        st.error(f"RAG 오류: {rag_error}")
+
+    _render_sources_footer(payload.get("used_data") or {})
+
+def _render_evidence_badge(
+    chunk: dict | None,
+    evidence_meta: dict | None,
+    *,
+    disabled: bool = False,
+    tooltip: str | None = None,
+) -> None:
+    if disabled:
+        label = "📎 (OFF)"
+        if tooltip:
+            label += f" — {tooltip}"
+        st.caption(label)
+        return
+
     if not chunk:
-        st.write("")
+        if tooltip:
+            st.caption(f"📎 {tooltip}")
+        else:
+            st.write("")
         return
 
     badge_label = "📎"
@@ -657,6 +833,65 @@ st.sidebar.header("데이터 상태")
 st.sidebar.write(f"📁 SHINHAN_DIR 존재: {SHINHAN_DIR.exists()}")
 st.sidebar.write(f"📁 EXTERNAL_DIR 존재: {EXTERNAL_DIR.exists()}")
 
+data_flags = st.session_state.get("_data_flags", {})
+st.sidebar.header("Data Sources")
+data_flags["use_weather"] = st.sidebar.toggle(
+    "Use Weather Data",
+    value=bool(data_flags.get("use_weather", False)),
+)
+data_flags["use_external"] = st.sidebar.toggle(
+    "Use External APIs",
+    value=bool(data_flags.get("use_external", False)),
+)
+
+rag_toggle_disabled = RETRIEVAL_TOOL is None or RETRIEVAL_INIT_ERROR is not None
+if rag_toggle_disabled:
+    data_flags["use_rag"] = False
+    st.sidebar.toggle(
+        "Use RAG (Embedded Docs)",
+        value=False,
+        disabled=True,
+        help="RetrievalTool이 준비되지 않아 비활성화되었습니다.",
+    )
+else:
+    data_flags["use_rag"] = st.sidebar.toggle(
+        "Use RAG (Embedded Docs)",
+        value=bool(data_flags.get("use_rag", True)),
+    )
+
+rag_threshold_default = float(data_flags.get("rag_threshold", 0.4))
+data_flags["rag_threshold"] = float(
+    st.sidebar.slider(
+        "RAG Threshold",
+        min_value=0.2,
+        max_value=0.6,
+        value=rag_threshold_default,
+        step=0.05,
+        disabled=rag_toggle_disabled,
+    )
+)
+data_flags["rag_top_k"] = int(
+    st.sidebar.slider(
+        "RAG top_k",
+        min_value=3,
+        max_value=10,
+        value=int(data_flags.get("rag_top_k", 5)),
+        step=1,
+        disabled=rag_toggle_disabled,
+    )
+)
+rag_modes = ["auto", "always", "off"]
+rag_mode_value = data_flags.get("rag_mode", "auto")
+if rag_mode_value not in rag_modes:
+    rag_mode_value = "auto"
+data_flags["rag_mode"] = st.sidebar.selectbox(
+    "RAG Mode",
+    options=rag_modes,
+    index=rag_modes.index(rag_mode_value),
+    disabled=rag_toggle_disabled,
+)
+st.session_state["_data_flags"] = data_flags
+
 # ===== 탭 구성 =====
 analysis_tab, sources_tab = st.tabs(["📈 분석", "📚 Embedded Sources"])
 
@@ -665,7 +900,8 @@ with analysis_tab:
     question = st.text_input("질문을 입력하세요", value=default_q)
     st.caption("상호는 반드시 {}로 감싸 주세요. 예) 성동구 {동대******}")
 
-    if st.button("분석 실행", type="primary"):
+    run_analysis = st.button("분석 실행", type="primary")
+    if run_analysis:
         from bigcon_2agent_mvp_v3 import agent1_pipeline, build_agent2_prompt, call_gemini_agent2
 
         with st.spinner("Agent-1: 데이터 집계/요약 중..."):
@@ -681,9 +917,8 @@ with analysis_tab:
                     a1['debug'] = dbg
                 st.session_state['_latest_overview'] = (overview_df, table_dict)
                 st.session_state['_latest_agent1'] = a1
+                st.session_state['_latest_question'] = question
                 st.success("Agent-1 JSON 생성 완료")
-                with st.expander("🔎 Agent-1 출력(JSON) 보기", expanded=False):
-                    st.json(a1)
             except Exception:
                 st.error("Agent-1 실행 오류")
                 st.code(traceback.format_exc())
@@ -695,43 +930,44 @@ with analysis_tab:
                 prompt_text = build_agent2_prompt(a1)
                 result = call_gemini_agent2(prompt_text)
                 st.success("Agent-2 카드 생성 완료")
+                st.session_state['_latest_agent2'] = result
             except Exception:
                 st.error("Agent-2 실행 오류")
                 st.code(traceback.format_exc())
                 st.stop()
 
-        retrieval_payload = None
-        if RETRIEVAL_TOOL is not None:
-            try:
-                retrieval_payload = RETRIEVAL_TOOL.retrieve(question, top_k=5)
-                st.session_state['_latest_retrieval'] = retrieval_payload
-            except Exception as exc:
-                st.warning(f"RetrievalTool 오류: {exc}")
-        else:
-            st.session_state['_latest_retrieval'] = None
+        _render_main_views(question, a1, result)
 
-        try:
-            overview_cached = st.session_state.get('_latest_overview', (None, None))
-            if isinstance(result, dict) and retrieval_payload:
-                result.setdefault("evidence", retrieval_payload.get("evidence", []))
-                result.setdefault("retrieval_chunks", retrieval_payload.get("chunks", []))
-            render_summary_view(
-                a1,
-                result,
-                overview_df=overview_cached[0],
-                table_dict=overview_cached[1],
-                retrieval_payload=retrieval_payload,
-            )
-        except Exception:
-            st.error("요약 뷰를 렌더링하는 중 오류가 발생했습니다.")
-            st.code(traceback.format_exc())
+    elif st.session_state.get('_latest_agent1') and st.session_state.get('_latest_agent2'):
+        latest_agent1 = st.session_state.get('_latest_agent1')
+        latest_agent2 = st.session_state.get('_latest_agent2')
+        question_snapshot = st.session_state.get('_latest_question', question)
+        _render_main_views(question_snapshot, latest_agent1, latest_agent2)
 
+    latest_agent2 = st.session_state.get('_latest_agent2')
+    if isinstance(latest_agent2, dict):
         with st.expander("🧾 Agent-2 출력(JSON) 보기", expanded=False):
-            st.json(result)
-        latest_retrieval = st.session_state.get('_latest_retrieval')
-        if latest_retrieval:
-            with st.expander("📎 Retrieval Evidence (JSON)", expanded=False):
-                st.json(latest_retrieval)
+            st.json(latest_agent2)
+    latest_retrieval = st.session_state.get('_latest_retrieval')
+    if latest_retrieval:
+        with st.expander("📎 Retrieval Evidence (JSON)", expanded=False):
+            st.json(latest_retrieval)
+    latest_agent1 = st.session_state.get('_latest_agent1')
+    if isinstance(latest_agent1, dict):
+        with st.expander("🔎 Agent-1 출력(JSON) 보기", expanded=False):
+            st.json(latest_agent1)
+
+    rag_flags = st.session_state.get("_data_flags", {})
+    if RETRIEVAL_TOOL is not None and RETRIEVAL_INIT_ERROR is None:
+        col_lo, col_hi = st.columns(2)
+        if col_lo.button("임계값 낮추기 (-0.05)"):
+            new_threshold = max(0.2, float(rag_flags.get("rag_threshold", 0.4)) - 0.05)
+            st.session_state["_data_flags"]["rag_threshold"] = round(new_threshold, 2)
+            st.experimental_rerun()
+        if col_hi.button("임계값 높이기 (+0.05)"):
+            new_threshold = min(0.6, float(rag_flags.get("rag_threshold", 0.4)) + 0.05)
+            st.session_state["_data_flags"]["rag_threshold"] = round(new_threshold, 2)
+            st.experimental_rerun()
 
     if show_debug:
         latest_agent1 = st.session_state.get('_latest_agent1')
