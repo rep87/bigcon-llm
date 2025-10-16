@@ -66,32 +66,6 @@ def _mask_debug_preview(text: str | None, limit: int = DEBUG_MAX_PREVIEW) -> str
     return masked[:limit]
 
 
-def tick():
-    return perf_counter()
-
-
-def to_ms(t0):
-    return int((perf_counter() - t0) * 1000)
-
-
-def _env_flag(name: str, default: str) -> str:
-    value = os.getenv(name)
-    return value if value is not None else default
-
-
-USE_LLM = _env_flag("AGENT1_USE_LLM", "true").lower() not in {"0", "false", "no"}
-DEBUG_MAX_PREVIEW = int(_env_flag("DEBUG_MAX_PREVIEW", "200") or 200)
-DEBUG_SHOW_RAW = _env_flag("DEBUG_SHOW_RAW", "true").lower() in {"1", "true", "yes"}
-
-
-def _mask_debug_preview(text: str | None, limit: int = DEBUG_MAX_PREVIEW) -> str:
-    if not text:
-        return ""
-    masked = re.sub(r"\{[^{}]*\}", "{***}", str(text))
-    masked = re.sub(r"([A-Za-z0-9]{4})[A-Za-z0-9]{4,}", r"\1***", masked)
-    return masked[:limit]
-
-
 def _normalize_str(value: str) -> str:
     if value is None:
         return ""
