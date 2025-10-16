@@ -99,7 +99,17 @@ def load_actioncard_schema_current():
         raise FileNotFoundError(f"스키마 파일을 찾을 수 없습니다: {SCHEMA_PATH}")
     with open(SCHEMA_PATH, 'r', encoding='utf-8') as f:
         _SCHEMA_CACHE = json.load(f)
-    _SCHEMA_VALIDATOR = Draft7Validator(_SCHEMA_CACHE)
+
+    if isinstance(_SCHEMA_CACHE, dict) and "schemas" in _SCHEMA_CACHE:
+        validators: dict[str, Draft7Validator] = {}
+        for key, schema_obj in _SCHEMA_CACHE.get("schemas", {}).items():
+            try:
+                validators[key] = Draft7Validator(schema_obj)
+            except Exception:
+                continue
+        _SCHEMA_VALIDATOR = validators
+    else:
+        _SCHEMA_VALIDATOR = Draft7Validator(_SCHEMA_CACHE)
     return _SCHEMA_CACHE, _SCHEMA_VALIDATOR
 
 def read_csv_smart(path):
@@ -844,14 +854,18 @@ def kpi_summary(panel_sub):
         '60': '60대',
     }
     age_distribution = []
+    age_allowlist = []
     for code, label in age_labels.items():
         cols = [f'M12_MAL_{code}_RAT', f'M12_FME_{code}_RAT']
-        vals = pd.to_numeric(pd.Series([detail_row.get(c) for c in cols]), errors='coerce')
-        total = vals.sum(skipna=True)
-        if pd.notna(total):
-            cleaned = _clean_pct(total)
-            if cleaned is not None:
-                age_distribution.append({'code': code, 'label': label, 'value': cleaned})
+        raw_vals = pd.Series([detail_row.get(c) for c in cols])
+        numeric_vals = pd.to_numeric(raw_vals, errors='coerce')
+        if numeric_vals.notna().sum() == 0:
+            continue
+        total = numeric_vals.sum(skipna=True)
+        cleaned = _clean_pct(total)
+        if cleaned is not None:
+            age_distribution.append({'code': code, 'label': label, 'value': cleaned})
+            age_allowlist.append(code)
     age_distribution.sort(key=lambda x: x['value'], reverse=True)
 
     customer_mix_map = [
@@ -877,6 +891,7 @@ def kpi_summary(panel_sub):
         'new_rate_avg': _clean_pct(new_latest),
         'age_distribution': age_distribution,
         'age_top_segments': age_distribution[:3],
+        'age_allowlist': age_allowlist,
         'customer_mix_detail': customer_mix_detail,
         'avg_ticket_band_label': ticket_band,
         'n_merchants': int(snap['_merchant_id'].nunique()),
@@ -900,6 +915,7 @@ def kpi_summary(panel_sub):
         'youth_pct': sanitized['youth_share_avg'],
         'customer_mix_detail': sanitized['customer_mix_detail'],
         'age_top_segments': sanitized['age_top_segments'],
+        'age_allowlist': sanitized['age_allowlist'],
         'avg_ticket_band_label': sanitized['avg_ticket_band_label'],
     }
 
@@ -1211,6 +1227,38 @@ QUESTION_TYPE_INFO = {
 }
 
 
+ORGANIZER_QUESTION_TYPES = {
+    "Q1_CAFE_CHANNELS",
+    "Q2_LOW_RETENTION",
+    "Q3_FOOD_ISSUE",
+}
+
+
+def _schema_key_for_question(question_type: str | None) -> str:
+    if question_type in ORGANIZER_QUESTION_TYPES:
+        return "organizer"
+    return "legacy"
+
+
+def _resolve_schema_for_question(
+    question_type: str | None,
+) -> tuple[dict, Draft7Validator | None, str]:
+    schema_bundle, validator_bundle = load_actioncard_schema_current()
+    key = _schema_key_for_question(question_type)
+    if isinstance(schema_bundle, dict) and "schemas" in schema_bundle:
+        schema_obj = schema_bundle.get("schemas", {}).get(key) or {}
+    else:
+        schema_obj = schema_bundle if isinstance(schema_bundle, dict) else {}
+        key = "legacy"
+
+    validator = None
+    if isinstance(validator_bundle, dict):
+        validator = validator_bundle.get(key)
+    else:
+        validator = validator_bundle
+    return schema_obj, validator, key
+
+
 def infer_question_type(question_text: str | None) -> str:
     text = (question_text or "").lower()
     if not text:
@@ -1226,7 +1274,7 @@ def infer_question_type(question_text: str | None) -> str:
 
 def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
     if not isinstance(rag_context, dict):
-        return ("RAG 비활성화: 컨텍스트가 전달되지 않았습니다.", "")
+        return ("", "RAG 비활성화: 컨텍스트가 전달되지 않았습니다.")
 
     enabled = bool(rag_context.get("enabled"))
     threshold = rag_context.get("threshold")
@@ -1258,6 +1306,7 @@ def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
         and (mode == "always" or threshold is None or (max_score is not None and max_score >= threshold))
     )
 
+    prompt_block = ""
     if include_rag:
         snippets = []
         for chunk in (rag_context.get("chunks") or [])[: hits or 5]:
@@ -1274,12 +1323,13 @@ def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
             )
         rag_payload = json.dumps(snippets, ensure_ascii=False, indent=2)
         summary = f"RAG 포함: hits={hits}, max_score={max_score}, threshold={threshold}, mode={mode}"
-        block = f"{summary}\n{rag_payload}"
+        prompt_block = f"{summary}\n{rag_payload}"
+        rag_context['prompt_note'] = summary
     else:
         reason = " ; ".join(reason_lines) if reason_lines else "근거 없음"
-        block = f"RAG 제외: {reason}"
-    rag_context['prompt_note'] = block
-    return block, "\n- ".join(reason_lines)
+        rag_context['prompt_note'] = f"RAG 제외: {reason}"
+
+    return prompt_block, "\n- ".join(reason_lines)
 
 
 def build_agent2_prompt_overhauled(
@@ -1289,30 +1339,56 @@ def build_agent2_prompt_overhauled(
     question_type: str | None = None,
     rag_context: dict | None = None,
 ):
-    try:
-        schema, _ = load_actioncard_schema_current()
-        schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
-    except Exception as e:
-        schema_text = json.dumps({"schema_error": str(e)}, ensure_ascii=False, indent=2)
-
     inferred_type = question_type or infer_question_type(question_text)
     info = QUESTION_TYPE_INFO.get(inferred_type, QUESTION_TYPE_INFO["GENERIC"])
-    type_rules = "- " + "\n- ".join(info.get("instructions", [])) if info.get("instructions") else ""
+    schema_obj = {}
+    try:
+        schema_obj, _, _ = _resolve_schema_for_question(inferred_type)
+    except Exception as exc:
+        schema_obj = {"schema_error": str(exc)}
+    schema_text = json.dumps(schema_obj, ensure_ascii=False, indent=2)
+
+    snapshot = (agent1_json or {}).get("debug", {}).get("snapshot", {})
+    if isinstance(snapshot, dict):
+        sanitized_snapshot = snapshot.get("sanitized") or {}
+    else:
+        sanitized_snapshot = {}
+    age_allowlist = []
+    if isinstance(sanitized_snapshot, dict):
+        allowlist_candidate = sanitized_snapshot.get("age_allowlist")
+        if isinstance(allowlist_candidate, list):
+            age_allowlist = [str(code) for code in allowlist_candidate if str(code)]
+        elif isinstance(allowlist_candidate, (tuple, set)):
+            age_allowlist = [str(code) for code in allowlist_candidate if str(code)]
+        if not age_allowlist:
+            distribution = sanitized_snapshot.get("age_distribution") or []
+            if isinstance(distribution, list):
+                for item in distribution:
+                    code = str(item.get("code")) if isinstance(item, dict) else None
+                    if code:
+                        age_allowlist.append(code)
+    age_allowlist = list(dict.fromkeys(age_allowlist))
 
     base_rules = [
-        "질문에 직접 답하라. 목표치·범위를 추정하지 말라.",
-        "주요 근거는 Agent-1 JSON이며, RAG가 활성화되고 관련도가 임계값 이상이면 RAG 근거를 추가로 포함한다.",
-        "근거의 출처(STRUCTURED/RAG)와 핵심 수치·스니펫을 명시한다.",
-        "모든 아이디어에 최소 1개 근거를 붙여라. 없으면 '근거 없음'을 기재한다.",
-        "상호명은 항상 마스킹 상태를 유지한다.",
-        "3~4개의 간결한 아이디어를 answers 배열로 작성한다.",
+        "질문에 직접 답하십시오. 목표치나 구간을 임의로 추정하지 마십시오(제공된 경우에만 사용).",
+        "주요 근거는 Agent-1 JSON이며, RAG가 활성화되고 유효할 때만 RAG 스니펫을 근거로 포함합니다.",
+        "모든 아이디어에 최소 1개 이상의 근거를 붙이고, 없으면 '근거 없음'으로 명시합니다.",
+        "근거에는 출처(STRUCTURED/RAG)와 핵심 수치 또는 스니펫을 함께 제시합니다.",
+        "상호명은 항상 마스킹 상태를 유지합니다.",
+        "answers 배열에 3~4개의 간결한 아이디어를 작성합니다.",
+        "age cohort 규칙: Agent-1 JSON에 존재하는 연령대만 사용하고, 0~100% 범위를 벗어나면 '—'로 표기합니다.",
     ]
+    if age_allowlist:
+        base_rules.append(f"사용 가능한 연령대 코드: {', '.join(age_allowlist)}")
+
+    type_rules = info.get("instructions", [])
 
     rag_block, rag_reason = _summarise_rag_context(rag_context)
 
     sections = [
         "당신은 한국어 소상공인 컨설턴트입니다.",
-        f"질문 유형: {info['label']} ({inferred_type})",
+        f"question_type={inferred_type}",
+        f"질문 유형 설명: {info['label']}",
         f"질문 원문: {question_text or '—'}",
         "[출력 규칙]",
         "- " + "\n- ".join(base_rules),
@@ -1320,21 +1396,28 @@ def build_agent2_prompt_overhauled(
 
     if type_rules:
         sections.append("[질문 유형별 지침]")
-        sections.append(type_rules)
+        sections.append("- " + "\n- ".join(type_rules))
 
     sections.append("[출력 스키마(JSON)]")
     sections.append(schema_text)
-    sections.append("[Agent-1 JSON]")
+    sections.append("[데이터(JSON)]")
     sections.append(json.dumps(agent1_json, ensure_ascii=False, indent=2))
-    sections.append("[RAG 근거 후보]")
-    sections.append(rag_block)
-    if rag_reason:
+
+    if rag_block:
+        sections.append("[RAG_CONTEXT]")
+        sections.append(rag_block)
+    elif rag_reason:
         sections.append(f"[RAG 참고 메모]\n- {rag_reason}")
 
     guide = "\n\n".join(sections)
     return guide
 
-def call_gemini_agent2_overhauled(prompt_text, model_name='models/gemini-2.5-flash'):
+def call_gemini_agent2_overhauled(
+    prompt_text,
+    model_name='models/gemini-2.5-flash',
+    *,
+    question_type: str | None = None,
+):
     """
     Gemini 2.5 Flash 전용 호출:
     - google-generativeai==0.8.3 기준
@@ -1351,22 +1434,19 @@ def call_gemini_agent2_overhauled(prompt_text, model_name='models/gemini-2.5-fla
         raise RuntimeError('GEMINI_API_KEY가 설정되지 않았습니다.')
     genai.configure(api_key=api_key)
 
-    # 1) 계정에서 실제 가능한 2.5-flash 계열 모델만 수집
     candidates = []
     try:
         avail = []
         for m in genai.list_models():
             if "generateContent" in getattr(m, "supported_generation_methods", []):
-                avail.append(m.name)  # 예: 'models/gemini-2.5-flash'
-        # 2.5 flash 계열만 필터
+                avail.append(m.name)
         for name in avail:
-            tail = name.split("/")[-1]
-            if "2.5" in tail and "flash" in tail:
+            tail = name.split('/')[-1]
+            if '2.5' in tail and 'flash' in tail:
                 candidates.append(name)
     except Exception:
         pass
 
-    # 가용성 조회 실패/비어있으면 합리적 후보(2.5 flash 계열)만 시도
     if not candidates:
         candidates = [
             "models/gemini-2.5-flash",
@@ -1377,11 +1457,9 @@ def call_gemini_agent2_overhauled(prompt_text, model_name='models/gemini-2.5-fla
             "gemini-2.5-flash-001",
         ]
 
-    # 사용자가 인자를 줬다면 맨 앞에 둠(역시 2.5 flash 계열이어야 함)
     if model_name and model_name not in candidates:
         candidates.insert(0, model_name)
 
-    # 세이프티(완화) + 토큰 보수적
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -1393,55 +1471,60 @@ def call_gemini_agent2_overhauled(prompt_text, model_name='models/gemini-2.5-fla
         "top_p": 0.9,
         "top_k": 32,
         "max_output_tokens": 900,
-        # "response_mime_type": "application/json",  # 강제하지 않음(빈 응답 회피)
     }
 
     def _extract_text(resp):
-        text = ""
+        text_value = ''
         try:
-            t = getattr(resp, "text", None)
-            if t: text = t
+            payload = getattr(resp, 'text', None)
+            if payload:
+                text_value = payload
         except Exception:
             pass
-        if (not text) and getattr(resp, "candidates", None):
+        if (not text_value) and getattr(resp, 'candidates', None):
             try:
                 cand0 = resp.candidates[0]
-                if cand0 and getattr(cand0, "content", None) and cand0.content.parts:
-                    for p in cand0.content.parts:
-                        pt = getattr(p, "text", "")
-                        if pt: text += pt
+                if cand0 and getattr(cand0, 'content', None) and cand0.content.parts:
+                    for part in cand0.content.parts:
+                        piece = getattr(part, 'text', '')
+                        if piece:
+                            text_value += piece
             except Exception:
                 pass
-        return (text or "").strip()
+        return (text_value or '').strip()
 
     def _blocked_info(resp):
         info = {}
-        try: info["prompt_feedback"] = getattr(resp, "prompt_feedback", None)
-        except Exception: pass
         try:
-            if getattr(resp, "candidates", None):
-                info["candidate_safety"] = getattr(resp.candidates[0], "safety_ratings", None)
-                info["finish_reason"] = getattr(resp.candidates[0], "finish_reason", None)
-        except Exception: pass
+            info['prompt_feedback'] = getattr(resp, 'prompt_feedback', None)
+        except Exception:
+            pass
+        try:
+            if getattr(resp, 'candidates', None):
+                info['candidate_safety'] = getattr(resp.candidates[0], 'safety_ratings', None)
+                info['finish_reason'] = getattr(resp.candidates[0], 'finish_reason', None)
+        except Exception:
+            pass
         return info
 
     def _run_once(name: str):
         model = genai.GenerativeModel(
             model_name=name,
             generation_config=generation_config,
-            safety_settings=safety_settings
+            safety_settings=safety_settings,
         )
         resp = model.generate_content(prompt_text)
-        text = _extract_text(resp)
+        text_value = _extract_text(resp)
         info = _blocked_info(resp)
-        return text, info, name
+        return text_value, info, name
 
     try:
-        _, schema_validator = load_actioncard_schema_current()
+        _, schema_validator, schema_key = _resolve_schema_for_question(question_type)
         schema_error = None
-    except Exception as e:
+    except Exception as exc:
         schema_validator = None
-        schema_error = str(e)
+        schema_error = str(exc)
+        schema_key = None
 
     all_attempt_logs = []
     last_error = schema_error
@@ -1450,98 +1533,88 @@ def call_gemini_agent2_overhauled(prompt_text, model_name='models/gemini-2.5-fla
         attempt_logs = []
         for mname in candidates:
             try:
-                text, info, used = _run_once(mname)
-                log_entry = {"model": used, "has_text": bool(text), "meta": info}
-                if not text:
-                    log_entry["error"] = "empty_text"
+                text_value, info, used = _run_once(mname)
+                log_entry = {"model": used, "has_text": bool(text_value), "meta": info}
+                if not text_value:
+                    log_entry['error'] = 'empty_text'
                     attempt_logs.append(log_entry)
-                    last_error = "LLM 응답이 비어 있습니다."
+                    last_error = 'LLM 응답이 비어 있습니다.'
                     continue
 
                 core = None
-                m = re.search(r"\{[\s\S]*\}", text)
-                if m:
+                match = re.search(r"\{[\s\S]*\}", text_value)
+                if match:
                     try:
-                        core = json.loads(m.group(0))
-                    except Exception as je:
-                        log_entry["error"] = f"json_parse_error: {je}"
+                        core = json.loads(match.group(0))
+                    except Exception as exc:
+                        log_entry['error'] = f"json_parse_error: {exc}"
                         attempt_logs.append(log_entry)
-                        last_error = f"JSON 파싱 실패: {je}"
+                        last_error = f"JSON 파싱 실패: {exc}"
                         continue
                 else:
-                    log_entry["error"] = "json_not_found"
+                    log_entry['error'] = 'json_not_found'
                     attempt_logs.append(log_entry)
-                    last_error = "응답에서 JSON 블록을 찾지 못했습니다."
+                    last_error = '응답에서 JSON 블록을 찾지 못했습니다.'
                     continue
 
                 if not isinstance(core, dict):
-                    log_entry["error"] = "json_not_object"
+                    log_entry['error'] = 'json_not_object'
                     attempt_logs.append(log_entry)
-                    last_error = "추출된 JSON이 객체 형식이 아닙니다."
+                    last_error = '추출된 JSON이 객체 형식이 아닙니다.'
                     continue
 
                 validation_ok = True
                 if schema_validator is not None:
                     try:
                         schema_validator.validate(core)
-                    except ValidationError as ve:
+                    except ValidationError as exc:
                         validation_ok = False
-                        log_entry["validation_error"] = ve.message
-                        last_error = f"스키마 검증 실패: {ve.message}"
+                        log_entry['validation_error'] = exc.message
+                        last_error = f"스키마 검증 실패: {exc.message}"
 
                 if validation_ok:
                     attempt_logs.append(log_entry)
                     all_attempt_logs.append({"attempt": attempt + 1, "logs": attempt_logs})
-                    # 디버그 기록
                     try:
                         debug = {
-                            "ts": datetime.datetime.utcnow().isoformat(),
-                            "chosen_model": used,
-                            "attempts": all_attempt_logs,
-                            "preview_text": text[:400],
-                            "schema_error": schema_error
+                            'ts': datetime.datetime.utcnow().isoformat(),
+                            'chosen_model': used,
+                            'attempts': all_attempt_logs,
+                            'schema_key': schema_key,
                         }
-                        with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
-                            json.dump(debug, f, ensure_ascii=False, indent=2)
+                        (OUTPUT_DIR / 'gemini_debug.json').write_text(
+                            json.dumps(debug, ensure_ascii=False, indent=2),
+                            encoding='utf-8',
+                        )
                     except Exception:
                         pass
-
-                    outp = OUTPUT_DIR / 'agent2_result.json'
-                    with open(outp, 'w', encoding='utf-8') as f:
-                        json.dump(core, f, ensure_ascii=False, indent=2)
-                    print('✅ Agent-2 결과 저장:', outp)
+                    (OUTPUT_DIR / 'agent2_result.json').write_text(
+                        json.dumps(core, ensure_ascii=False, indent=2),
+                        encoding='utf-8',
+                    )
                     return core
-
                 attempt_logs.append(log_entry)
-            except Exception as e:
-                attempt_logs.append({"model": mname, "error": str(e)})
-                last_error = str(e)
-
+            except Exception as exc:
+                attempt_logs.append({"model": mname, "error": str(exc)})
+                last_error = str(exc)
         all_attempt_logs.append({"attempt": attempt + 1, "logs": attempt_logs})
-        if schema_validator is None:
-            break
 
-    # 모두 실패 → 폴백(앱 다운 방지)
     fallback = {
         "answers": [
             {
-                "idea_title": "데이터 보강 제안",
-                "audience": "내부 운영팀",
-                "channels": ["대시보드"],
-                "execution": [
-                    "Gemini 2.5 Flash 가용성 확인",
-                    "API 키 및 호출 한도 점검",
-                    "프롬프트 길이 축소 후 재시도",
-                ],
-                "copy_samples": ["데이터를 조금만 더 주세요!"],
-                "measurement": ["LLM 호출 성공 여부"],
+                "idea_title": "카드 생성 실패",
+                "audience": "—",
+                "channels": ["—"],
+                "execution": ["LLM 카드 생성이 실패하여 기본 안내만 제공합니다."],
+                "copy_samples": ["—"],
+                "measurement": ["—"],
                 "evidence": [
                     {
-                        "source": "STRUCTURED",
-                        "key": "근거",
-                        "value": "근거 없음",
+                        "source": "NONE",
+                        "key": "error_detail",
+                        "value": last_error,
                         "period": None,
-                        "snippet": f"LLM 호출 실패: {last_error or '원인 미상'}",
+                        "snippet": None,
                         "doc_id": None,
                         "chunk_id": None,
                         "score": None,
@@ -1550,22 +1623,10 @@ def call_gemini_agent2_overhauled(prompt_text, model_name='models/gemini-2.5-fla
             }
         ]
     }
-    try:
-        debug = {
-            "ts": datetime.datetime.utcnow().isoformat(),
-            "attempts": all_attempt_logs,
-            "schema_error": schema_error,
-            "last_error": last_error
-        }
-        with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
-            json.dump(debug, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-    outp = OUTPUT_DIR / 'agent2_result.json'
-    with open(outp, 'w', encoding='utf-8') as f:
-        json.dump(fallback, f, ensure_ascii=False, indent=2)
-    print('⚠️ Agent-2: 2.5 flash 가용성/세이프티 문제 → 폴백 카드 반환')
+    (OUTPUT_DIR / 'agent2_result.json').write_text(
+        json.dumps(fallback, ensure_ascii=False, indent=2),
+        encoding='utf-8',
+    )
     return fallback
 
 

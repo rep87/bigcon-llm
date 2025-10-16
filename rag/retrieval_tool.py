@@ -16,7 +16,9 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
@@ -65,6 +67,7 @@ class RetrievalTool:
         self.corpus_dir = self.root_path / "corpus"
         self._catalog: list[_DocumentEntry] | None = None
         self._index_cache: dict[str, dict[str, Any]] = {}
+        self._hybrid_alpha = 0.3
 
     # ------------------------------------------------------------------
     # catalog helpers
@@ -189,7 +192,7 @@ class RetrievalTool:
         meta_rows: list[dict[str, Any]] = []
         dim = None
 
-        tokenised_query = self._tokenise(query)
+        tokenised_query = self._tokenise(f"query: {query}")
 
         for entry in doc_entries:
             if allowed_docs and entry.doc_id not in allowed_docs:
@@ -207,8 +210,13 @@ class RetrievalTool:
                 # Skip documents with incompatible dimensions.
                 continue
             vectors_list.append(vectors)
-            text_tokens = doc_index["token_sets"]
+            token_sets = doc_index["token_sets"]
+            token_lists = doc_index.get("token_lists") or []
+            token_counts = doc_index.get("token_counts") or []
             for i, row in chunks_df.iterrows():
+                tokens_list = token_lists[i] if i < len(token_lists) else []
+                counts = token_counts[i] if i < len(token_counts) else Counter(tokens_list)
+                token_set = token_sets[i] if i < len(token_sets) else set(tokens_list)
                 meta_rows.append(
                     {
                         "doc_id": entry.doc_id,
@@ -218,7 +226,10 @@ class RetrievalTool:
                         "end": row.get("end"),
                         "title": entry.title,
                         "origin_path": entry.origin_path,
-                        "token_set": text_tokens[i],
+                        "token_set": token_set,
+                        "token_list": tokens_list,
+                        "token_counts": counts,
+                        "length": len(tokens_list),
                     }
                 )
 
@@ -236,6 +247,37 @@ class RetrievalTool:
             }
 
         scores = all_vectors @ query_vec
+
+        bm25_scores = np.zeros(len(meta_rows), dtype=np.float32)
+        if meta_rows and tokenised_query:
+            total_docs = len(meta_rows)
+            doc_freq: Counter[str] = Counter()
+            lengths = []
+            for meta in meta_rows:
+                token_list = meta.get("token_list") or []
+                lengths.append(len(token_list))
+                doc_freq.update(set(token_list))
+            avg_len = float(sum(lengths) / max(len(lengths), 1)) or 1.0
+            k1 = 1.5
+            b = 0.75
+            for token in tokenised_query:
+                df = doc_freq.get(token, 0)
+                if df == 0:
+                    continue
+                idf = math.log((total_docs - df + 0.5) / (df + 0.5) + 1.0)
+                for idx, meta in enumerate(meta_rows):
+                    counts: Counter[str] = meta.get("token_counts") or Counter()
+                    tf = counts.get(token, 0)
+                    if tf <= 0:
+                        continue
+                    length = meta.get("length") or 0
+                    denom = tf + k1 * (1 - b + b * (length / avg_len))
+                    bm25_scores[idx] += idf * (tf * (k1 + 1)) / denom
+
+        if bm25_scores.size and bm25_scores.max() > 0:
+            bm25_norm = bm25_scores / bm25_scores.max()
+            scores = (1 - self._hybrid_alpha) * scores + self._hybrid_alpha * bm25_norm
+
         query_tokens = set(tokenised_query)
         if query_tokens:
             for idx, meta in enumerate(meta_rows):
@@ -363,9 +405,16 @@ class RetrievalTool:
         if len(chunks_df) != len(vectors):
             # Shape mismatch, skip the document.
             return None
-        token_sets = [self._tokenise(str(text)) for text in chunks_df.get("text", [])]
-        token_sets = [set(tokens) for tokens in token_sets]
-        payload = {"vectors": vectors, "chunks": chunks_df, "token_sets": token_sets}
+        token_lists = [self._tokenise(f"passage: {text}") for text in chunks_df.get("text", [])]
+        token_sets = [set(tokens) for tokens in token_lists]
+        token_counts = [Counter(tokens) for tokens in token_lists]
+        payload = {
+            "vectors": vectors,
+            "chunks": chunks_df,
+            "token_sets": token_sets,
+            "token_lists": token_lists,
+            "token_counts": token_counts,
+        }
         self._index_cache[entry.doc_id] = payload
         return payload
 
