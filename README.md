@@ -35,6 +35,6 @@ print(hits["evidence"][:2])
 ## Organizer Q1/Q2/Q3 answer policy (public mode)
 - Public mode is the default experience (toggle via the sidebar App Mode selector or the `APP_MODE` secret) and hides fail-soft banners and internal caveats.
 - Agent-2 now answers the organizer’s three evaluation questions (Q1 채널/홍보, Q2 재방문, Q3 요식업 가설) with 3–4 concise ideas, each carrying audience, 채널, 실행, 카피, 측정지표, and at least one evidence item.
-- Age cohorts strictly follow Agent-1’s allow-list and 0–100% guard rails; missing cohorts are omitted instead of being synthesized.
+- Age cohorts strictly follow Agent-1’s allow-list with deterministic combined-vs-gender merge rules; values are guarded to the 0–100% range and missing cohorts are omitted instead of being synthesized.
 - RAG evidence is appended only when the selected documents clear the similarity threshold; otherwise the cards surface structured data alone without “근거 없음” noise in public view.
 - Switch to **Debug** mode to inspect fail-soft notes, RAG score gates, and other diagnostics that remain available for reviewers/operators.
