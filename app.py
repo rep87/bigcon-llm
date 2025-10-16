@@ -1,12 +1,180 @@
-import os, json, traceback, re
+import json
+import os
+import re
+import traceback
 from pathlib import Path
-import streamlit as st
+
 import pandas as pd
+import streamlit as st
 
 # ===== 페이지 기본 =====
 st.set_page_config(page_title="성동구 소상공인 비밀상담사 (MVP)", page_icon="💬", layout="wide")
 st.title("성동구 소상공인 비밀상담사 (MVP)")
 st.caption("Agent-1: 데이터 집계/요약 → Agent-2: 실행카드(JSON) 생성")
+show_debug = st.checkbox("🔍 디버그 보기", value=True)
+
+
+def _env_flag(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value if value is not None else default
+
+
+DEBUG_SHOW_RAW = _env_flag("DEBUG_SHOW_RAW", "true").lower() in {"1", "true", "yes"}
+
+
+def _get_debug_section(agent1_json: dict | None) -> dict:
+    debug = (agent1_json or {}).get("debug")
+    return debug if isinstance(debug, dict) else {}
+
+
+def _get_debug_snapshot(agent1_json: dict | None) -> dict:
+    debug = _get_debug_section(agent1_json)
+    snap = debug.get("snapshot")
+    if isinstance(snap, dict):
+        sanitized = snap.get("sanitized")
+        if isinstance(sanitized, dict):
+            return sanitized
+    legacy = debug.get("sanitized_snapshot")
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _get_debug_raw_snapshot(agent1_json: dict | None) -> dict:
+    debug = _get_debug_section(agent1_json)
+    snap = debug.get("snapshot")
+    if isinstance(snap, dict):
+        raw = snap.get("raw")
+        if isinstance(raw, dict):
+            return raw
+    legacy = debug.get("latest_raw_snapshot")
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def render_debug_view(agent1_json: dict | None, show_raw: bool = DEBUG_SHOW_RAW) -> None:
+    debug = _get_debug_section(agent1_json)
+    if not debug:
+        st.info("디버그 정보가 없습니다.")
+        return
+
+    def _flatten_rows(obj: dict) -> pd.DataFrame:
+        rows = []
+        for key, value in (obj or {}).items():
+            if isinstance(value, (dict, list)):
+                try:
+                    text = json.dumps(value, ensure_ascii=False)
+                except TypeError:
+                    text = str(value)
+                rows.append({"항목": key, "값": text})
+            else:
+                rows.append({"항목": key, "값": value})
+        return pd.DataFrame(rows)
+
+    def _numeric_values(data):
+        if isinstance(data, dict):
+            for val in data.values():
+                yield from _numeric_values(val)
+        elif isinstance(data, (list, tuple)):
+            for item in data:
+                yield from _numeric_values(item)
+        elif isinstance(data, (int, float)):
+            yield data
+
+    errors = debug.get("errors", [])
+    resolve_info = debug.get("resolve", {}) or {}
+    panel_info = debug.get("panel", {}) or {}
+    snapshot_info = (debug.get("snapshot", {}) or {})
+    sanitized_snapshot = snapshot_info.get("sanitized") or {}
+    agent1_llm = debug.get("agent1_llm", {}) or {}
+
+    warnings = []
+    if resolve_info.get("resolved_merchant_id") is None:
+        warnings.append("가맹점 미확정: 전표본 요약으로 떨어질 위험")
+    rows_after = panel_info.get("rows_after")
+    if rows_after is not None and rows_after != 1:
+        warnings.append("단일 상점 패널 아님")
+    for num in _numeric_values(sanitized_snapshot):
+        try:
+            val = float(num)
+        except (TypeError, ValueError):
+            continue
+        if val < 0 or val > 100:
+            warnings.append("정규화 실패 의심")
+            break
+    if agent1_llm.get("safety_blocked"):
+        warnings.append("LLM 안전성 차단")
+
+    for err in errors:
+        stage = err.get('stage', 'unknown')
+        msg = err.get('msg', '')
+        st.error(f"[{stage}] {msg}")
+    for warn in warnings:
+        st.error(warn)
+
+    input_info = debug.get("input", {}) or {}
+    st.markdown("#### 입력/플래그")
+    st.write("원문:", input_info.get("original") or "—")
+    flags = input_info.get("flags") or {}
+    if flags:
+        st.write({k: flags.get(k) for k in sorted(flags)})
+
+    parse_info = debug.get("parse", {}) or {}
+    st.markdown("#### 파싱 결과")
+    st.write({
+        "merchant_mask": parse_info.get("merchant_mask"),
+        "mask_prefix": parse_info.get("mask_prefix"),
+        "sigungu": parse_info.get("sigungu"),
+        "pattern_used": parse_info.get("pattern_used"),
+        "elapsed_ms": parse_info.get("elapsed_ms"),
+    })
+
+    st.markdown("#### 가맹점 매칭")
+    st.write({
+        "path": resolve_info.get("path"),
+        "resolved_merchant_id": resolve_info.get("resolved_merchant_id"),
+        "elapsed_ms": resolve_info.get("elapsed_ms"),
+    })
+    candidates = resolve_info.get("candidates_top3") or []
+    if candidates:
+        st.table(pd.DataFrame(candidates))
+    else:
+        st.write("후보 없음")
+
+    st.markdown("#### 패널 필터")
+    st.write({
+        "rows_before": panel_info.get("rows_before"),
+        "rows_after": panel_info.get("rows_after"),
+        "latest_ta_ym": panel_info.get("latest_ta_ym"),
+        "elapsed_ms": panel_info.get("elapsed_ms"),
+    })
+
+    st.markdown("#### 스냅샷")
+    if show_raw:
+        raw_df = _flatten_rows(snapshot_info.get("raw") or {})
+        if not raw_df.empty:
+            st.caption("원본(raw)")
+            st.table(raw_df)
+    sanitized_df = _flatten_rows(sanitized_snapshot)
+    if not sanitized_df.empty:
+        st.caption("정규화(sanitized)")
+        st.table(sanitized_df)
+
+    render_info = debug.get("render", {}) or {}
+    table_dict = render_info.get("table_dict")
+    if isinstance(table_dict, dict) and table_dict:
+        st.markdown("#### 렌더 테이블")
+        st.table(pd.DataFrame([table_dict]))
+
+    st.markdown("#### Agent-1 LLM")
+    st.write({
+        "used": agent1_llm.get("used"),
+        "model": agent1_llm.get("model"),
+        "resp_bytes": agent1_llm.get("resp_bytes"),
+        "safety_blocked": agent1_llm.get("safety_blocked"),
+        "elapsed_ms": agent1_llm.get("elapsed_ms"),
+    })
+    preview = agent1_llm.get("prompt_preview")
+    if preview:
+        st.caption("프롬프트 프리뷰")
+        st.code(preview)
 
 
 def _mask_name(raw: str) -> str:
@@ -74,7 +242,7 @@ def _humanize_age_segment(code: str) -> str:
 
 
 def _collect_major_customers(agent1_json: dict) -> str:
-    debug_snapshot = ((agent1_json or {}).get("debug") or {}).get("sanitized_snapshot") or {}
+    debug_snapshot = _get_debug_snapshot(agent1_json)
     kpis = (agent1_json or {}).get("kpis", {})
     segments = []
     age_segments = debug_snapshot.get("age_top_segments") or kpis.get("age_top_segments") or []
@@ -136,7 +304,7 @@ def _collect_overview_row(agent1_json: dict) -> tuple[pd.DataFrame, dict]:
         addr = " / ".join([str(v) for v in addr if v])
     address = addr if addr else "—"
 
-    debug_snapshot = ((agent1_json or {}).get("debug") or {}).get("sanitized_snapshot") or {}
+    debug_snapshot = _get_debug_snapshot(agent1_json)
     kpis = (agent1_json or {}).get("kpis", {})
     new_rate = debug_snapshot.get("new_pct", kpis.get("new_rate_avg"))
     revisit_rate = debug_snapshot.get("revisit_pct", kpis.get("revisit_rate_avg"))
@@ -173,7 +341,7 @@ def _collect_overview_row(agent1_json: dict) -> tuple[pd.DataFrame, dict]:
 
 
 def _build_diagnosis(agent1_json: dict) -> str:
-    debug_snapshot = ((agent1_json or {}).get("debug") or {}).get("sanitized_snapshot") or {}
+    debug_snapshot = _get_debug_snapshot(agent1_json)
     kpis = (agent1_json or {}).get("kpis", {})
     sentences = []
 
@@ -230,7 +398,7 @@ def _build_goal_lines(agent1_json: dict) -> tuple[str, list[str]]:
     else:
         period_text = "기간 정보 —"
 
-    debug_snapshot = ((agent1_json or {}).get("debug") or {}).get("sanitized_snapshot") or {}
+    debug_snapshot = _get_debug_snapshot(agent1_json)
     kpis = (agent1_json or {}).get("kpis", {})
     mapping = [
         ("revisit_rate_avg", "재방문율"),
@@ -303,15 +471,16 @@ def render_summary_view(
     if context and not context.get("merchant"):
         st.warning("질문과 정확히 일치하는 가맹점을 찾지 못해 표본 전체 요약을 보여드립니다.")
 
-    debug_info = (agent1_json or {}).get("debug")
+    debug_info = _get_debug_section(agent1_json)
     if overview_df is None or table_dict is None:
-        if isinstance(debug_info, dict) and isinstance(debug_info.get("table_dict"), dict):
-            table_dict = debug_info.get("table_dict")
+        render_info = debug_info.get("render") if isinstance(debug_info, dict) else None
+        if isinstance(render_info, dict) and isinstance(render_info.get("table_dict"), dict):
+            table_dict = render_info.get("table_dict")
             overview_df = pd.DataFrame([table_dict])
         else:
             overview_df, table_dict = _collect_overview_row(agent1_json)
             if isinstance(debug_info, dict):
-                debug_info["table_dict"] = table_dict
+                debug_info.setdefault("render", {})["table_dict"] = table_dict
     if overview_df is None:
         if table_dict:
             overview_df = pd.DataFrame([table_dict])
@@ -390,81 +559,65 @@ st.sidebar.header("데이터 상태")
 st.sidebar.write(f"📁 SHINHAN_DIR 존재: {SHINHAN_DIR.exists()}")
 st.sidebar.write(f"📁 EXTERNAL_DIR 존재: {EXTERNAL_DIR.exists()}")
 
-# ===== 질문 입력 =====
-default_q = "성동구 {고향***} 기준으로, 재방문율 4주 플랜 작성해줘."
-question = st.text_input("질문을 입력하세요", value=default_q)
-st.caption("상호는 반드시 {}로 감싸 주세요. 예) 성동구 {동대******}")
+# ===== 탭 구성 =====
+analysis_tab, = st.tabs(["📈 분석"])
 
-# ===== 실행 버튼 =====
-if st.button("분석 실행", type="primary"):
-    # 지연 로딩 임포트 (배포 런타임 문제 회피)
-    from bigcon_2agent_mvp_v3 import agent1_pipeline, build_agent2_prompt, call_gemini_agent2
+with analysis_tab:
+    default_q = "성동구 {고향***} 기준으로, 재방문율 4주 플랜 작성해줘."
+    question = st.text_input("질문을 입력하세요", value=default_q)
+    st.caption("상호는 반드시 {}로 감싸 주세요. 예) 성동구 {동대******}")
 
-    # Agent-1
-    with st.spinner("Agent-1: 데이터 집계/요약 중..."):
-        try:
-            a1 = agent1_pipeline(question, SHINHAN_DIR, EXTERNAL_DIR)
+    if st.button("분석 실행", type="primary"):
+        from bigcon_2agent_mvp_v3 import agent1_pipeline, build_agent2_prompt, call_gemini_agent2
+
+        with st.spinner("Agent-1: 데이터 집계/요약 중..."):
             try:
-                overview_df, table_dict = _collect_overview_row(a1)
+                a1 = agent1_pipeline(question, SHINHAN_DIR, EXTERNAL_DIR)
+                try:
+                    overview_df, table_dict = _collect_overview_row(a1)
+                except Exception:
+                    overview_df, table_dict = pd.DataFrame(), {}
+                if isinstance(a1, dict):
+                    dbg = _get_debug_section(a1)
+                    dbg.setdefault('render', {})['table_dict'] = table_dict
+                    a1['debug'] = dbg
+                st.session_state['_latest_overview'] = (overview_df, table_dict)
+                st.session_state['_latest_agent1'] = a1
+                st.success("Agent-1 JSON 생성 완료")
+                with st.expander("🔎 Agent-1 출력(JSON) 보기", expanded=False):
+                    st.json(a1)
             except Exception:
-                overview_df, table_dict = pd.DataFrame(), {}
-            if isinstance(a1, dict):
-                dbg = a1.setdefault('debug', {})
-                if isinstance(dbg, dict):
-                    dbg['table_dict'] = table_dict
-            st.session_state['_latest_overview'] = (overview_df, table_dict)
-            st.success("Agent-1 JSON 생성 완료")
-            with st.expander("🔎 Agent-1 출력(JSON) 보기", expanded=False):
-                debug_info = (a1 or {}).get('debug', {})
-                st.text(
-                    f"parsed: {json.dumps(debug_info.get('parsed'), ensure_ascii=False, default=str)}"
-                )
-                st.text(
-                    f"candidates: {json.dumps(debug_info.get('resolve_candidates'), ensure_ascii=False, default=str)}"
-                )
-                st.text(
-                    f"resolved_merchant_id: {debug_info.get('resolved_merchant_id')} (path={debug_info.get('resolve_path')})"
-                )
-                st.text(f"merchants_covered: {debug_info.get('merchants_covered')}")
-                st.text(
-                    f"latest_raw: {json.dumps(debug_info.get('latest_raw_snapshot'), ensure_ascii=False, default=str)}"
-                )
-                st.text(
-                    f"sanitized_snapshot: {json.dumps(debug_info.get('sanitized_snapshot'), ensure_ascii=False, default=str)}"
-                )
-                st.text(
-                    f"table_dict: {json.dumps(debug_info.get('table_dict'), ensure_ascii=False, default=str)}"
-                )
-                st.json(a1)
-        except Exception:
-            st.error("Agent-1 실행 오류")
-            st.code(traceback.format_exc())
-            st.stop()
+                st.error("Agent-1 실행 오류")
+                st.code(traceback.format_exc())
+                st.stop()
 
-    # Agent-2
-    with st.spinner("Agent-2: 카드 생성 중..."):
+        with st.spinner("Agent-2: 카드 생성 중..."):
+            try:
+                os.environ["GEMINI_API_KEY"] = API_KEY
+                prompt_text = build_agent2_prompt(a1)
+                result = call_gemini_agent2(prompt_text)
+                st.success("Agent-2 카드 생성 완료")
+            except Exception:
+                st.error("Agent-2 실행 오류")
+                st.code(traceback.format_exc())
+                st.stop()
+
         try:
-            os.environ["GEMINI_API_KEY"] = API_KEY  # 내부 함수가 env 읽도록 주입
-            prompt_text = build_agent2_prompt(a1)
-            result = call_gemini_agent2(prompt_text)
-            st.success("Agent-2 카드 생성 완료")
+            overview_cached = st.session_state.get('_latest_overview', (None, None))
+            render_summary_view(a1, result, overview_df=overview_cached[0], table_dict=overview_cached[1])
         except Exception:
-            st.error("Agent-2 실행 오류")
+            st.error("요약 뷰를 렌더링하는 중 오류가 발생했습니다.")
             st.code(traceback.format_exc())
-            st.stop()
 
-    # 출력
-    try:
-        overview_cached = st.session_state.get('_latest_overview', (None, None))
-        render_summary_view(a1, result, overview_df=overview_cached[0], table_dict=overview_cached[1])
-    except Exception:
-        st.error("요약 뷰를 렌더링하는 중 오류가 발생했습니다.")
-        st.code(traceback.format_exc())
+        with st.expander("🧾 Agent-2 출력(JSON) 보기", expanded=False):
+            st.json(result)
 
-    with st.expander("🧾 Agent-2 출력(JSON) 보기", expanded=False):
-        st.json(result)
+    if show_debug:
+        latest_agent1 = st.session_state.get('_latest_agent1')
+        with st.expander("🔍 디버그 상세", expanded=True):
+            render_debug_view(latest_agent1, show_raw=DEBUG_SHOW_RAW)
 
-# 최초 안내
-if not st.session_state.get("_intro_shown"):
-    st.info("✅ 업로드 성공! 이제 질문 입력 후 [분석 실행]을 눌러 카드 결과를 확인해보세요.")
-    st.session_state["_intro_shown"] = True
+    if not st.session_state.get("_intro_shown"):
+        st.info("✅ 업로드 성공! 이제 질문 입력 후 [분석 실행]을 눌러 카드 결과를 확인해보세요.")
+        st.session_state["_intro_shown"] = True
+
