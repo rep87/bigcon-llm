@@ -1415,8 +1415,8 @@ def build_agent2_prompt_overhauled(
 def call_gemini_agent2_overhauled(
     prompt_text,
     model_name='models/gemini-2.5-flash',
-    *,
     question_type: str | None = None,
+    **kwargs,
 ):
     """
     Gemini 2.5 Flash 전용 호출:
@@ -1428,6 +1428,10 @@ def call_gemini_agent2_overhauled(
     """
     import google.generativeai as genai
     import re, json, datetime
+
+    if kwargs:
+        # 추가 인자는 무시하지만, 향후 디버깅을 위해 키 목록만 확보합니다.
+        _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841
 
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
