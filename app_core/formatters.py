@@ -1,52 +1,14 @@
-"""Utility formatters for deterministic KPI rendering."""
+"""Deterministic formatters and diagnostics for Agent-1 derived metrics."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-def _to_float(value: Any) -> Optional[float]:
-    """Best-effort conversion to float while stripping percent symbols."""
-
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        # Treat booleans as invalid for percentages
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    text = text.replace("%", "").replace(",", "")
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return None
-
-
-def _pct_guard(number: Optional[float]) -> Optional[float]:
-    """Normalize a numeric value into the 0-100 range with one decimal place."""
-
-    if number is None:
-        return None
-    if 0.0 <= number <= 1.0:
-        number *= 100.0
-    if math.isnan(number):  # pragma: no cover - defensive
-        return None
-    if number < 0.0 or number > 100.0:
-        return None
-    return round(number, 1)
-
-
-def _close(a: float, b: float, tol: float = 0.5) -> bool:
-    return abs(a - b) <= tol
-
-
-_AGE_LABEL_MAP: Dict[str, str] = {
+AGE_LABEL_MAP: Dict[str, str] = {
     "1020": "10‒20대",
     "2029": "20대",
     "2030": "20‒30대",
@@ -64,231 +26,373 @@ _AGE_LABEL_MAP: Dict[str, str] = {
     "70": "70대",
 }
 
-
-_GENDER_KEYS = {
+GENDER_ALIASES: Dict[str, set[str]] = {
     "F": {"F", "f", "FME", "female", "여", "여성"},
     "M": {"M", "m", "MAL", "male", "남", "남성"},
 }
 
 
 @dataclass
-class AgeBucket:
-    code: str
+class AgeMergeRecord:
+    """Intermediate record describing how an age bucket was derived."""
+
+    key: str
     label: str
-    percent: Optional[float]
+    combined_value: Optional[float]
+    combined_hint: str
+    female_value: Optional[float]
+    female_hint: str
+    male_value: Optional[float]
+    male_hint: str
+    final_value: Optional[float]
     source: str
-    female: Optional[float]
-    male: Optional[float]
-    combined: Optional[float]
-    fm_sum: Optional[float]
-    notes: str = ""
-    included: bool = False
+    included: bool
+    notes: List[str]
 
 
-def _label_for_code(code: str, fallback: Optional[str] = None) -> str:
-    if not code:
-        return fallback or "—"
-    key = str(code)
-    if key in _AGE_LABEL_MAP:
-        return _AGE_LABEL_MAP[key]
-    if fallback:
-        return fallback
-    return key
+def to_float_pct(value: Any) -> Tuple[Optional[float], str]:
+    """Convert value to a 0-100 percentage with origin hint.
+
+    Returns (numeric_value, origin_hint) where origin_hint is one of
+    {"p100", "p1", "str", "none", "bad"}.
+    """
+
+    if value is None:
+        return None, "none"
+
+    hint = "p100"
+    numeric: Optional[float]
+
+    if isinstance(value, bool):
+        return None, "bad"
+
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None, "none"
+        hint = "str"
+        text = text.replace("%", "").replace(",", "")
+        try:
+            numeric = float(text)
+        except (TypeError, ValueError):
+            return None, "bad"
+
+    if numeric is None or math.isnan(numeric):  # pragma: no cover - defensive
+        return None, "bad"
+
+    if 0.0 <= numeric <= 1.0:
+        numeric *= 100.0
+        hint = "p1"
+
+    if numeric < 0.0 or numeric > 100.0:
+        return None, "bad"
+
+    return round(numeric, 1), hint if hint in {"p100", "p1", "str"} else "p100"
 
 
-def _collect_allowlist(agent1: Dict[str, Any]) -> List[str]:
-    allowlist: List[str] = []
+def _snapshot_sections(agent1: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    debug = (agent1 or {}).get("debug") or {}
+    snapshot = debug.get("snapshot") or {}
+    sanitized = snapshot.get("sanitized") or {}
+    raw = snapshot.get("raw") or {}
     kpis = (agent1 or {}).get("kpis") or {}
-    candidate = kpis.get("age_allowlist")
-    if isinstance(candidate, (list, tuple, set)):
-        allowlist.extend([str(code) for code in candidate if code is not None])
-    debug_snapshot = ((agent1 or {}).get("debug") or {}).get("snapshot") or {}
-    sanitized = debug_snapshot.get("sanitized")
-    if isinstance(sanitized, dict):
-        candidate = sanitized.get("age_allowlist")
-        if isinstance(candidate, (list, tuple, set)):
-            allowlist.extend([str(code) for code in candidate if code is not None])
+    return sanitized if isinstance(sanitized, dict) else {}, raw if isinstance(raw, dict) else {}, kpis
+
+
+def _collect_allowlist(agent1: Dict[str, Any], sanitized: Dict[str, Any], kpis: Dict[str, Any]) -> List[str]:
+    allowlist: List[str] = []
+    candidates: Iterable[Any] = []
+    if isinstance(kpis.get("age_allowlist"), (list, tuple, set)):
+        candidates = kpis.get("age_allowlist")
+        allowlist.extend(str(code) for code in candidates if code is not None)
+    if isinstance(sanitized.get("age_allowlist"), (list, tuple, set)):
+        candidates = sanitized.get("age_allowlist")
+        allowlist.extend(str(code) for code in candidates if code is not None)
     return list(dict.fromkeys(allowlist))
 
 
-def _combined_distribution(agent1: Dict[str, Any]) -> Dict[str, Tuple[Optional[float], Optional[str]]]:
-    combined: Dict[str, Tuple[Optional[float], Optional[str]]] = {}
-    sources: Sequence[Any] = []
-    kpis = (agent1 or {}).get("kpis") or {}
-    dist = kpis.get("age_distribution")
-    if isinstance(dist, list):
-        sources = dist
-    else:
-        snapshot = ((agent1 or {}).get("debug") or {}).get("snapshot") or {}
-        sanitized = snapshot.get("sanitized")
-        if isinstance(sanitized, dict):
-            dist = sanitized.get("age_distribution")
-            if isinstance(dist, list):
-                sources = dist
-    for entry in sources:
-        if not isinstance(entry, dict):
-            continue
-        code = entry.get("code")
-        label = entry.get("label")
-        if code is None and label:
-            code = label
-        if code is None:
-            continue
-        code_str = str(code)
-        value = _pct_guard(_to_float(entry.get("value")))
-        combined[code_str] = (value, label)
+def _iter_age_entries(value: Any) -> Iterable[Tuple[str, Optional[str], Any]]:
+    if isinstance(value, dict):
+        for key, val in value.items():
+            yield str(key), None, val
+    elif isinstance(value, Sequence):
+        for item in value:
+            if isinstance(item, dict):
+                code = item.get("code") or item.get("key") or item.get("id") or item.get("label")
+                if code is None:
+                    continue
+                label = item.get("label") or item.get("name")
+                val = item.get("value")
+                if val is None:
+                    # allow alternate keys for numeric value
+                    for alt in ("percent", "ratio", "pct", "share"):
+                        if alt in item:
+                            val = item[alt]
+                            break
+                yield str(code), label, val
+
+
+def _collect_combined_distribution(
+    sanitized: Dict[str, Any], kpis: Dict[str, Any]
+) -> Dict[str, Tuple[Optional[float], str]]:
+    combined: Dict[str, Tuple[Optional[float], str]] = {}
+    labels: Dict[str, str] = {}
+    for container in (
+        sanitized.get("age_distribution"),
+        kpis.get("age_distribution"),
+    ):
+        for code, label, raw in _iter_age_entries(container):
+            numeric, _ = to_float_pct(raw)
+            if numeric is None:
+                continue
+            combined[code] = (numeric, label or AGE_LABEL_MAP.get(code, code))
+            if label:
+                labels[code] = label
     return combined
 
 
-def _gender_distribution(agent1: Dict[str, Any]) -> Dict[str, Dict[str, Optional[float]]]:
-    by_gender: Dict[str, Dict[str, Optional[float]]] = {}
-    snapshot = ((agent1 or {}).get("debug") or {}).get("snapshot") or {}
-    raw = snapshot.get("raw")
-    if not isinstance(raw, dict):
-        return by_gender
+def _collect_gender_distribution(
+    sanitized: Dict[str, Any], raw: Dict[str, Any], kpis: Dict[str, Any]
+) -> Dict[str, Dict[str, Tuple[Optional[float], str]]]:
+    by_gender: Dict[str, Dict[str, Tuple[Optional[float], str]]] = {}
+
+    for container in (
+        sanitized.get("age_by_gender"),
+        sanitized.get("age_gender"),
+        kpis.get("age_by_gender"),
+        kpis.get("age_gender"),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for code, mapping in container.items():
+            if not isinstance(mapping, dict):
+                continue
+            record: Dict[str, Tuple[Optional[float], str]] = by_gender.setdefault(str(code), {})
+            for gender_alias, aliases in GENDER_ALIASES.items():
+                for alias in aliases:
+                    if alias in mapping:
+                        value, hint = to_float_pct(mapping[alias])
+                        if value is not None:
+                            record[gender_alias] = (value, hint)
+                        break
+
     pattern = re.compile(r"M12_(MAL|FME)_([0-9+]+)_RAT", re.IGNORECASE)
     for key, value in raw.items():
         if not isinstance(key, str):
             continue
-        cleaned_key = key[:-4] if key.endswith("_raw") else key
-        match = pattern.fullmatch(cleaned_key)
+        base_key = key[:-4] if key.endswith("_raw") else key
+        match = pattern.fullmatch(base_key)
         if not match:
             continue
-        gender_code, bucket_code = match.groups()
-        gender_norm = None
-        for gkey, aliases in _GENDER_KEYS.items():
-            if gender_code in aliases:
-                gender_norm = gkey
+        gender_token, bucket = match.groups()
+        gender_norm: Optional[str] = None
+        for gender, aliases in GENDER_ALIASES.items():
+            if gender_token in aliases:
+                gender_norm = gender
                 break
         if gender_norm is None:
             continue
-        numeric = _pct_guard(_to_float(value))
+        numeric, hint = to_float_pct(value)
         if numeric is None:
             continue
-        bucket = str(bucket_code)
-        by_gender.setdefault(bucket, {})[gender_norm] = numeric
+        by_gender.setdefault(str(bucket), {})[gender_norm] = (numeric, hint)
+
     return by_gender
 
 
-def _build_age_records(agent1: Dict[str, Any]) -> List[AgeBucket]:
-    combined = _combined_distribution(agent1)
-    by_gender = _gender_distribution(agent1)
-    allowlist = _collect_allowlist(agent1)
-    combined_codes = set(combined.keys())
-    gender_codes = set(by_gender.keys())
-    candidate_keys = sorted(combined_codes | gender_codes)
+def _guard_percent(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    if math.isnan(value):  # pragma: no cover - defensive
+        return None
+    if value < 0.0 or value > 100.0:
+        return None
+    return round(value, 1)
+
+
+def _build_age_records(agent1: Dict[str, Any]) -> Tuple[List[AgeMergeRecord], List[AgeMergeRecord]]:
+    sanitized, raw, kpis = _snapshot_sections(agent1)
+    allowlist = _collect_allowlist(agent1, sanitized, kpis)
+    combined = _collect_combined_distribution(sanitized, kpis)
+    by_gender = _collect_gender_distribution(sanitized, raw, kpis)
+
+    candidate_keys = sorted(set(combined.keys()) | set(by_gender.keys()))
     if allowlist:
-        allow = {str(code) for code in allowlist}
+        allow = set(allowlist)
         candidate_keys = [code for code in candidate_keys if code in allow]
 
-    records: List[AgeBucket] = []
+    all_records: List[AgeMergeRecord] = []
+    included: List[AgeMergeRecord] = []
 
     for code in candidate_keys:
-        combined_value, combined_label = combined.get(code, (None, None))
-        genders = by_gender.get(code, {})
-        female = genders.get("F")
-        male = genders.get("M")
-        fm_sum = None
-        fm_note = ""
-        if female is not None and male is not None:
-            fm_candidate = _pct_guard(female + male)
-            if fm_candidate is None:
-                fm_note = "F+M 합이 범위를 벗어남"
-            else:
-                fm_sum = fm_candidate
-        elif genders:
-            fm_note = "단일 성별 데이터만 존재"
+        combined_entry = combined.get(code)
+        combined_value = combined_entry[0] if combined_entry else None
+        combined_label = combined_entry[1] if combined_entry else None
+        combined_hint = "none"
+        if combined_entry:
+            _, combined_hint = to_float_pct(combined_value)
 
-        label = _label_for_code(code, combined_label)
-        chosen_value: Optional[float] = None
+        gender_map = by_gender.get(code) or {}
+        female_value, female_hint = (gender_map.get("F") or (None, "none"))
+        male_value, male_hint = (gender_map.get("M") or (None, "none"))
+
+        fm_sum: Optional[float] = None
+        notes: List[str] = []
+        if female_value is not None and male_value is not None:
+            total = female_value + male_value
+            fm_sum = _guard_percent(total)
+            if fm_sum is None:
+                notes.append("F+M 합이 0–100 범위를 벗어남")
+
+        final_value: Optional[float] = None
         source = "skipped"
 
         if combined_value is not None:
-            chosen_value = combined_value
-            source = "combined"
-        elif fm_sum is not None:
-            chosen_value = fm_sum
-            source = "F+M"
+            final_value = _guard_percent(combined_value)
+            if final_value is not None:
+                source = "combined"
+        if final_value is None and fm_sum is not None:
+            final_value = fm_sum
+            if final_value is not None:
+                source = "F+M"
 
-        if chosen_value is None and fm_sum is not None:
-            # Combined missing but F+M valid
-            chosen_value = fm_sum
-            source = "F+M"
-
-        note_parts: List[str] = []
-        if fm_note:
-            note_parts.append(fm_note)
         if (
-            combined_value is not None
+            final_value is not None
+            and combined_value is not None
             and fm_sum is not None
-            and not _close(combined_value, fm_sum)
+            and abs(combined_value - fm_sum) > 0.5
         ):
-            note_parts.append(
-                f"combined {combined_value:.1f} vs F+M {fm_sum:.1f}"
-            )
+            notes.append(f"combined {combined_value:.1f} vs F+M {fm_sum:.1f}")
 
-        included = chosen_value is not None
-        if not included and not note_parts and not genders and combined_value is None:
-            note_parts.append("데이터 없음")
+        label = AGE_LABEL_MAP.get(code, combined_label or code)
 
-        records.append(
-            AgeBucket(
-                code=code,
-                label=label,
-                percent=chosen_value,
-                source=source,
-                female=female,
-                male=male,
-                combined=combined_value,
-                fm_sum=fm_sum,
-                notes="; ".join(note_parts),
-                included=included,
-            )
+        record = AgeMergeRecord(
+            key=code,
+            label=label,
+            combined_value=_guard_percent(combined_value),
+            combined_hint=combined_hint,
+            female_value=_guard_percent(female_value),
+            female_hint=female_hint,
+            male_value=_guard_percent(male_value),
+            male_hint=male_hint,
+            final_value=_guard_percent(final_value),
+            source=source,
+            included=final_value is not None,
+            notes=notes,
         )
 
-    records.sort(
+        all_records.append(record)
+        if record.included and record.final_value is not None:
+            included.append(record)
+
+    included.sort(
         key=lambda item: (
-            0 if item.included else 1,
-            -(item.percent if isinstance(item.percent, (int, float)) else -1),
-            item.code,
+            -item.final_value if isinstance(item.final_value, (int, float)) else 1e9,
+            item.key,
         )
     )
 
-    return records
+    return included, all_records
+
+
+def merge_age_buckets(agent1: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return deterministic age buckets for rendering."""
+
+    included, _ = _build_age_records(agent1)
+    return [
+        {
+            "key": record.key,
+            "label": record.label,
+            "value": record.final_value,
+            "source": record.source,
+            "combined": record.combined_value,
+            "female": record.female_value,
+            "male": record.male_value,
+            "notes": list(record.notes),
+        }
+        for record in included
+        if record.final_value is not None
+    ]
 
 
 def get_age_buckets(agent1: Dict[str, Any]) -> List[Tuple[str, float]]:
     """Return a sorted list of (label, percent) tuples for valid age buckets."""
 
-    records = _build_age_records(agent1)
-    buckets: List[Tuple[str, float]] = []
-    for record in records:
-        if not record.included or record.percent is None:
-            continue
-        buckets.append((record.label, record.percent))
-    buckets.sort(key=lambda item: item[1], reverse=True)
-    return buckets
+    return [(item["label"], item["value"]) for item in merge_age_buckets(agent1)]
 
 
 def get_age_bucket_details(agent1: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Provide detailed debug information for how age buckets were derived."""
+    """Detailed debug information for age merge decisions."""
 
-    records = _build_age_records(agent1)
+    _, all_records = _build_age_records(agent1)
     details: List[Dict[str, Any]] = []
-    for record in records:
+    for record in all_records:
         details.append(
             {
-                "code": record.code,
+                "key": record.key,
                 "label": record.label,
-                "percent": record.percent,
+                "final_value": record.final_value,
                 "source": record.source,
-                "female": record.female,
-                "male": record.male,
-                "combined": record.combined,
-                "sum_fm": record.fm_sum,
+                "combined_value": record.combined_value,
+                "female_value": record.female_value,
+                "male_value": record.male_value,
                 "included": record.included,
-                "notes": record.notes,
+                "notes": "; ".join(record.notes) if record.notes else "",
             }
         )
     return details
+
+
+def three_line_diagnosis(agent1: Dict[str, Any]) -> List[str]:
+    """Build exactly three summary lines for the overview diagnosis."""
+
+    sanitized, _, kpis = _snapshot_sections(agent1)
+    lines: List[str] = []
+
+    mix_detail = sanitized.get("customer_mix_detail") or kpis.get("customer_mix_detail") or {}
+    mix_labels = ["유동", "직장", "거주"]
+    mix_parts: List[str] = []
+    if isinstance(mix_detail, dict):
+        for label in mix_labels:
+            value, _ = to_float_pct(mix_detail.get(label))
+            if value is None:
+                mix_parts.append(f"{label} —")
+            else:
+                mix_parts.append(f"{label} {value:.1f}%")
+    if not mix_parts:
+        mix_parts = ["유형 데이터 부족"]
+    lines.append(" · ".join(mix_parts))
+
+    age_buckets = merge_age_buckets(agent1)
+    if age_buckets:
+        top_bucket = age_buckets[0]
+        lines.append(f"최다 연령 {top_bucket['label']} {top_bucket['value']:.1f}%")
+    else:
+        lines.append("연령 데이터 부족")
+
+    new_pct, _ = to_float_pct(sanitized.get("new_pct") or kpis.get("new_rate_avg"))
+    revisit_pct, _ = to_float_pct(sanitized.get("revisit_pct") or kpis.get("revisit_rate_avg"))
+    if new_pct is None and revisit_pct is None:
+        lines.append("신규·재방문 데이터 부족")
+    else:
+        parts = []
+        parts.append(f"신규 {new_pct:.1f}%" if new_pct is not None else "신규 —")
+        parts.append(f"재방문 {revisit_pct:.1f}%" if revisit_pct is not None else "재방문 —")
+        lines.append(" · ".join(parts))
+
+    while len(lines) < 3:
+        lines.append("데이터 부족")
+
+    return lines[:3]
+
+
+__all__ = [
+    "to_float_pct",
+    "merge_age_buckets",
+    "get_age_buckets",
+    "get_age_bucket_details",
+    "three_line_diagnosis",
+]
 

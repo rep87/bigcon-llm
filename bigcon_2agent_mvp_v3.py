@@ -20,6 +20,7 @@ __all__ = [
     "infer_question_type",
     "load_actioncard_schema",
     "load_actioncard_schema_current",
+    "AGENT2_PROMPT_TRACE",
 ]
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -36,6 +37,33 @@ random.seed(SEED); np.random.seed(SEED)
 
 _SCHEMA_CACHE = None
 _SCHEMA_VALIDATOR = None
+AGENT2_PROMPT_TRACE: dict = {}
+
+
+def tick():
+    return perf_counter()
+
+
+def to_ms(t0):
+    return int((perf_counter() - t0) * 1000)
+
+
+def _env_flag(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value if value is not None else default
+
+
+USE_LLM = _env_flag("AGENT1_USE_LLM", "true").lower() not in {"0", "false", "no"}
+DEBUG_MAX_PREVIEW = int(_env_flag("DEBUG_MAX_PREVIEW", "200") or 200)
+DEBUG_SHOW_RAW = _env_flag("DEBUG_SHOW_RAW", "true").lower() in {"1", "true", "yes"}
+
+
+def _mask_debug_preview(text: str | None, limit: int = DEBUG_MAX_PREVIEW) -> str:
+    if not text:
+        return ""
+    masked = re.sub(r"\{[^{}]*\}", "{***}", str(text))
+    masked = re.sub(r"([A-Za-z0-9]{4})[A-Za-z0-9]{4,}", r"\1***", masked)
+    return masked[:limit]
 
 
 def tick():
@@ -1410,6 +1438,30 @@ def build_agent2_prompt_overhauled(
         sections.append(f"[RAG 참고 메모]\n- {rag_reason}")
 
     guide = "\n\n".join(sections)
+    schema_keys = []
+    if isinstance(schema_obj, dict) and isinstance(schema_obj.get("properties"), dict):
+        schema_keys = sorted(schema_obj["properties"].keys())
+    rag_doc_ids = []
+    rag_threshold = None
+    rag_max_score = None
+    rag_mode = None
+    if isinstance(rag_context, dict):
+        rag_doc_ids = list(rag_context.get("selected_doc_ids") or [])
+        rag_threshold = rag_context.get("threshold")
+        rag_max_score = rag_context.get("max_score")
+        rag_mode = rag_context.get("mode")
+    global AGENT2_PROMPT_TRACE
+    AGENT2_PROMPT_TRACE = {
+        "question_type": inferred_type,
+        "organizer_mode": inferred_type in ORGANIZER_QUESTION_TYPES,
+        "schema_keys": schema_keys,
+        "rag_included": bool(rag_block),
+        "rag_reason": rag_reason,
+        "rag_context_doc_ids": rag_doc_ids,
+        "rag_threshold": rag_threshold,
+        "rag_max_score": rag_max_score,
+        "rag_mode": rag_mode,
+    }
     return guide
 
 def call_gemini_agent2_overhauled(

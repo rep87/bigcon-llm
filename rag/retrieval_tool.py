@@ -291,6 +291,7 @@ class RetrievalTool:
             top_indices = np.argpartition(scores, -top_k)[-top_k:]
             top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
 
+        ordered_scores = [float(scores[idx]) for idx in top_indices.tolist()]
         chunks: list[dict[str, Any]] = []
         for idx in top_indices:
             meta = meta_rows[idx]
@@ -352,6 +353,7 @@ class RetrievalTool:
             "mode": mode,
             "selected_doc_ids": sorted(allowed_docs or []),
             "catalog_size": len(doc_entries),
+            "top_scores": ordered_scores,
         }
 
     # ------------------------------------------------------------------
