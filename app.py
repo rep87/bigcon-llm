@@ -27,347 +27,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency path
     RetrievalTool = None
 
-    parse_info = debug.get("parse", {}) or {}
-    st.markdown("#### 파싱 결과")
-    st.write({
-        "merchant_mask": parse_info.get("merchant_mask"),
-        "mask_prefix": parse_info.get("mask_prefix"),
-        "sigungu": parse_info.get("sigungu"),
-        "pattern_used": parse_info.get("pattern_used"),
-        "elapsed_ms": parse_info.get("elapsed_ms"),
-    })
-
-    st.markdown("#### 가맹점 매칭")
-    st.write({
-        "path": resolve_info.get("path"),
-        "resolved_merchant_id": resolve_info.get("resolved_merchant_id"),
-        "elapsed_ms": resolve_info.get("elapsed_ms"),
-    })
-    candidates = resolve_info.get("candidates_top3") or []
-    if candidates:
-        st.table(pd.DataFrame(candidates))
-    else:
-        st.write("후보 없음")
-
-    st.markdown("#### 패널 필터")
-    st.write({
-        "rows_before": panel_info.get("rows_before"),
-        "rows_after": panel_info.get("rows_after"),
-        "latest_ta_ym": panel_info.get("latest_ta_ym"),
-        "elapsed_ms": panel_info.get("elapsed_ms"),
-    })
-
-    st.markdown("#### 스냅샷")
-    if show_raw:
-        raw_df = _flatten_rows(snapshot_info.get("raw") or {})
-        if not raw_df.empty:
-            st.caption("원본(raw)")
-            st.table(raw_df)
-    sanitized_df = _flatten_rows(sanitized_snapshot)
-    if not sanitized_df.empty:
-        st.caption("정규화(sanitized)")
-        st.table(sanitized_df)
-    age_details = get_age_bucket_details(agent1_json or {})
-    if age_details:
-        st.caption("연령 분포 결정")
-        st.table(pd.DataFrame(age_details))
-
-    render_info = debug.get("render", {}) or {}
-    table_dict = render_info.get("table_dict")
-    if isinstance(table_dict, dict) and table_dict:
-        st.markdown("#### 렌더 테이블")
-        st.table(pd.DataFrame([table_dict]))
-
-    rag_info_state = st.session_state.get("_latest_rag_info")
-    rag_prompt_state = st.session_state.get("_latest_rag_prompt_context") or {}
-    st.markdown("#### RAG 상태")
-    if isinstance(rag_info_state, dict):
-        summary = {
-            "requested": rag_info_state.get("requested"),
-            "enabled": rag_info_state.get("enabled"),
-            "selected_doc_ids": rag_info_state.get("selected_doc_ids"),
-            "threshold": rag_info_state.get("threshold"),
-            "max_score": rag_info_state.get("max_score"),
-            "mode": rag_info_state.get("mode"),
-            "error": rag_info_state.get("error"),
-        }
-        st.write(summary)
-        payload = rag_info_state.get("payload") or {}
-        chunk_rows = []
-        for chunk in (payload.get("chunks") or [])[:5]:
-            chunk_rows.append(
-                {
-                    "doc_id": chunk.get("doc_id"),
-                    "chunk_id": chunk.get("chunk_id"),
-                    "score": chunk.get("score"),
-                }
-            )
-        if chunk_rows:
-            st.table(pd.DataFrame(chunk_rows))
-        else:
-            st.write("근거 없음 또는 임계값 미달")
-        prompt_note = rag_prompt_state.get("prompt_note")
-        if prompt_note:
-            st.caption(_shorten_snippet(prompt_note, limit=200))
-    else:
-        st.write("RAG 정보가 없습니다.")
-
-    st.markdown("#### Agent-1 LLM")
-    st.write({
-        "used": agent1_llm.get("used"),
-        "model": agent1_llm.get("model"),
-        "resp_bytes": agent1_llm.get("resp_bytes"),
-        "safety_blocked": agent1_llm.get("safety_blocked"),
-        "elapsed_ms": agent1_llm.get("elapsed_ms"),
-    })
-    preview = agent1_llm.get("prompt_preview")
-    if preview:
-        st.caption("프롬프트 프리뷰")
-        st.code(preview)
-
-
-def _render_sources_footer(used_data: Dict[str, Any]) -> None:
-    if not used_data:
-        return
-
-    st.caption("Sources Used")
-    cols = st.columns(4)
-    structured_text = "✅ Structured" if used_data.get("structured") else "⚪️ Structured"
-    weather_text = "✅ Weather" if used_data.get("weather") else "⚪️ Weather"
-    external_text = "✅ External" if used_data.get("external") else "⚪️ External"
-    rag_info = used_data.get("rag") or {}
-    rag_enabled = bool(rag_info.get("enabled"))
-    rag_hits = rag_info.get("hits") or 0
-    rag_label = "✅ RAG" if rag_enabled and rag_hits else ("⚪️ RAG" if rag_enabled else "🚫 RAG")
-    rag_details = []
-    if rag_hits:
-        rag_details.append(f"hits={rag_hits}")
-    max_score = rag_info.get("max_score")
-    if isinstance(max_score, (int, float)):
-        rag_details.append(f"max={max_score:.2f}")
-    threshold = rag_info.get("threshold")
-    if isinstance(threshold, (int, float)):
-        rag_details.append(f"θ={threshold:.2f}")
-    mode = rag_info.get("mode")
-    if mode:
-        rag_details.append(str(mode))
-    selected_docs = rag_info.get("selected_docs") or []
-    if selected_docs:
-        rag_details.append(f"docs={len(selected_docs)}")
-    elif rag_info.get("requested") and not rag_enabled:
-        rag_details.append("docs=0")
-    rag_text = rag_label + (" (" + ", ".join(rag_details) + ")" if rag_details else "")
-
-    cols[0].markdown(structured_text)
-    cols[1].markdown(weather_text)
-    cols[2].markdown(external_text)
-    cols[3].markdown(rag_text)
-
-
-def render_fail_soft_answer(
-    payload: Optional[Dict[str, Any]],
-    *,
-    rag_info: Optional[Dict[str, Any]] = None,
-) -> None:
-    st.subheader("Fail-soft 응답")
-    if not payload:
-        st.info("응답이 생성되지 않았습니다.")
-        return
-
-    segments = payload.get("segments") or []
-    if not segments:
-        st.info("응답이 생성되지 않았습니다.")
-    rag_error = (rag_info or {}).get("error") if rag_info else None
-
-    for segment in segments:
-        cols = st.columns([12, 1])
-        with cols[0]:
-            st.markdown(f"- {segment.get('text')}")
-        with cols[1]:
-            evidence_chunk = segment.get("evidence")
-            evidence_meta = segment.get("evidence_meta")
-            source = segment.get("source")
-            if evidence_chunk:
-                _render_evidence_badge(evidence_chunk, evidence_meta)
-            elif source == "rag":
-                rag_enabled = bool((rag_info or {}).get("enabled"))
-                if rag_enabled:
-                    _render_evidence_badge(None, None, tooltip="관련 근거 없음")
-                elif rag_error:
-                    _render_evidence_badge(None, None, tooltip=f"RAG 오류: {rag_error}")
-                else:
-                    _render_evidence_badge(None, None, disabled=True, tooltip="RAG 비활성화")
-
-    caveats = payload.get("caveats") or []
-    if caveats:
-        unique_caveats = []
-        for item in caveats:
-            if item and item not in unique_caveats:
-                unique_caveats.append(item)
-        if unique_caveats:
-            st.caption("주의 사항")
-            for item in unique_caveats:
-                st.markdown(f"- {item}")
-
-    if rag_error and all("RAG 오류" not in item for item in caveats):
-        st.error(f"RAG 오류: {rag_error}")
-
-    _render_sources_footer(payload.get("used_data") or {})
-
-def _render_evidence_badge(
-    chunk: dict | None,
-    evidence_meta: dict | None,
-    *,
-    disabled: bool = False,
-    tooltip: str | None = None,
-) -> None:
-    if disabled:
-        label = "📎 (OFF)"
-        if tooltip:
-            label += f" — {tooltip}"
-        st.caption(label)
-        return
-
-    if not chunk:
-        if tooltip:
-            st.caption(f"📎 {tooltip}")
-        else:
-            st.write("")
-        return
-
-    popover_fn = getattr(st, "popover", None)
-    score = chunk.get("score")
-    score_text = f"{float(score):.3f}" if score is not None else "—"
-    doc_id = chunk.get("doc_id") or "—"
-    chunk_id = chunk.get("chunk_id") or "—"
-    title = evidence_meta.get("title") if isinstance(evidence_meta, dict) else None
-    uri = evidence_meta.get("uri") if isinstance(evidence_meta, dict) else None
-
-    def _short_label(value: str) -> str:
-        text = str(value or "")
-        if len(text) <= 8:
-            return text
-        return text[:5] + "…"
-
-    display_token = chunk.get("chunk_id") or chunk.get("doc_id") or "근거"
-    badge_label = f"📎 {_short_label(display_token)}·{score_text}"
-
-    body_lines = [f"**문서 제목:** {title or doc_id}"]
-    body_lines.append(f"**문서 ID:** {doc_id}")
-    body_lines.append(f"**Chunk ID:** {chunk_id}")
-    body_lines.append(f"**유사도:** {score_text}")
-    text = chunk.get("text") or "—"
-    body_lines.append("\n**내용 발췌**\n")
-    body_lines.append(text)
-    if uri:
-        body_lines.append(f"\n[원본 열기]({uri})")
-
-    if callable(popover_fn):
-        with popover_fn(badge_label):
-            for line in body_lines:
-                st.markdown(line)
-    else:  # pragma: no cover - fallback for older Streamlit
-        with st.expander(badge_label, expanded=False):
-            for line in body_lines:
-                st.markdown(line)
-
-
-def _env_flag(name: str, default: str) -> str:
-    value = os.getenv(name)
-    return value if value is not None else default
-
-
-DEBUG_SHOW_RAW = _env_flag("DEBUG_SHOW_RAW", "true").lower() in {"1", "true", "yes"}
-
-
-def _secret_value(name: str, default: str | None = None) -> str | None:
-    try:
-        return st.secrets.get(name, default)
-    except Exception:  # pragma: no cover - Streamlit secrets unavailable
-        return default
-
-
-DEFAULT_RAG_ROOT = "data/rag"
-RAG_ROOT = _secret_value("RAG_ROOT") or os.getenv("RAG_ROOT") or DEFAULT_RAG_ROOT
-RAG_EMBED_VERSION = os.getenv("RAG_EMBED_VERSION", "embed_v1")
-_DEFAULT_APP_MODE = (_secret_value("APP_MODE") or os.getenv("APP_MODE") or "public").lower()
-if _DEFAULT_APP_MODE not in {"public", "debug"}:
-    _DEFAULT_APP_MODE = "public"
-if "_app_mode" not in st.session_state:
-    st.session_state["_app_mode"] = _DEFAULT_APP_MODE
-APP_MODE = st.session_state.get("_app_mode", "public")
-
-if APP_MODE == "debug":
-    show_debug = st.checkbox(
-        "🔍 디버그 보기",
-        value=st.session_state.get("show_debug_checkbox", True),
-        key="show_debug_checkbox",
-    )
-else:
-    show_debug = False
-RAG_ROOT_PATH = Path(RAG_ROOT).expanduser()
-RETRIEVAL_INIT_ERROR: str | None = None
-RETRIEVAL_TOOL: object | None = None
-RAG_CATALOG: list[Dict[str, Any]] = []
-RAG_CATALOG_ERROR: str | None = None
-
-if RetrievalTool is not None:
-    try:
-        RETRIEVAL_TOOL = RetrievalTool(root=RAG_ROOT, embed_version=RAG_EMBED_VERSION)
-    except Exception as exc:  # pragma: no cover - defensive guard for UI
-        RETRIEVAL_INIT_ERROR = str(exc)
-else:  # pragma: no cover - module missing
-    RETRIEVAL_INIT_ERROR = "rag.RetrievalTool 모듈을 불러오지 못했습니다."
-
-if RETRIEVAL_TOOL is not None and RETRIEVAL_INIT_ERROR is None:
-    if not RAG_ROOT_PATH.exists():
-        RAG_CATALOG_ERROR = f"RAG_ROOT 경로({RAG_ROOT_PATH})가 존재하지 않습니다."
-    else:
-        try:
-            catalog_entries = RETRIEVAL_TOOL.load_catalog()
-            for entry in catalog_entries:
-                origin_path = entry.origin_path
-                origin_uri = origin_path
-                if origin_path:
-                    path_obj = Path(origin_path)
-                    if not path_obj.is_absolute():
-                        origin_uri = (RAG_ROOT_PATH / path_obj).as_posix()
-                    else:
-                        origin_uri = path_obj.as_posix()
-                RAG_CATALOG.append(
-                    {
-                        "document_id": entry.doc_id,
-                        "title": entry.title,
-                        "num_chunks": entry.num_chunks,
-                        "embedding_model": entry.embedding_model,
-                        "created_at": entry.created_at,
-                        "origin_path": origin_uri,
-                        "tags": list(entry.tags or []),
-                        "year": entry.year,
-                    }
-                )
-        except Exception as exc:  # pragma: no cover - defensive guard
-            RAG_CATALOG_ERROR = str(exc)
-
-
-def _get_debug_section(agent1_json: dict | None) -> dict:
-    debug = (agent1_json or {}).get("debug")
-    return debug if isinstance(debug, dict) else {}
-
-
-if "_data_flags" not in st.session_state:
-    st.session_state["_data_flags"] = {
-        "use_weather": False,
-        "use_external": False,
-        "use_rag": True,
-        "rag_threshold": 0.35,
-        "rag_top_k": 5,
-        "rag_mode": "auto",
-        "rag_filter": "",
-        "rag_selected_ids": [],
-    }
-
-
 def _get_debug_snapshot(agent1_json: dict | None) -> dict:
     debug = _get_debug_section(agent1_json)
     snap = debug.get("snapshot")
@@ -498,6 +157,7 @@ def _build_debug_report_markdown(
     rag_info: Dict[str, Any] | None,
     rag_prompt_context: Dict[str, Any] | None,
     prompt_trace: Dict[str, Any] | None,
+    response_trace: Dict[str, Any] | None,
 ) -> str:
     if not isinstance(agent1_json, dict):
         return ""
@@ -590,6 +250,48 @@ def _build_debug_report_markdown(
     )
     if prompt_trace.get("rag_context_doc_ids"):
         lines.append(f"- rag doc_ids: {prompt_trace.get('rag_context_doc_ids')}")
+
+    response_trace = response_trace or {}
+    lines.append("\n**Agent-2 Response Trace**")
+    if not response_trace:
+        lines.append("- response trace unavailable")
+    else:
+        status = response_trace.get("status")
+        lines.append(f"- status: {status}")
+        if response_trace.get("generation_config"):
+            lines.append(f"- generation_config: {response_trace.get('generation_config')}")
+        if response_trace.get("prompt_length") is not None:
+            lines.append(f"- prompt_length: {response_trace.get('prompt_length')}")
+        if response_trace.get("chosen_model"):
+            lines.append(f"- chosen_model: {response_trace.get('chosen_model')}")
+        if response_trace.get("last_error"):
+            lines.append(f"- last_error: {response_trace.get('last_error')}")
+        if response_trace.get("fallback_answers") is not None:
+            lines.append(f"- fallback_answers: {response_trace.get('fallback_answers')}")
+        attempts = response_trace.get("attempts") or []
+        if attempts:
+            lines.append("- attempts:")
+            for attempt in attempts:
+                label = f"attempt {attempt.get('attempt')} / {attempt.get('model')}"
+                lines.append(f"    - {label}: {attempt.get('status')}")
+                parse_logs = attempt.get("parse_logs") or []
+                excerpt = ""
+                for entry in parse_logs:
+                    if not entry.get("success") and entry.get("excerpt"):
+                        excerpt = entry["excerpt"].replace('\n', ' ')[:160]
+                        break
+                if excerpt:
+                    lines.append(f"        · excerpt: {excerpt}")
+                if attempt.get("raw_preview"):
+                    preview = attempt.get("raw_preview").replace('\n', ' ')
+                    lines.append(f"        · raw_preview: {preview[:160]}")
+                if attempt.get("repair_logs"):
+                    rep_logs = attempt["repair_logs"]
+                    for entry in rep_logs:
+                        if not entry.get("success") and entry.get("excerpt"):
+                            snippet = entry["excerpt"].replace('\n', ' ')[:160]
+                            lines.append(f"        · repair excerpt: {snippet}")
+                            break
 
     rag_info = rag_info or {}
     lines.append("\n**RAG Retrieval**")
@@ -758,12 +460,14 @@ def render_debug_view(agent1_json: dict | None, show_raw: bool = DEBUG_SHOW_RAW)
     rag_info_state = st.session_state.get("_latest_rag_info")
     rag_prompt_state = st.session_state.get("_latest_rag_prompt_context")
     prompt_trace = st.session_state.get("_latest_prompt_trace")
+    response_trace = st.session_state.get("_latest_response_trace")
     report_markdown = _build_debug_report_markdown(
         agent1_json,
         question_type=question_type,
         rag_info=rag_info_state,
         rag_prompt_context=rag_prompt_state,
         prompt_trace=prompt_trace,
+        response_trace=response_trace,
     )
     if report_markdown:
         st.markdown(report_markdown)

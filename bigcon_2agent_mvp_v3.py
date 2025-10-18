@@ -16,7 +16,102 @@ import pandas as pd
 import numpy as np
 from jsonschema import Draft7Validator
 
-from app_core.formatters import merge_age_buckets, to_float_pct
+try:
+    from app_core.formatters import merge_age_buckets, to_float_pct
+except ImportError:  # pragma: no cover - fallback for deployments without ``app_core`` package
+    def to_float_pct(value):
+        """Simplified percentage parser returning ``(value, hint)`` like the shared helper."""
+
+        if value is None:
+            return None, "none"
+        if isinstance(value, bool):
+            return None, "bad"
+
+        hint = "p100"
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+        else:
+            text = str(value).strip().replace("%", "").replace(",", "")
+            if not text:
+                return None, "none"
+            hint = "str"
+            try:
+                numeric = float(text)
+            except (TypeError, ValueError):
+                return None, "bad"
+
+        if numeric is None:
+            return None, "bad"
+        if 0.0 <= numeric <= 1.0:
+            numeric *= 100.0
+            hint = "p1"
+        if numeric < 0.0 or numeric > 100.0:
+            return None, "bad"
+        return round(numeric, 1), hint
+
+    def merge_age_buckets(agent1):
+        """Minimal fallback that prefers combined buckets and sums gender splits when necessary."""
+
+        agent1 = agent1 or {}
+        combined = agent1.get("age_distribution") or {}
+        by_gender = agent1.get("age_by_gender") or agent1.get("age_gender") or {}
+        label_map = {
+            "1020": "10‒20대",
+            "2029": "20대",
+            "2030": "20‒30대",
+            "3039": "30대",
+            "30": "30대",
+            "3040": "30‒40대",
+            "4049": "40대",
+            "40": "40대",
+            "4050": "40‒50대",
+            "5059": "50대",
+            "50": "50대",
+            "60": "60대",
+            "60+": "60대+",
+            "60_plus": "60대+",
+        }
+
+        keys = sorted({str(k) for k in list(combined.keys()) + list(by_gender.keys())})
+        records = []
+
+        for key in keys:
+            label = label_map.get(key, key)
+            value = None
+            source = None
+            if key in combined:
+                value, _ = to_float_pct(combined.get(key))
+                if value is not None:
+                    source = "combined"
+            if value is None:
+                mapping = by_gender.get(key) or {}
+                f_value = None
+                for alias in ("F", "f", "FME", "female", "여", "여성"):
+                    if alias in mapping:
+                        f_value, _ = to_float_pct(mapping[alias])
+                        break
+                m_value = None
+                for alias in ("M", "m", "MAL", "male", "남", "남성"):
+                    if alias in mapping:
+                        m_value, _ = to_float_pct(mapping[alias])
+                        break
+                if f_value is not None and m_value is not None:
+                    total = f_value + m_value
+                    if 0.0 <= total <= 100.0:
+                        value = round(total, 1)
+                        source = "F+M"
+            if value is not None:
+                records.append(
+                    {
+                        "key": key,
+                        "label": label,
+                        "value": value,
+                        "source": source or "combined",
+                    }
+                )
+
+        records.sort(key=lambda item: item["value"], reverse=True)
+        return records
 
 __all__ = [
     "agent1_pipeline",
@@ -30,18 +125,6 @@ __all__ = [
     "AGENT2_PROMPT_TRACE",
     "AGENT2_RESPONSE_TRACE",
     "llm_json_safe_parse",
-]
-
-__all__ = [
-    "agent1_pipeline",
-    "build_agent2_prompt",
-    "build_agent2_prompt_overhauled",
-    "call_gemini_agent2",
-    "call_gemini_agent2_overhauled",
-    "infer_question_type",
-    "load_actioncard_schema",
-    "load_actioncard_schema_current",
-    "AGENT2_PROMPT_TRACE",
 ]
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -1806,12 +1889,6 @@ def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
 
     return prompt_block, "\n- ".join(reason_lines)
 
-    validator = None
-    if isinstance(validator_bundle, dict):
-        validator = validator_bundle.get(key)
-    else:
-        validator = validator_bundle
-    return schema_obj, validator, key
 
 def build_agent2_prompt_overhauled(
     agent1_json,
@@ -1935,10 +2012,6 @@ def call_gemini_agent2_overhauled(
 
     if kwargs:
         _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841 - reserved for debugging
-
-    if kwargs:
-        # 추가 인자는 무시하지만, 향후 디버깅을 위해 키 목록만 확보합니다.
-        _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841
 
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
