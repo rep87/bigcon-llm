@@ -37,4 +37,5 @@ print(hits["evidence"][:2])
 - Agent-2 now answers the organizer’s three evaluation questions (Q1 채널/홍보, Q2 재방문, Q3 요식업 가설) with 3–4 concise ideas, each carrying audience, 채널, 실행, 카피, 측정지표, and at least one evidence item.
 - Age cohorts strictly follow Agent-1’s allow-list with deterministic combined-vs-gender merge rules; values are guarded to the 0–100% range and missing cohorts are omitted instead of being synthesized.
 - RAG evidence is appended only when the selected documents clear the similarity threshold; otherwise the cards surface structured data alone without “근거 없음” noise in public view.
+- Agent-2 응답은 3단계(JSON strict → 추출 → 자동 수리) 파서와 단일 LLM 재시도로 검증되며, 모두 실패해도 구조화된 폴백 카드가 생성되어 화면이 비지 않습니다.
 - Switch to **Debug** mode to inspect fail-soft notes, RAG score gates, and other diagnostics that remain available for reviewers/operators.

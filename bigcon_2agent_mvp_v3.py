@@ -2,14 +2,35 @@
 # BIGCON 2-Agent MVP (Colab, Gemini API) — v3 (fits actual 3-dataset structure)
 # %pip -q install google-generativeai pandas openpyxl
 
-import os, json, re, random, sys, glob, datetime
+import ast
+import datetime
+import json
+import os
+import random
+import re
 from time import perf_counter
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from jsonschema import Draft7Validator, ValidationError
+from jsonschema import Draft7Validator
+
+from app_core.formatters import merge_age_buckets, to_float_pct
+
+__all__ = [
+    "agent1_pipeline",
+    "build_agent2_prompt",
+    "build_agent2_prompt_overhauled",
+    "call_gemini_agent2",
+    "call_gemini_agent2_overhauled",
+    "infer_question_type",
+    "load_actioncard_schema",
+    "load_actioncard_schema_current",
+    "AGENT2_PROMPT_TRACE",
+    "AGENT2_RESPONSE_TRACE",
+    "llm_json_safe_parse",
+]
 
 __all__ = [
     "agent1_pipeline",
@@ -38,6 +59,7 @@ random.seed(SEED); np.random.seed(SEED)
 _SCHEMA_CACHE = None
 _SCHEMA_VALIDATOR = None
 AGENT2_PROMPT_TRACE: dict = {}
+AGENT2_RESPONSE_TRACE: dict = {}
 
 
 def tick():
@@ -52,6 +74,456 @@ def _env_flag(name: str, default: str) -> str:
     value = os.getenv(name)
     return value if value is not None else default
 
+
+def _strip_code_fences(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines)
+    return stripped.strip()
+
+
+def _json_error_window(text: str, exc: Exception, radius: int = 120) -> str:
+    pos = getattr(exc, "pos", None)
+    if pos is None and isinstance(exc, json.JSONDecodeError):
+        pos = exc.pos
+    if pos is None:
+        return ""
+    start = max(pos - radius, 0)
+    end = min(len(text), pos + radius)
+    return text[start:end]
+
+
+def _extract_json_candidate(text: str) -> tuple[str | None, int | None]:
+    if not text:
+        return None, None
+    cleaned = _strip_code_fences(text)
+    start = cleaned.find("{")
+    while start != -1:
+        depth = 0
+        for idx in range(start, len(cleaned)):
+            ch = cleaned[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    snippet = cleaned[start : idx + 1]
+                    return snippet, start
+        start = cleaned.find("{", start + 1)
+    return None, None
+
+
+def _apply_json_repairs(text: str) -> list[str]:
+    candidates: list[str] = []
+    if not text:
+        return candidates
+    base = text.strip()
+    seen = set()
+
+    def _push(value: str):
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append(value)
+
+    _push(base)
+    repaired = re.sub(r",\s*(\]|\})", r"\1", base)
+    _push(repaired)
+    repaired = re.sub(r"'", '"', repaired)
+    repaired = re.sub(r"\bNaN\b", "null", repaired)
+    repaired = re.sub(r"\bInfinity\b", "null", repaired)
+    repaired = re.sub(r"\b-?inf\b", "null", repaired, flags=re.IGNORECASE)
+    _push(repaired)
+    return candidates
+
+
+def _attempt_literal_eval(text: str):
+    try:
+        value = ast.literal_eval(text)
+    except Exception:
+        return None
+    try:
+        return json.loads(json.dumps(value))
+    except Exception:
+        return None
+
+
+def llm_json_safe_parse(text: str, schema_validator: Draft7Validator | None = None):
+    logs: list[dict] = []
+    if text is None:
+        logs.append({"pass": "strict", "success": False, "error": "empty_response"})
+        return None, logs
+
+    cleaned = text.strip()
+    if not cleaned:
+        logs.append({"pass": "strict", "success": False, "error": "empty_response"})
+        return None, logs
+
+    def _validate(obj):
+        if schema_validator is not None:
+            schema_validator.validate(obj)
+
+    # Strict pass ---------------------------------------------------------
+    try:
+        parsed = json.loads(cleaned)
+        _validate(parsed)
+        logs.append({"pass": "strict", "success": True})
+        return parsed, logs
+    except Exception as exc:
+        entry = {"pass": "strict", "success": False, "error": str(exc)}
+        if isinstance(exc, json.JSONDecodeError):
+            entry.update({"line": exc.lineno, "col": exc.colno, "excerpt": _json_error_window(cleaned, exc)})
+        logs.append(entry)
+
+    # Extract pass --------------------------------------------------------
+    snippet, offset = _extract_json_candidate(cleaned)
+    if snippet:
+        try:
+            parsed = json.loads(snippet)
+            _validate(parsed)
+            logs.append({"pass": "extract", "success": True, "offset": offset})
+            return parsed, logs
+        except Exception as exc:
+            entry = {"pass": "extract", "success": False, "error": str(exc), "offset": offset}
+            if isinstance(exc, json.JSONDecodeError):
+                entry.update({"line": exc.lineno, "col": exc.colno, "excerpt": _json_error_window(snippet, exc)})
+            logs.append(entry)
+    else:
+        logs.append({"pass": "extract", "success": False, "error": "candidate_not_found"})
+
+    candidate = snippet or cleaned
+
+    # Repair pass ---------------------------------------------------------
+    for idx, variant in enumerate(_apply_json_repairs(candidate)):
+        try:
+            parsed = json.loads(variant)
+            _validate(parsed)
+            logs.append({"pass": "repair", "success": True, "variant": idx})
+            return parsed, logs
+        except Exception as exc:
+            entry = {"pass": "repair", "success": False, "variant": idx, "error": str(exc)}
+            if isinstance(exc, json.JSONDecodeError):
+                entry.update({"line": exc.lineno, "col": exc.colno, "excerpt": _json_error_window(variant, exc)})
+            logs.append(entry)
+
+    literal_candidate = _attempt_literal_eval(candidate)
+    if literal_candidate is not None:
+        try:
+            _validate(literal_candidate)
+            logs.append({"pass": "literal_eval", "success": True})
+            return literal_candidate, logs
+        except Exception as exc:
+            logs.append({"pass": "literal_eval", "success": False, "error": str(exc)})
+
+    return None, logs
+
+
+def _coerce_to_answers(payload: dict | None) -> dict | None:
+    """Ensure Agent-2 payload exposes an ``answers`` array for downstream logic."""
+
+    if not isinstance(payload, dict):
+        return payload
+
+    if "answers" in payload or "recommendations" not in payload:
+        return payload
+
+    coerced = dict(payload)
+    coerced["answers"] = payload.get("recommendations")
+    return coerced
+
+
+def _structured_value(agent1_json: dict | None, key: str) -> tuple[float | None, str | None]:
+    agent1_json = agent1_json or {}
+    debug = agent1_json.get("debug") or {}
+    snapshot = debug.get("snapshot") or {}
+    sanitized = snapshot.get("sanitized") or {}
+    kpis = agent1_json.get("kpis") or {}
+    raw_value = sanitized.get(key, kpis.get(key))
+    value, _ = to_float_pct(raw_value)
+    return value, sanitized.get("latest_ta_ym") or debug.get("panel", {}).get("latest_ta_ym")
+
+
+def _structured_evidence_entry(
+    key: str,
+    value: float | None,
+    *,
+    period: str | None,
+    snippet: str | None = None,
+) -> dict:
+    if value is None:
+        return {
+            "source": "STRUCTURED",
+            "key": key or "근거 없음",
+            "value": "—",
+            "period": period or "—",
+            "snippet": snippet or "근거 없음",
+            "doc_id": None,
+            "chunk_id": None,
+            "score": None,
+        }
+    display_value = f"{value:.1f}%" if isinstance(value, (int, float)) else value
+    return {
+        "source": "STRUCTURED",
+        "key": key,
+        "value": display_value,
+        "period": period or "recent_8m",
+        "snippet": snippet or display_value,
+        "doc_id": None,
+        "chunk_id": None,
+        "score": None,
+    }
+
+
+def _structured_fallback_cards(agent1_json: dict | None, question_type: str | None) -> dict:
+    question_type = question_type or "GENERIC"
+    age_records = merge_age_buckets(agent1_json or {})
+    top_age = age_records[0] if age_records else None
+    top_age_label = top_age.get("label") if top_age else "핵심 고객층"
+    top_age_value = top_age.get("value") if top_age else None
+    top_age_key = top_age.get("key") if top_age else "age_distribution"
+
+    flow_pct, period_hint = _structured_value(agent1_json, "flow_pct")
+    resident_pct, _ = _structured_value(agent1_json, "resident_pct")
+    work_pct, _ = _structured_value(agent1_json, "work_pct")
+    new_pct, _ = _structured_value(agent1_json, "new_pct")
+    revisit_pct, _ = _structured_value(agent1_json, "revisit_pct")
+
+    if period_hint is None:
+        panel = ((agent1_json or {}).get("debug") or {}).get("panel") or {}
+        period_hint = panel.get("latest_ta_ym") or "recent_8m"
+
+    def _make_card(
+        idea_title: str,
+        audience: str,
+        channels: list[str],
+        execution: list[str],
+        copy_samples: list[str],
+        measurement: list[str],
+        evidence_specs: list[dict],
+    ) -> dict:
+        evidence = [item for item in evidence_specs if item]
+        if not evidence:
+            evidence = [
+                _structured_evidence_entry(
+                    "근거 없음",
+                    None,
+                    period=period_hint,
+                    snippet="근거 없음",
+                )
+            ]
+        return {
+            "idea_title": idea_title,
+            "audience": audience,
+            "channels": channels,
+            "execution": execution,
+            "copy_samples": copy_samples,
+            "measurement": measurement,
+            "evidence": evidence,
+        }
+
+    age_evidence = _structured_evidence_entry(
+        f"age_distribution.{top_age_key}",
+        top_age_value,
+        period=period_hint,
+        snippet=f"{top_age_label} {top_age_value:.1f}%" if isinstance(top_age_value, (int, float)) else None,
+    ) if top_age_value is not None else None
+    flow_evidence = _structured_evidence_entry(
+        "customer_mix_detail.유동",
+        flow_pct,
+        period=period_hint,
+        snippet=f"유동 {flow_pct:.1f}%" if isinstance(flow_pct, (int, float)) else None,
+    ) if flow_pct is not None else None
+    resident_evidence = _structured_evidence_entry(
+        "customer_mix_detail.거주",
+        resident_pct,
+        period=period_hint,
+        snippet=f"거주 {resident_pct:.1f}%" if isinstance(resident_pct, (int, float)) else None,
+    ) if resident_pct is not None else None
+    work_evidence = _structured_evidence_entry(
+        "customer_mix_detail.직장",
+        work_pct,
+        period=period_hint,
+        snippet=f"직장 {work_pct:.1f}%" if isinstance(work_pct, (int, float)) else None,
+    ) if work_pct is not None else None
+    new_evidence = _structured_evidence_entry(
+        "new_pct",
+        new_pct,
+        period=period_hint,
+        snippet=f"신규 {new_pct:.1f}%" if isinstance(new_pct, (int, float)) else None,
+    ) if new_pct is not None else None
+    revisit_evidence = _structured_evidence_entry(
+        "revisit_pct",
+        revisit_pct,
+        period=period_hint,
+        snippet=f"재방문 {revisit_pct:.1f}%" if isinstance(revisit_pct, (int, float)) else None,
+    ) if revisit_pct is not None else None
+
+    cards: list[dict] = []
+
+    if question_type == "Q2_LOW_RETENTION":
+        cards.append(
+            _make_card(
+                "단골 회수 메시지 캠페인",
+                top_age_label,
+                ["카카오톡 채널", "SMS"],
+                [
+                    "재방문 고객에게 이탈 기간별 리마인드 메시지를 발송합니다.",
+                    "멤버십 쿠폰을 재발급해 재방문 유인을 만듭니다.",
+                ],
+                [
+                    f"다시 찾아주시면 {top_age_label} 전용 혜택을 준비했어요!",
+                    "이번 주 안에 방문 시 추가 리필을 드립니다.",
+                ],
+                ["재방문 고객 수", "쿠폰 재사용률"],
+                [revisit_evidence or new_evidence, age_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "스탬프 적립 프로모션",
+                "재방문 유도 고객",
+                ["현장 POP", "멤버십 앱"],
+                [
+                    "현장 스탬프판을 비치하고 3회 방문 시 무료 메뉴를 제공합니다.",
+                    "앱에서 실시간 적립 현황을 보여줍니다.",
+                ],
+                [
+                    "스탬프 3개 모으면 아메리카노 무료!",
+                    "이번 주 멤버십 적립률 TOP 고객 공지",
+                ],
+                ["스탬프 적립률", "혜택 교환 건수"],
+                [new_evidence, revisit_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "현장 체류 경험 강화",
+                "점심/퇴근 고객",
+                ["오프라인 이벤트", "지역 커뮤니티"],
+                [
+                    "점심시간 한정 시식/시연 이벤트를 기획합니다.",
+                    "지역 커뮤니티에 리뷰 인증 시 혜택을 제공합니다.",
+                ],
+                [
+                    "점심 인증샷 업로드 시 디저트 증정",
+                    "퇴근길에 들르면 마감 할인 제공",
+                ],
+                ["이벤트 참여자 수", "리뷰 증가량"],
+                [flow_evidence, resident_evidence or work_evidence],
+            )
+        )
+    elif question_type == "Q3_FOOD_ISSUE":
+        cards.append(
+            _make_card(
+                "시그니처 메뉴 집중 홍보",
+                top_age_label,
+                ["SNS", "지도 리뷰"],
+                [
+                    "대표 메뉴 조리 과정을 짧은 영상으로 제작합니다.",
+                    "지도 리뷰에 맛/위생 키워드 응답을 상시 관리합니다.",
+                ],
+                [
+                    f"{top_age_label} 손님이 좋아한 시그니처 레시피 공개",
+                    "오늘 만든 신선한 원두/재료 강조",
+                ],
+                ["영상 조회수", "긍정 리뷰 비중"],
+                [age_evidence, flow_evidence or resident_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "피크타임 회전율 개선",
+                "점심 피크 고객",
+                ["현장 안내", "테이블 오더"],
+                [
+                    "피크 시간 사전 주문/픽업 라인을 운영합니다.",
+                    "혼잡도를 현장 안내판으로 공지합니다.",
+                ],
+                [
+                    "점심 전 미리 주문하면 대기 없이 픽업!",
+                    "테이블에서 QR 주문하고 바로 받아가세요",
+                ],
+                ["테이블 회전 시간", "픽업 사전 주문 비중"],
+                [work_evidence, flow_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "리뷰 기반 품질 보완",
+                "재방문 잠재 고객",
+                ["리뷰 DM", "멤버십"],
+                [
+                    "리뷰에서 제기된 맛/서비스 이슈를 정리하고 개선 공지를 보냅니다.",
+                    "개선 후 재방문 고객에게 보상 쿠폰을 제공합니다.",
+                ],
+                [
+                    "리뷰 남겨주신 의견을 반영해 레시피를 새로 손봤습니다.",
+                    "재방문 시 무료 토핑을 드립니다.",
+                ],
+                ["리뷰 응답률", "재방문 고객 수"],
+                [revisit_evidence or new_evidence, resident_evidence],
+            )
+        )
+    else:  # Q1_CAFE_CHANNELS or generic
+        cards.append(
+            _make_card(
+                "핵심 연령대 SNS 집중 광고",
+                top_age_label,
+                ["인스타그램", "네이버 플레이스"],
+                [
+                    "연령대 관심사에 맞춘 숏폼 콘텐츠를 주 3회 게시합니다.",
+                    "플레이스 리뷰 상단에 시즌 한정 메뉴를 노출합니다.",
+                ],
+                [
+                    f"#{top_age_label} 취향 저격 신메뉴 공개",
+                    "방문 인증 시 음료 1+1",
+                ],
+                ["SNS 참여율", "플레이스 클릭수"],
+                [age_evidence, flow_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "오피스 타겟 쿠폰 제휴",
+                "직장인 고객",
+                ["회사 제휴", "배달앱 광고"],
+                [
+                    "근처 오피스와 제휴해 점심 시간 할인 쿠폰을 제공합니다.",
+                    "배달앱 홈 배너에 오피스 타겟 전용 메뉴를 노출합니다.",
+                ],
+                [
+                    "점심 11-14시 전용 2,000원 할인 쿠폰",
+                    "회사 이메일 인증 시 추가 적립",
+                ],
+                ["쿠폰 사용률", "점심 매출"],
+                [work_evidence, resident_evidence or flow_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "단골 확보 멤버십 메시지",
+                "재방문 잠재 고객",
+                ["멤버십 앱", "카카오톡 채널"],
+                [
+                    "재방문율이 낮은 고객에게 주말 한정 혜택을 보냅니다.",
+                    "멤버십 포인트로 시즌 굿즈 교환 이벤트를 알립니다.",
+                ],
+                [
+                    "이번 주말 재방문 시 포인트 2배 적립",
+                    "굿즈 한정 수량 예약 링크",
+                ],
+                ["재방문 고객 수", "멤버십 활성화율"],
+                [revisit_evidence, new_evidence],
+            )
+        )
+
+    return {"answers": cards[:4]}
 
 USE_LLM = _env_flag("AGENT1_USE_LLM", "true").lower() not in {"0", "false", "no"}
 DEBUG_MAX_PREVIEW = int(_env_flag("DEBUG_MAX_PREVIEW", "200") or 200)
@@ -1233,6 +1705,7 @@ ORGANIZER_QUESTION_TYPES = {
     "Q1_CAFE_CHANNELS",
     "Q2_LOW_RETENTION",
     "Q3_FOOD_ISSUE",
+    "GENERIC",
 }
 
 
@@ -1333,6 +1806,12 @@ def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
 
     return prompt_block, "\n- ".join(reason_lines)
 
+    validator = None
+    if isinstance(validator_bundle, dict):
+        validator = validator_bundle.get(key)
+    else:
+        validator = validator_bundle
+    return schema_obj, validator, key
 
 def build_agent2_prompt_overhauled(
     agent1_json,
@@ -1411,6 +1890,9 @@ def build_agent2_prompt_overhauled(
     elif rag_reason:
         sections.append(f"[RAG 참고 메모]\n- {rag_reason}")
 
+    sections.append("[응답 형식]")
+    sections.append("JSON만 출력하세요. 마크다운/설명/코드블럭 금지. 문자열 내 줄바꿈은 \\n으로 표기하세요.")
+
     guide = "\n\n".join(sections)
     schema_keys = []
     if isinstance(schema_obj, dict) and isinstance(schema_obj.get("properties"), dict):
@@ -1440,20 +1922,19 @@ def build_agent2_prompt_overhauled(
 
 def call_gemini_agent2_overhauled(
     prompt_text,
-    model_name='models/gemini-2.5-flash',
+    model_name: str = 'models/gemini-2.5-flash',
+    *,
     question_type: str | None = None,
+    agent1_json: dict | None = None,
     **kwargs,
 ):
-    """
-    Gemini 2.5 Flash 전용 호출:
-    - google-generativeai==0.8.3 기준
-    - 2.5 flash 가용성 자동 확인(list_models) 후 2.5 flash 계열만 시도
-    - response_mime_type 강제 해제(빈 응답 회피), 텍스트→JSON 추출
-    - 세이프티/빈응답/가용성 이슈 시 폴백 카드 반환 (앱은 계속 동작)
-    - 디버그 로그: outputs/gemini_debug.json
-    """
+    """Call Gemini for Agent-2 with robust JSON parsing and fallback cards."""
+
     import google.generativeai as genai
-    import re, json, datetime
+    import datetime
+
+    if kwargs:
+        _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841 - reserved for debugging
 
     if kwargs:
         # 추가 인자는 무시하지만, 향후 디버깅을 위해 키 목록만 확보합니다.
@@ -1464,13 +1945,13 @@ def call_gemini_agent2_overhauled(
         raise RuntimeError('GEMINI_API_KEY가 설정되지 않았습니다.')
     genai.configure(api_key=api_key)
 
-    candidates = []
+    candidates: list[str] = []
     try:
-        avail = []
-        for m in genai.list_models():
-            if "generateContent" in getattr(m, "supported_generation_methods", []):
-                avail.append(m.name)
-        for name in avail:
+        available = []
+        for model in genai.list_models():
+            if "generateContent" in getattr(model, "supported_generation_methods", []):
+                available.append(model.name)
+        for name in available:
             tail = name.split('/')[-1]
             if '2.5' in tail and 'flash' in tail:
                 candidates.append(name)
@@ -1498,12 +1979,40 @@ def call_gemini_agent2_overhauled(
     ]
     generation_config = {
         "temperature": 0.2,
-        "top_p": 0.9,
+        "top_p": 0.1,
         "top_k": 32,
-        "max_output_tokens": 900,
+        "max_output_tokens": 2048,
     }
 
-    def _extract_text(resp):
+    prompt_payload = (prompt_text or "").rstrip()
+    if "JSON만 출력하세요" not in prompt_payload:
+        prompt_payload = (
+            prompt_payload
+            + "\n\nJSON만 출력하세요. 마크다운/설명/코드블럭 금지. 문자열 내 줄바꿈은 \\n으로 표기하세요."
+        )
+
+    try:
+        _, schema_validator, schema_key = _resolve_schema_for_question(question_type)
+        schema_error = None
+    except Exception as exc:
+        schema_validator = None
+        schema_key = "unknown"
+        schema_error = str(exc)
+
+    global AGENT2_RESPONSE_TRACE
+    AGENT2_RESPONSE_TRACE = {
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "question_type": question_type,
+        "requested_model": model_name,
+        "model_candidates": list(dict.fromkeys(candidates)),
+        "generation_config": dict(generation_config),
+        "schema_key": schema_key,
+        "schema_error": schema_error,
+        "prompt_length": len(prompt_payload),
+        "attempts": [],
+    }
+
+    def _extract_text(resp) -> str:
         text_value = ''
         try:
             payload = getattr(resp, 'text', None)
@@ -1537,122 +2046,159 @@ def call_gemini_agent2_overhauled(
             pass
         return info
 
-    def _run_once(name: str):
+    def _run_once(name: str, prompt_body: str):
         model = genai.GenerativeModel(
             model_name=name,
             generation_config=generation_config,
             safety_settings=safety_settings,
         )
-        resp = model.generate_content(prompt_text)
-        text_value = _extract_text(resp)
-        info = _blocked_info(resp)
+        response = model.generate_content(
+            prompt_body,
+            response_mime_type="application/json",
+        )
+        text_value = _extract_text(response)
+        info = _blocked_info(response)
         return text_value, info, name
 
-    try:
-        _, schema_validator, schema_key = _resolve_schema_for_question(question_type)
-        schema_error = None
-    except Exception as exc:
-        schema_validator = None
-        schema_error = str(exc)
-        schema_key = None
+    def _repair_with_llm(name: str, failing_text: str):
+        snippet = _strip_code_fences(failing_text or "").strip()
+        if len(snippet) > 4000:
+            snippet = snippet[:4000]
+        repair_prompt = (
+            "아래 JSON을 스키마에 맞게 고쳐 JSON만 반환하세요. 고칠 수 없으면 {\"answers\": []}를 반환하세요."
+            "\n\n=== JSON 후보 ===\n" + snippet
+        )
+        repair_config = dict(generation_config)
+        repair_config.update({"temperature": 0.1, "top_p": 0.05, "max_output_tokens": 1024})
+        try:
+            model = genai.GenerativeModel(
+                model_name=name,
+                generation_config=repair_config,
+                safety_settings=safety_settings,
+            )
+            response = model.generate_content(
+                repair_prompt,
+                response_mime_type="application/json",
+            )
+            repaired_text = _extract_text(response)
+            info = _blocked_info(response)
+            return repaired_text, {"meta": info}
+        except Exception as exc:  # pragma: no cover - network guard
+            return None, {"error": str(exc)}
 
-    all_attempt_logs = []
-    last_error = schema_error
+    chosen_payload = None
+    chosen_model = None
+    last_error = schema_error or "unknown"
 
     for attempt in range(2):
-        attempt_logs = []
-        for mname in candidates:
-            try:
-                text_value, info, used = _run_once(mname)
-                log_entry = {"model": used, "has_text": bool(text_value), "meta": info}
-                if not text_value:
-                    log_entry['error'] = 'empty_text'
-                    attempt_logs.append(log_entry)
-                    last_error = 'LLM 응답이 비어 있습니다.'
-                    continue
-
-                core = None
-                match = re.search(r"\{[\s\S]*\}", text_value)
-                if match:
-                    try:
-                        core = json.loads(match.group(0))
-                    except Exception as exc:
-                        log_entry['error'] = f"json_parse_error: {exc}"
-                        attempt_logs.append(log_entry)
-                        last_error = f"JSON 파싱 실패: {exc}"
-                        continue
-                else:
-                    log_entry['error'] = 'json_not_found'
-                    attempt_logs.append(log_entry)
-                    last_error = '응답에서 JSON 블록을 찾지 못했습니다.'
-                    continue
-
-                if not isinstance(core, dict):
-                    log_entry['error'] = 'json_not_object'
-                    attempt_logs.append(log_entry)
-                    last_error = '추출된 JSON이 객체 형식이 아닙니다.'
-                    continue
-
-                validation_ok = True
-                if schema_validator is not None:
-                    try:
-                        schema_validator.validate(core)
-                    except ValidationError as exc:
-                        validation_ok = False
-                        log_entry['validation_error'] = exc.message
-                        last_error = f"스키마 검증 실패: {exc.message}"
-
-                if validation_ok:
-                    attempt_logs.append(log_entry)
-                    all_attempt_logs.append({"attempt": attempt + 1, "logs": attempt_logs})
-                    try:
-                        debug = {
-                            'ts': datetime.datetime.utcnow().isoformat(),
-                            'chosen_model': used,
-                            'attempts': all_attempt_logs,
-                            'schema_key': schema_key,
-                        }
-                        (OUTPUT_DIR / 'gemini_debug.json').write_text(
-                            json.dumps(debug, ensure_ascii=False, indent=2),
-                            encoding='utf-8',
-                        )
-                    except Exception:
-                        pass
-                    (OUTPUT_DIR / 'agent2_result.json').write_text(
-                        json.dumps(core, ensure_ascii=False, indent=2),
-                        encoding='utf-8',
-                    )
-                    return core
-                attempt_logs.append(log_entry)
-            except Exception as exc:
-                attempt_logs.append({"model": mname, "error": str(exc)})
-                last_error = str(exc)
-        all_attempt_logs.append({"attempt": attempt + 1, "logs": attempt_logs})
-
-    fallback = {
-        "answers": [
-            {
-                "idea_title": "카드 생성 실패",
-                "audience": "—",
-                "channels": ["—"],
-                "execution": ["LLM 카드 생성이 실패하여 기본 안내만 제공합니다."],
-                "copy_samples": ["—"],
-                "measurement": ["—"],
-                "evidence": [
-                    {
-                        "source": "NONE",
-                        "key": "error_detail",
-                        "value": last_error,
-                        "period": None,
-                        "snippet": None,
-                        "doc_id": None,
-                        "chunk_id": None,
-                        "score": None,
-                    }
-                ],
+        for model_candidate in candidates:
+            attempt_record = {
+                "attempt": attempt + 1,
+                "model": model_candidate,
             }
-        ]
-    }
+            try:
+                text_value, info, used_model = _run_once(model_candidate, prompt_payload)
+            except Exception as exc:  # pragma: no cover - network guard
+                attempt_record["error"] = str(exc)
+                last_error = str(exc)
+                AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+                continue
+
+            attempt_record["raw_preview"] = (text_value or "")[:600]
+            attempt_record["raw_length"] = len(text_value or "")
+            attempt_record["meta"] = info
+
+            parsed, parse_logs = llm_json_safe_parse(text_value, None)
+            attempt_record["parse_logs"] = parse_logs
+
+            validation_error: str | None = None
+            if parsed is not None:
+                coerced = _coerce_to_answers(parsed)
+                attempt_record["coerced_to_answers"] = bool(coerced is not parsed)
+                try:
+                    if schema_validator is not None and coerced is not None:
+                        schema_validator.validate(coerced)
+                except Exception as exc:
+                    validation_error = str(exc)
+                    attempt_record["validation_error"] = validation_error
+                else:
+                    attempt_record["status"] = "parsed"
+                    chosen_payload = coerced
+                    chosen_model = used_model
+                    AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+                    break
+
+            if validation_error:
+                last_error = validation_error
+            elif parse_logs:
+                last_error = parse_logs[-1].get("error") or last_error
+
+            attempt_record["status"] = attempt_record.get("status") or (
+                "validation_failed" if validation_error else "parse_failed"
+            )
+
+            repaired_text, repair_meta = _repair_with_llm(model_candidate, text_value)
+            attempt_record["repair_preview"] = (repaired_text or "")[:600]
+            attempt_record["repair_meta"] = repair_meta
+            if repaired_text:
+                repaired, repair_logs = llm_json_safe_parse(repaired_text, None)
+                attempt_record["repair_logs"] = repair_logs
+                if repaired is not None:
+                    coerced_repair = _coerce_to_answers(repaired)
+                    attempt_record["repair_coerced_to_answers"] = bool(
+                        coerced_repair is not repaired
+                    )
+                    try:
+                        if schema_validator is not None and coerced_repair is not None:
+                            schema_validator.validate(coerced_repair)
+                    except Exception as exc:
+                        attempt_record["repair_validation_error"] = str(exc)
+                        last_error = str(exc)
+                    else:
+                        attempt_record["status"] = "repaired"
+                        chosen_payload = coerced_repair
+                        chosen_model = model_candidate
+                        AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+                        break
+                if repair_logs:
+                    last_error = repair_logs[-1].get("error") or last_error
+
+            AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+        if chosen_payload is not None:
+            break
+
+    if chosen_payload is not None:
+        AGENT2_RESPONSE_TRACE.update({"status": "success", "chosen_model": chosen_model})
+        try:
+            debug_payload = {
+                "ts": datetime.datetime.utcnow().isoformat(),
+                "chosen_model": chosen_model,
+                "attempts": AGENT2_RESPONSE_TRACE["attempts"],
+                "schema_key": schema_key,
+            }
+            (OUTPUT_DIR / 'gemini_debug.json').write_text(
+                json.dumps(debug_payload, ensure_ascii=False, indent=2),
+                encoding='utf-8',
+            )
+        except Exception:
+            pass
+        (OUTPUT_DIR / 'agent2_result.json').write_text(
+            json.dumps(chosen_payload, ensure_ascii=False, indent=2),
+            encoding='utf-8',
+        )
+        return chosen_payload
+
+    AGENT2_RESPONSE_TRACE.update({
+        "status": "fallback",
+        "last_error": last_error,
+    })
+    fallback = _structured_fallback_cards(agent1_json, question_type)
+    AGENT2_RESPONSE_TRACE["fallback_answers"] = len(fallback.get("answers", []))
+    try:
+        if schema_validator is not None:
+            schema_validator.validate(fallback)
+    except Exception:
+        pass
     (OUTPUT_DIR / 'agent2_result.json').write_text(
         json.dumps(fallback, ensure_ascii=False, indent=2),
         encoding='utf-8',
@@ -1701,7 +2247,12 @@ def main():
         prompt_text = build_agent2_prompt_overhauled(a1, question_text=q)
         print('\n==== Gemini Prompt Preview (앞부분) ====')
         print(prompt_text[:800] + ('\n... (생략)' if len(prompt_text)>800 else ''))
-        a2 = call_gemini_agent2_overhauled(prompt_text, model_name=args.model)
+        a2 = call_gemini_agent2_overhauled(
+            prompt_text,
+            model_name=args.model,
+            agent1_json=a1,
+            question_type=infer_question_type(q),
+        )
         print('\n==== Agent-2 결과 (앞부분) ====')
         print(json.dumps(a2, ensure_ascii=False, indent=2)[:800] + '\n...')
     except FileNotFoundError as e:
