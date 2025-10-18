@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import compileall
 import json
-
 from pathlib import Path
 import sys
 
@@ -86,6 +86,7 @@ def check_prompt_with_rag_block() -> None:
 def main() -> None:
     check_age_merge()
     check_prompt_with_rag_block()
+    compileall.compile_dir(str(PROJECT_ROOT), quiet=1)
 
 
 if __name__ == "__main__":

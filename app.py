@@ -34,15 +34,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency path
     RetrievalTool = None
 
-    for chunk in chunks:
-        if str(chunk.get("doc_id")) != str(doc_id):
-            continue
-        current_chunk_id = chunk.get("chunk_id")
-        if chunk_id_str is not None and str(current_chunk_id) != chunk_id_str:
-            continue
-        target_chunk = chunk
-        break
-
     if target_chunk is None:
         for chunk in chunks:
             if str(chunk.get("doc_id")) == str(doc_id):
