@@ -32,6 +32,18 @@ __all__ = [
     "llm_json_safe_parse",
 ]
 
+__all__ = [
+    "agent1_pipeline",
+    "build_agent2_prompt",
+    "build_agent2_prompt_overhauled",
+    "call_gemini_agent2",
+    "call_gemini_agent2_overhauled",
+    "infer_question_type",
+    "load_actioncard_schema",
+    "load_actioncard_schema_current",
+    "AGENT2_PROMPT_TRACE",
+]
+
 APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / 'data'
 SHINHAN_DIR = DATA_DIR / 'shinhan'
@@ -1794,6 +1806,12 @@ def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
 
     return prompt_block, "\n- ".join(reason_lines)
 
+    validator = None
+    if isinstance(validator_bundle, dict):
+        validator = validator_bundle.get(key)
+    else:
+        validator = validator_bundle
+    return schema_obj, validator, key
 
 def build_agent2_prompt_overhauled(
     agent1_json,
@@ -1917,6 +1935,10 @@ def call_gemini_agent2_overhauled(
 
     if kwargs:
         _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841 - reserved for debugging
+
+    if kwargs:
+        # 추가 인자는 무시하지만, 향후 디버깅을 위해 키 목록만 확보합니다.
+        _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841
 
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
