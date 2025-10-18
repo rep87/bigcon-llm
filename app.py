@@ -5,6 +5,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from app_core.config import get_flag
 from app_core.failsoft import (
     compose_fail_soft_answer,
     external_adapter,
@@ -26,6 +27,88 @@ try:
     from rag import RetrievalTool
 except Exception:  # pragma: no cover - optional dependency path
     RetrievalTool = None
+
+
+DEFAULT_RAG_ROOT = "data/rag"
+RAG_ROOT = _secret_value("RAG_ROOT") or os.getenv("RAG_ROOT") or DEFAULT_RAG_ROOT
+RAG_EMBED_VERSION = os.getenv("RAG_EMBED_VERSION", "embed_v1")
+_DEFAULT_APP_MODE = (_secret_value("APP_MODE") or os.getenv("APP_MODE") or "public").lower()
+if _DEFAULT_APP_MODE not in {"public", "debug"}:
+    _DEFAULT_APP_MODE = "public"
+if "_app_mode" not in st.session_state:
+    st.session_state["_app_mode"] = _DEFAULT_APP_MODE
+APP_MODE = st.session_state.get("_app_mode", "public")
+
+if APP_MODE == "debug":
+    show_debug = st.checkbox(
+        "🔍 디버그 보기",
+        value=st.session_state.get("show_debug_checkbox", True),
+        key="show_debug_checkbox",
+    )
+else:
+    show_debug = False
+RAG_ROOT_PATH = Path(RAG_ROOT).expanduser()
+RETRIEVAL_INIT_ERROR: str | None = None
+RETRIEVAL_TOOL: object | None = None
+RAG_CATALOG: list[Dict[str, Any]] = []
+RAG_CATALOG_ERROR: str | None = None
+
+if RetrievalTool is not None:
+    try:
+        RETRIEVAL_TOOL = RetrievalTool(root=RAG_ROOT, embed_version=RAG_EMBED_VERSION)
+    except Exception as exc:  # pragma: no cover - defensive guard for UI
+        RETRIEVAL_INIT_ERROR = str(exc)
+else:  # pragma: no cover - module missing
+    RETRIEVAL_INIT_ERROR = "rag.RetrievalTool 모듈을 불러오지 못했습니다."
+
+if RETRIEVAL_TOOL is not None and RETRIEVAL_INIT_ERROR is None:
+    if not RAG_ROOT_PATH.exists():
+        RAG_CATALOG_ERROR = f"RAG_ROOT 경로({RAG_ROOT_PATH})가 존재하지 않습니다."
+    else:
+        try:
+            catalog_entries = RETRIEVAL_TOOL.load_catalog()
+            for entry in catalog_entries:
+                origin_path = entry.origin_path
+                origin_uri = origin_path
+                if origin_path:
+                    path_obj = Path(origin_path)
+                    if not path_obj.is_absolute():
+                        origin_uri = (RAG_ROOT_PATH / path_obj).as_posix()
+                    else:
+                        origin_uri = path_obj.as_posix()
+                RAG_CATALOG.append(
+                    {
+                        "document_id": entry.doc_id,
+                        "title": entry.title,
+                        "num_chunks": entry.num_chunks,
+                        "embedding_model": entry.embedding_model,
+                        "created_at": entry.created_at,
+                        "origin_path": origin_uri,
+                        "tags": list(entry.tags or []),
+                        "year": entry.year,
+                    }
+                )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            RAG_CATALOG_ERROR = str(exc)
+
+
+def _get_debug_section(agent1_json: dict | None) -> dict:
+    debug = (agent1_json or {}).get("debug")
+    return debug if isinstance(debug, dict) else {}
+
+
+if "_data_flags" not in st.session_state:
+    st.session_state["_data_flags"] = {
+        "use_weather": False,
+        "use_external": False,
+        "use_rag": True,
+        "rag_threshold": 0.35,
+        "rag_top_k": 5,
+        "rag_mode": "auto",
+        "rag_filter": "",
+        "rag_selected_ids": [],
+    }
+
 
 def _get_debug_snapshot(agent1_json: dict | None) -> dict:
     debug = _get_debug_section(agent1_json)
@@ -778,12 +861,8 @@ def _render_evidence_badge(
                 st.markdown(line)
 
 
-def _env_flag(name: str, default: str) -> str:
-    value = os.getenv(name)
-    return value if value is not None else default
-
-
-DEBUG_SHOW_RAW = _env_flag("DEBUG_SHOW_RAW", "true").lower() in {"1", "true", "yes"}
+DEFAULT_DEBUG_SHOW_RAW = get_flag("DEBUG_SHOW_RAW", True)
+DEBUG_SHOW_RAW = DEFAULT_DEBUG_SHOW_RAW
 
 
 def _secret_value(name: str, default: str | None = None) -> str | None:
@@ -802,6 +881,11 @@ if _DEFAULT_APP_MODE not in {"public", "debug"}:
 if "_app_mode" not in st.session_state:
     st.session_state["_app_mode"] = _DEFAULT_APP_MODE
 APP_MODE = st.session_state.get("_app_mode", "public")
+
+DEFAULT_QUESTION = "{페로**********} 카페의 주요 방문 고객 특성에 따른 마케팅 채널 추천 및 홍보안을 작성"
+if "seeded_default_question" not in st.session_state:
+    st.session_state["user_query_text"] = DEFAULT_QUESTION
+    st.session_state["seeded_default_question"] = True
 
 if APP_MODE == "debug":
     show_debug = st.checkbox(
@@ -1297,7 +1381,9 @@ def _render_main_views(
         st.error("요약 뷰를 렌더링하는 중 오류가 발생했습니다.")
         st.code(traceback.format_exc())
 
-def render_debug_view(agent1_json: dict | None, show_raw: bool = DEBUG_SHOW_RAW) -> None:
+def render_debug_view(agent1_json: dict | None, show_raw: bool | None = None) -> None:
+    if show_raw is None:
+        show_raw = DEBUG_SHOW_RAW
     debug = _get_debug_section(agent1_json)
     if not debug:
         st.info("디버그 정보가 없습니다.")
@@ -2147,8 +2233,13 @@ st.session_state["_data_flags"] = data_flags
 analysis_tab, sources_tab = st.tabs(["📈 분석", "📚 Embedded Sources"])
 
 with analysis_tab:
-    default_q = "성동구 {고향***} 기준으로, 재방문율 4주 플랜 작성해줘."
-    question = st.text_input("질문을 입력하세요", value=default_q)
+    question = st.text_area(
+        "질문을 입력하세요",
+        key="user_query_text",
+        value=st.session_state.get("user_query_text", DEFAULT_QUESTION),
+        placeholder=DEFAULT_QUESTION,
+        height=120,
+    )
     st.caption("상호는 반드시 {}로 감싸 주세요. 예) 성동구 {동대******}")
 
     run_analysis = st.button("분석 실행", type="primary")

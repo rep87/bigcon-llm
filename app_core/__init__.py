@@ -1,8 +1,9 @@
 """Core application helpers (fail-soft adapters, formatters, etc.)."""
 
-from . import failsoft, formatters
+from . import config, failsoft, formatters
 
 __all__ = [
+    "config",
     "failsoft",
     "formatters",
 ]
