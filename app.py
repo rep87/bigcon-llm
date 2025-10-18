@@ -28,86 +28,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency path
     RetrievalTool = None
 
-    response_trace = response_trace or {}
-    lines.append("\n**Agent-2 Response Trace**")
-    if not response_trace:
-        lines.append("- response trace unavailable")
-    else:
-        status = response_trace.get("status")
-        lines.append(f"- status: {status}")
-        if response_trace.get("generation_config"):
-            lines.append(f"- generation_config: {response_trace.get('generation_config')}")
-        if response_trace.get("prompt_length") is not None:
-            lines.append(f"- prompt_length: {response_trace.get('prompt_length')}")
-        if response_trace.get("chosen_model"):
-            lines.append(f"- chosen_model: {response_trace.get('chosen_model')}")
-        if response_trace.get("last_error"):
-            lines.append(f"- last_error: {response_trace.get('last_error')}")
-        if response_trace.get("fallback_answers") is not None:
-            lines.append(f"- fallback_answers: {response_trace.get('fallback_answers')}")
-        attempts = response_trace.get("attempts") or []
-        if attempts:
-            lines.append("- attempts:")
-            for attempt in attempts:
-                label = f"attempt {attempt.get('attempt')} / {attempt.get('model')}"
-                lines.append(f"    - {label}: {attempt.get('status')}")
-                parse_logs = attempt.get("parse_logs") or []
-                excerpt = ""
-                for entry in parse_logs:
-                    if not entry.get("success") and entry.get("excerpt"):
-                        excerpt = entry["excerpt"].replace('\n', ' ')[:160]
-                        break
-                if excerpt:
-                    lines.append(f"        · excerpt: {excerpt}")
-                if attempt.get("raw_preview"):
-                    preview = attempt.get("raw_preview").replace('\n', ' ')
-                    lines.append(f"        · raw_preview: {preview[:160]}")
-                if attempt.get("repair_logs"):
-                    rep_logs = attempt["repair_logs"]
-                    for entry in rep_logs:
-                        if not entry.get("success") and entry.get("excerpt"):
-                            snippet = entry["excerpt"].replace('\n', ' ')[:160]
-                            lines.append(f"        · repair excerpt: {snippet}")
-                            break
-
-    rag_info = rag_info or {}
-    lines.append("\n**RAG Retrieval**")
-    if not rag_info:
-        lines.append("- RAG info unavailable")
-    else:
-        lines.append(
-            f"- requested={rag_info.get('requested')} enabled={rag_info.get('enabled')} selection_missing={rag_info.get('selection_missing')}"
-        )
-        lines.append(
-            f"- selected_doc_ids: {rag_info.get('selected_doc_ids')} catalog_size={rag_info.get('catalog_size')}"
-        )
-        lines.append(
-            f"- mode={rag_info.get('mode')} threshold={rag_info.get('threshold')} top_k={rag_info.get('top_k')}"
-        )
-        lines.append(
-            f"- max_score={rag_info.get('max_score')} include_evidence={rag_info.get('include_evidence')} error={rag_info.get('error')}"
-        )
-        payload = rag_info.get("payload") or {}
-        top_scores = rag_prompt_context.get("top_scores") if isinstance(rag_prompt_context, dict) else []
-        if not top_scores:
-            top_scores = payload.get("top_scores") or []
-        if top_scores:
-            rounded = [round(float(score), 3) for score in top_scores[:5]]
-            lines.append(f"- top_scores: {rounded}")
-        if not rag_info.get("include_evidence"):
-            reason = ""
-            max_score = rag_info.get("max_score")
-            threshold = rag_info.get("threshold")
-            if rag_info.get("error"):
-                reason = rag_info.get("error")
-            elif max_score is None:
-                reason = "no hits"
-            elif threshold is not None and max_score < threshold:
-                reason = f"max_score {max_score:.3f} < threshold {threshold:.2f}"
-            else:
-                reason = "evidence suppressed"
-            lines.append(f"- evidence omitted reason: {reason}")
-
     return "\n".join(lines)
 
 
@@ -792,6 +712,17 @@ def _build_debug_report_markdown(
 
     lines: List[str] = ["### Debug Report"]
     lines.append("**Agent-1 Snapshot**")
+
+    if isinstance(debug_section, dict):
+        panel_meta = debug_section.get("panel") or {}
+        if isinstance(panel_meta, dict):
+            warnings = panel_meta.get("warnings")
+            if warnings:
+                lines.append("- panel warnings:")
+                for warn in warnings:
+                    lines.append(f"    - {warn}")
+            if panel_meta.get("error"):
+                lines.append(f"- panel error: {panel_meta.get('error')}")
 
     age_entries = _iter_debug_distribution(
         sanitized_snapshot.get("age_distribution") or kpis.get("age_distribution")

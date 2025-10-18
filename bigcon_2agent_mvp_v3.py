@@ -12,8 +12,10 @@ from time import perf_counter
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
-import pandas as pd
+from typing import Any, Dict, List
+
 import numpy as np
+import pandas as pd
 from jsonschema import Draft7Validator
 
 try:
@@ -112,6 +114,35 @@ except ImportError:  # pragma: no cover - fallback for deployments without ``app
 
         records.sort(key=lambda item: item["value"], reverse=True)
         return records
+
+try:
+    from app_core.panel_extract import (
+        NEEDED as PANEL_NEEDED_COLUMNS,
+        extract_panel_for,
+    )
+except ImportError:  # pragma: no cover - fallback when panel helpers are unavailable
+    PANEL_NEEDED_COLUMNS = [
+        "ENCODED_MCT",
+        "TA_YM",
+        "M12_MAL_1020_RAT",
+        "M12_MAL_30_RAT",
+        "M12_MAL_40_RAT",
+        "M12_MAL_50_RAT",
+        "M12_MAL_60_RAT",
+        "M12_FME_1020_RAT",
+        "M12_FME_30_RAT",
+        "M12_FME_40_RAT",
+        "M12_FME_50_RAT",
+        "M12_FME_60_RAT",
+        "MCT_UE_CLN_REU_RAT",
+        "MCT_UE_CLN_NEW_RAT",
+        "RC_M1_SHC_RSD_UE_CLN_RAT",
+        "RC_M1_SHC_WP_UE_CLN_RAT",
+        "RC_M1_SHC_FLP_UE_CLN_RAT",
+    ]
+
+    def extract_panel_for(df, mct_id):  # pragma: no cover - fallback path
+        raise RuntimeError("panel_extract module unavailable")
 
 __all__ = [
     "agent1_pipeline",
@@ -923,9 +954,10 @@ def build_panel(shinhan_dir, merchants_df=None, target_id=None):
         panel['YOUTH_SHARE'] = np.nan
     panel['REVISIT_RATE'] = pd.to_numeric(panel.get('MCT_UE_CLN_REU_RAT', np.nan), errors='coerce')
     panel['NEW_RATE'] = pd.to_numeric(panel.get('MCT_UE_CLN_NEW_RAT', np.nan), errors='coerce')
-    panel.rename(columns={'ENCODED_MCT':'_merchant_id'}, inplace=True)
-    if '_merchant_id' in panel.columns:
-        panel['_merchant_id'] = panel['_merchant_id'].astype(str)
+    if 'ENCODED_MCT' in panel.columns:
+        panel['_merchant_id'] = panel['ENCODED_MCT'].astype(str)
+    else:
+        panel['_merchant_id'] = ""
     stats['merchants_after'] = int(panel['_merchant_id'].nunique()) if '_merchant_id' in panel.columns else 0
     stats['set2_merchants_after'] = int(s2['ENCODED_MCT'].astype(str).nunique()) if 'ENCODED_MCT' in s2.columns else 0
     stats['set3_merchants_after'] = int(s3['ENCODED_MCT'].astype(str).nunique()) if 'ENCODED_MCT' in s3.columns else 0
@@ -1399,40 +1431,71 @@ def kpi_summary(panel_sub):
         return round(f, 1)
 
     detail_row = snap.iloc[0]
-    youth_latest = _safe_float(detail_row.get('YOUTH_SHARE'))
-    revisit_latest = _safe_float(detail_row.get('REVISIT_RATE'))
-    new_latest = _safe_float(detail_row.get('NEW_RATE'))
+    merchant_id = detail_row.get('ENCODED_MCT') or detail_row.get('_merchant_id')
+    merchant_id = str(merchant_id) if merchant_id is not None else None
 
-    age_labels = {
-        '1020': '청년(10-20)',
-        '30': '30대',
-        '40': '40대',
-        '50': '50대',
-        '60': '60대',
-    }
-    age_distribution = []
-    age_allowlist = []
-    for code, label in age_labels.items():
-        cols = [f'M12_MAL_{code}_RAT', f'M12_FME_{code}_RAT']
-        raw_vals = pd.Series([detail_row.get(c) for c in cols])
-        numeric_vals = pd.to_numeric(raw_vals, errors='coerce')
-        if numeric_vals.notna().sum() == 0:
-            continue
-        total = numeric_vals.sum(skipna=True)
-        cleaned = _clean_pct(total)
-        if cleaned is not None:
-            age_distribution.append({'code': code, 'label': label, 'value': cleaned})
-            age_allowlist.append(code)
-    age_distribution.sort(key=lambda x: x['value'], reverse=True)
+    safe_panel = None
+    panel_error = None
+    if merchant_id is not None:
+        missing_cols = [col for col in PANEL_NEEDED_COLUMNS if col not in panel_sub.columns]
+        if missing_cols:
+            panel_error = f"missing_columns:{','.join(sorted(set(missing_cols)))}"
+        else:
+            working = panel_sub[PANEL_NEEDED_COLUMNS].copy()
+            working['ENCODED_MCT'] = working['ENCODED_MCT'].astype(str)
+            try:
+                safe_panel = extract_panel_for(working, merchant_id)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                panel_error = str(exc)
+    else:
+        panel_error = 'encoded_mct_unavailable'
 
-    customer_mix_map = [
-        ('유동', 'RC_M1_SHC_FLP_UE_CLN_RAT'),
-        ('거주', 'RC_M1_SHC_RSD_UE_CLN_RAT'),
-        ('직장', 'RC_M1_SHC_WP_UE_CLN_RAT'),
-    ]
-    customer_mix_detail = {}
-    for label, col in customer_mix_map:
-        customer_mix_detail[label] = _clean_pct(_safe_float(detail_row.get(col)))
+    age_distribution: List[Dict[str, Any]] = []
+    age_allowlist: List[str] = []
+    customer_mix_detail: Dict[str, Any] = {label: None for label in ('유동', '거주', '직장')}
+    gender_share: Dict[str, Any] = {'female': None, 'male': None}
+    youth_latest = None
+    revisit_latest = None
+    new_latest = None
+    panel_warnings: List[str] | None = None
+
+    if safe_panel:
+        for bucket in safe_panel.get('age_distribution', []):
+            value = _clean_pct(bucket.get('value'))
+            if value is None:
+                continue
+            code = bucket.get('code') or bucket.get('label')
+            age_distribution.append({
+                'code': bucket.get('code'),
+                'label': bucket.get('label') or code,
+                'value': value,
+            })
+            if bucket.get('code'):
+                age_allowlist.append(str(bucket['code']))
+            if bucket.get('code') == '1020':
+                youth_latest = value
+        age_distribution.sort(key=lambda item: item['value'], reverse=True)
+
+        flow_map = safe_panel.get('flow') or {}
+        flow_mapping = {
+            '유동': flow_map.get('floating'),
+            '거주': flow_map.get('residential'),
+            '직장': flow_map.get('workplace'),
+        }
+        for label, raw_val in flow_mapping.items():
+            customer_mix_detail[label] = _clean_pct(raw_val)
+
+        gender_map = safe_panel.get('gender_share') or {}
+        gender_share = {
+            'female': _clean_pct(gender_map.get('female')),
+            'male': _clean_pct(gender_map.get('male')),
+        }
+
+        kpi_map = safe_panel.get('kpis') or {}
+        revisit_latest = _clean_pct(kpi_map.get('revisit_rate'))
+        new_latest = _clean_pct(kpi_map.get('new_rate'))
+
+        panel_warnings = safe_panel.get('warnings') or None
 
     ticket_band_raw = detail_row.get('APV_CE_RAT')
     ticket_band = None
@@ -1450,6 +1513,7 @@ def kpi_summary(panel_sub):
         'age_top_segments': age_distribution[:3],
         'age_allowlist': age_allowlist,
         'customer_mix_detail': customer_mix_detail,
+        'gender_share': gender_share,
         'avg_ticket_band_label': ticket_band,
         'n_merchants': int(snap['_merchant_id'].nunique()),
     }
@@ -1457,13 +1521,9 @@ def kpi_summary(panel_sub):
     raw_snapshot = {
         'TA_YM': detail_row.get('TA_YM'),
         '_date': str(detail_row.get('_date')),
-        'MCT_UE_CLN_REU_RAT_raw': detail_row.get('MCT_UE_CLN_REU_RAT_raw'),
-        'MCT_UE_CLN_NEW_RAT_raw': detail_row.get('MCT_UE_CLN_NEW_RAT_raw'),
-        'M12_MAL_1020_RAT_raw': detail_row.get('M12_MAL_1020_RAT_raw'),
-        'M12_FME_1020_RAT_raw': detail_row.get('M12_FME_1020_RAT_raw'),
-        'RC_M1_SHC_FLP_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_FLP_UE_CLN_RAT_raw'),
-        'RC_M1_SHC_RSD_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_RSD_UE_CLN_RAT_raw'),
-        'RC_M1_SHC_WP_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_WP_UE_CLN_RAT_raw'),
+        'panel_dict': safe_panel,
+        'panel_error': panel_error,
+        'panel_warnings': panel_warnings,
     }
 
     sanitized_snapshot = {
@@ -1473,28 +1533,20 @@ def kpi_summary(panel_sub):
         'customer_mix_detail': sanitized['customer_mix_detail'],
         'age_top_segments': sanitized['age_top_segments'],
         'age_allowlist': sanitized['age_allowlist'],
+        'gender_share': sanitized['gender_share'],
         'avg_ticket_band_label': sanitized['avg_ticket_band_label'],
     }
 
-    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
-    print("✅ KPI sanitized:", json.dumps(sanitized_snapshot, ensure_ascii=False))
-
-    return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
-
-
-    sanitized_snapshot = {
-        'revisit_pct': sanitized['revisit_rate_avg'],
-        'new_pct': sanitized['new_rate_avg'],
-        'youth_pct': sanitized['youth_share_avg'],
-        'customer_mix_detail': sanitized['customer_mix_detail'],
-        'age_top_segments': sanitized['age_top_segments'],
-        'avg_ticket_band_label': sanitized['avg_ticket_band_label'],
+    debug_payload = {
+        'latest_raw_snapshot': raw_snapshot,
+        'sanitized_snapshot': sanitized_snapshot,
     }
+    if panel_warnings:
+        debug_payload['panel_warnings'] = panel_warnings
+    if panel_error:
+        debug_payload['panel_error'] = panel_error
 
-    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
-    print("✅ KPI sanitized:", json.dumps(sanitized_snapshot, ensure_ascii=False))
-
-    return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
+    return sanitized, debug_payload
 
 
 def weather_effect(panel_sub, wx_monthly):
@@ -1682,6 +1734,10 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         'sanitized': sanitized_snapshot,
         'elapsed_ms': snapshot_elapsed,
     }
+    if kpi_debug and kpi_debug.get('panel_warnings'):
+        debug_block.setdefault('panel', {}).setdefault('warnings', kpi_debug['panel_warnings'])
+    if kpi_debug and kpi_debug.get('panel_error'):
+        debug_block.setdefault('panel', {})['error'] = kpi_debug['panel_error']
 
     render_table = _build_debug_table(qinfo, merchant_match, sanitized_snapshot)
     debug_block['render'] = {
@@ -1816,6 +1872,7 @@ def _resolve_schema_for_question(
         validator = validator_bundle
     return schema_obj, validator, key
 
+    return prompt_block, "\n- ".join(reason_lines)
 
 def infer_question_type(question_text: str | None) -> str:
     text = (question_text or "").lower()
