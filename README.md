@@ -31,6 +31,8 @@ print(hits["evidence"][:2])
 - Originals: place source docs (txt/pdf) under `data/rag/corpus/...`.
 - Embeddings: create `data/rag/indices/<embed_version>/<doc_id>/` with `manifest.json`, `chunks.parquet`, `vectors.npy`.
 - Streamlit UI: turn on "Use RAG", filter documents, and select one or more entries before running 분석.
+- Default embedding backend: `intfloat/multilingual-e5-base` (override via `EMBED_BACKEND` / `EMBED_MODEL_NAME`). Queries and passages are prefixed with `query: ` / `passage: ` and L2-normalised to match stored vectors.
+- `manifest.json` should record `embedding_model`, `tokenizer`, `vector_dim`, `instruction_prefix`, `normalize`, and `origin_path` so runtime can confirm consistency. Mixed settings trigger debug warnings; legacy HBW indices remain readable but skip the new model features.
 
 ## Organizer Q1/Q2/Q3 answer policy (public mode)
 - Public mode is the default experience (toggle via the sidebar App Mode selector or the `APP_MODE` secret) and hides fail-soft banners and internal caveats.

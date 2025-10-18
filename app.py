@@ -28,121 +28,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency path
     RetrievalTool = None
 
-def _format_debug_pct(value: Any) -> str:
-    pct, hint = to_float_pct(value)
-    if pct is None:
-        return f"{value!r} ({hint})"
-    return f"{pct:.1f}% ({hint})"
-
-
-def _lookup_gender_value(mapping: Dict[str, Any], aliases: Sequence[str]) -> Any:
-    for alias in aliases:
-        if alias in mapping:
-            return mapping.get(alias)
-    return None
-
-
-def _build_debug_report_markdown(
-    agent1_json: dict | None,
-    *,
-    question_type: str | None,
-    rag_info: Dict[str, Any] | None,
-    rag_prompt_context: Dict[str, Any] | None,
-    prompt_trace: Dict[str, Any] | None,
-    response_trace: Dict[str, Any] | None,
-) -> str:
-    if not isinstance(agent1_json, dict):
-        return ""
-
-    kpis = (agent1_json.get("kpis") or {}) if isinstance(agent1_json, dict) else {}
-    sanitized_snapshot = _get_debug_snapshot(agent1_json)
-    debug_section = _get_debug_section(agent1_json)
-    raw_snapshot = ((debug_section.get("snapshot") or {}).get("raw") or {}) if isinstance(debug_section, dict) else {}
-
-    lines: List[str] = ["### Debug Report"]
-    lines.append("**Agent-1 Snapshot**")
-
-    age_entries = _iter_debug_distribution(
-        sanitized_snapshot.get("age_distribution") or kpis.get("age_distribution")
-    )
-    if age_entries:
-        lines.append("- age_distribution:")
-        for key, raw_value in age_entries:
-            lines.append(f"    - {key}: {_format_debug_pct(raw_value)}")
-    else:
-        lines.append("- age_distribution: 없음")
-
-    gender_data = (
-        sanitized_snapshot.get("age_by_gender")
-        or sanitized_snapshot.get("age_gender")
-        or kpis.get("age_by_gender")
-        or kpis.get("age_gender")
-        or {}
-    )
-    if isinstance(gender_data, dict) and gender_data:
-        lines.append("- age_by_gender:")
-        for bucket, mapping in gender_data.items():
-            if not isinstance(mapping, dict):
-                continue
-            female_raw = _lookup_gender_value(mapping, _DEBUG_F_KEYS)
-            male_raw = _lookup_gender_value(mapping, _DEBUG_M_KEYS)
-            lines.append(
-                "    - "
-                + f"{bucket}: F {_format_debug_pct(female_raw)}, M {_format_debug_pct(male_raw)}"
-            )
-    elif raw_snapshot:
-        raw_keys = [key for key in raw_snapshot.keys() if "M12_" in str(key)]
-        if raw_keys:
-            lines.append(f"- raw age keys detected: {', '.join(raw_keys[:6])}")
-
-    mix_detail = sanitized_snapshot.get("customer_mix_detail") or kpis.get("customer_mix_detail")
-    if isinstance(mix_detail, dict) and mix_detail:
-        lines.append("- customer_mix_detail:")
-        for key, value in mix_detail.items():
-            lines.append(f"    - {key}: {_format_debug_pct(value)}")
-
-    new_raw = sanitized_snapshot.get("new_pct") or kpis.get("new_rate_avg")
-    revisit_raw = sanitized_snapshot.get("revisit_pct") or kpis.get("revisit_rate_avg")
-    lines.append(f"- 신규 비중: {_format_debug_pct(new_raw)}")
-    lines.append(f"- 재방문 비중: {_format_debug_pct(revisit_raw)}")
-
-    normalization_notes = [
-        f"{key}={value}"
-        for key, value in sanitized_snapshot.items()
-        if isinstance(key, str) and "normalize" in key.lower()
-    ]
-    if normalization_notes:
-        lines.append("- normalization flags:")
-        for note in normalization_notes:
-            lines.append(f"    - {note}")
-
-    lines.append("\n**Age Merge Decision**")
-    age_details = get_age_bucket_details(agent1_json or {})
-    if age_details:
-        for item in age_details:
-            final_val = item.get("final_value")
-            final_text = f"{final_val:.1f}%" if isinstance(final_val, (int, float)) else "—"
-            status = "included" if item.get("included") else "skipped"
-            lines.append(
-                f"- {item.get('label')} ({item.get('key')}): {final_text} ← {item.get('source')} ({status})"
-            )
-            if item.get("notes"):
-                lines.append(f"    - {item['notes']}")
-    else:
-        lines.append("- no age buckets detected")
-
-    prompt_trace = prompt_trace or {}
-    lines.append("\n**Agent-2 Prompt**")
-    lines.append(f"- question_type: {question_type or prompt_trace.get('question_type')}")
-    lines.append(f"- organizer_mode: {prompt_trace.get('organizer_mode')}")
-    lines.append(f"- schema_keys: {prompt_trace.get('schema_keys')}")
-    lines.append(
-        f"- rag_context_included: {prompt_trace.get('rag_included')}"
-        + (f" (reason: {prompt_trace.get('rag_reason')})" if prompt_trace.get("rag_reason") else "")
-    )
-    if prompt_trace.get("rag_context_doc_ids"):
-        lines.append(f"- rag doc_ids: {prompt_trace.get('rag_context_doc_ids')}")
-
     response_trace = response_trace or {}
     lines.append("\n**Agent-2 Response Trace**")
     if not response_trace:
@@ -815,6 +700,9 @@ def _prepare_rag_prompt_context(rag_info: Dict[str, Any] | None) -> Dict[str, An
         "error": rag_info.get("error"),
         "catalog_size": rag_info.get("catalog_size"),
         "top_scores": list(payload.get("top_scores") or []),
+        "encoder_info": payload.get("encoder_info"),
+        "doc_specs": payload.get("doc_specs"),
+        "retrieval_warnings": payload.get("warnings"),
     }
     return context
 
@@ -973,6 +861,46 @@ def _build_debug_report_markdown(
                 lines.append(f"    - {item['notes']}")
     else:
         lines.append("- no age buckets detected")
+
+    encoder_info = None
+    if isinstance(rag_prompt_context, dict):
+        encoder_info = rag_prompt_context.get("encoder_info")
+    if not encoder_info and isinstance(rag_info, dict):
+        encoder_info = (rag_info.get("payload") or {}).get("encoder_info")
+    if isinstance(encoder_info, dict) and encoder_info:
+        lines.append("\n**RAG Embedding**")
+        configured = encoder_info.get("configured") or {}
+        active = encoder_info.get("active") or {}
+        state = encoder_info.get("encoder_state") or {}
+        lines.append(
+            "- configured: "
+            + f"backend={configured.get('backend')} model={configured.get('model')} normalize={configured.get('normalize')}"
+        )
+        lines.append(
+            "- active: "
+            + f"backend={active.get('backend')} model={active.get('model')} normalize={active.get('normalize')}"
+        )
+        if encoder_info.get("mode"):
+            lines.append(f"- encoder mode: {encoder_info.get('mode')}")
+        if state:
+            lines.append(
+                "- encoder_state: "
+                + f"backend={state.get('backend')} model={state.get('model')} dim={state.get('dim')}"
+            )
+        doc_specs = encoder_info.get("doc_specs") or []
+        if doc_specs:
+            sample = doc_specs[0]
+            lines.append(
+                "- doc_spec sample: "
+                + f"doc_id={sample.get('doc_id')} model={sample.get('embedding_model')} dim={sample.get('vector_dim')}"
+            )
+        if encoder_info.get("warnings"):
+            lines.append("- encoder warnings:")
+            for warn in encoder_info.get("warnings"):
+                lines.append(f"    - {warn}")
+        skipped = encoder_info.get("skipped_doc_ids") or []
+        if skipped:
+            lines.append("- skipped doc ids: " + ", ".join(map(str, skipped)))
 
     prompt_trace = prompt_trace or {}
     lines.append("\n**Agent-2 Prompt**")
