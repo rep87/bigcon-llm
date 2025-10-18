@@ -1,64 +1,68 @@
-"""Detect suspicious top-level ``return`` statements.
-
-This script scans every Python file in the repository (excluding virtual
-environments, git metadata, and cached directories) and emits a diagnostic if a
-line begins with the keyword ``return`` at indentation level zero. Such
-patterns usually indicate that a helper function lost its wrapper during a
-merge, ultimately leading to ``SyntaxError: 'return' outside function`` at
-runtime.
-
-Usage::
-
-    python scripts/check_top_level_returns.py
-
-The script exits with a non-zero status when at least one offending line is
-found, making it suitable for CI or pre-commit hooks.
-"""
+#!/usr/bin/env python3
+"""Fail fast when a Python file contains a module-level return statement."""
 
 from __future__ import annotations
 
+import ast
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Iterable
 
 
-EXCLUDE_DIR_NAMES: set[str] = {".git", "venv", ".venv", "__pycache__"}
-RETURN_PATTERN = re.compile(r"^return\b")
+class ModuleReturnVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.stack: list[ast.AST] = []
+        self.violations: list[ast.Return] = []
+
+    def visit(self, node: ast.AST) -> None:  # type: ignore[override]
+        self.stack.append(node)
+        super().visit(node)
+        self.stack.pop()
+
+    def visit_Return(self, node: ast.Return) -> None:  # noqa: N802 (ast API)
+        if any(isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) for parent in self.stack[:-1]):
+            return
+        if any(isinstance(parent, ast.ClassDef) for parent in self.stack[:-1]):
+            return
+        self.violations.append(node)
+        self.generic_visit(node)
 
 
 def iter_python_files(root: Path) -> Iterable[Path]:
+    skip_names = {".git", "venv", ".venv", "__pycache__"}
     for path in root.rglob("*.py"):
-        parts = set(path.parts)
-        if parts & EXCLUDE_DIR_NAMES:
+        if any(part in skip_names for part in path.parts):
             continue
         yield path
 
 
+def check_file(path: Path) -> list[ast.Return]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except SyntaxError:
+        return []  # syntax errors handled elsewhere
+    visitor = ModuleReturnVisitor()
+    visitor.visit(tree)
+    return visitor.violations
+
+
 def main() -> int:
     root = Path(os.getcwd())
-    offenders: list[str] = []
+    failures = []
+    for file_path in iter_python_files(root):
+        violations = check_file(file_path)
+        for violation in violations:
+            failures.append((file_path, violation.lineno))
 
-    for path in iter_python_files(root):
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for lineno, line in enumerate(fh, start=1):
-                stripped = line.lstrip()
-                if stripped.startswith("#"):
-                    continue
-                if RETURN_PATTERN.match(line):
-                    offenders.append(f"{path}:{lineno}: {line.strip()}")
-
-    if offenders:
-        print("Top-level return statements detected:")
-        for entry in offenders:
-            print(f"  {entry}")
-        print("Consider wrapping the relevant code in a function.")
+    if failures:
+        for file_path, lineno in failures:
+            print(f"Module-level return detected: {file_path}:{lineno}")
         return 1
 
-    print("No top-level return statements found.")
+    print("No module-level return statements detected.")
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry point
+if __name__ == "__main__":
     sys.exit(main())

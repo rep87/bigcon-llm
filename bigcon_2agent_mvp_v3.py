@@ -168,7 +168,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MONTHS = 8
 SEED = 42
-random.seed(SEED); np.random.seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
 
 _SCHEMA_CACHE = None
 _SCHEMA_VALIDATOR = None
@@ -738,16 +739,22 @@ def load_set1(shinhan_dir):
     ren = {}
     for c in df.columns:
         cu = str(c).upper()
-        if cu == 'ENCODED_MCT': ren[c] = 'ENCODED_MCT'
-        elif 'SIGUNGU' in cu:   ren[c] = 'SIGUNGU'
-        elif 'BSE_AR' in cu:    ren[c] = 'ADDR_BASE'
-        elif ('ZCD' in cu) or ('BZN' in cu) or ('업종' in cu): ren[c] = 'CATEGORY'
-        elif cu == 'MCT_NM':    ren[c] = 'MCT_NM'
+        if cu == 'ENCODED_MCT':
+            ren[c] = 'ENCODED_MCT'
+        elif 'SIGUNGU' in cu:
+            ren[c] = 'SIGUNGU'
+        elif 'BSE_AR' in cu:
+            ren[c] = 'ADDR_BASE'
+        elif ('ZCD' in cu) or ('BZN' in cu) or ('업종' in cu):
+            ren[c] = 'CATEGORY'
+        elif cu == 'MCT_NM':
+            ren[c] = 'MCT_NM'
     df = df.rename(columns=ren)
     df = df.loc[:, ~df.columns.duplicated()]
     keep = ['ENCODED_MCT','MCT_NM','ADDR_BASE','SIGUNGU','CATEGORY']
     for k in keep:
-        if k not in df.columns: df[k] = np.nan
+        if k not in df.columns:
+            df[k] = np.nan
     df = df[keep].drop_duplicates('ENCODED_MCT')
     if 'ENCODED_MCT' in df.columns:
         df['ENCODED_MCT'] = df['ENCODED_MCT'].apply(lambda v: str(v).strip() if pd.notna(v) else '')
@@ -792,10 +799,11 @@ def load_set3(shinhan_dir):
 
 def load_weather_monthly(external_dir):
     f = None
-    for e in ('.csv','.parquet','.parq','.feather'):
+    for e in ('.csv', '.parquet', '.parq', '.feather'):
         cand = list(external_dir.glob(f'**/*{e}'))
         if cand:
-            f = cand[0]; break
+            f = cand[0]
+            break
     if not f:
         print('⚠️ 외부(날씨) 데이터가 없습니다. 날씨 분석은 제한됩니다.')
         return None
@@ -811,8 +819,9 @@ def load_weather_monthly(external_dir):
     c_dt = None
     for c in wx.columns:
         cl = str(c).lower()
-        if any(k in cl for k in ['date','ymd','dt','일자','날짜','yyyymm']):
-            c_dt = c; break
+        if any(k in cl for k in ['date', 'ymd', 'dt', '일자', '날짜', 'yyyymm']):
+            c_dt = c
+            break
     if c_dt is None:
         raise ValueError('날씨 데이터에 날짜(또는 YYYYMM) 컬럼을 찾지 못했습니다.')
     dt = pd.to_datetime(wx[c_dt].astype(str), errors='coerce')
@@ -820,8 +829,9 @@ def load_weather_monthly(external_dir):
     c_rain = None
     for c in wx.columns:
         cl = c.lower()
-        if any(k in cl for k in ['rain','precip','rn_mm','rainfall','rr','강수','강수량','비']):
-            c_rain = c; break
+        if any(k in cl for k in ['rain', 'precip', 'rn_mm', 'rainfall', 'rr', '강수', '강수량', '비']):
+            c_rain = c
+            break
     if c_rain is None:
         wx['_rain_val'] = 0.0
     else:
@@ -1399,7 +1409,9 @@ def parse_question(q):
         'merchant_sigungu_pattern': sigungu_pattern,
     }
 
-def subset_period(panel, months=DEFAULT_MONTHS):
+def subset_period(panel, months: int | None = None):
+    if months is None:
+        months = DEFAULT_MONTHS
     if panel['_date'].isna().all():
         return panel.iloc[0:0]
     maxd = panel['_date'].max()
@@ -1559,7 +1571,15 @@ def weather_effect(panel_sub, wx_monthly):
     corr = m['REVISIT_RATE'].corr(m['RAIN_SUM'])
     return {'metric':'REVISIT_RATE','effect':float(corr), 'ci':[None,None], 'note':'피어슨 상관(월단위)'}
 
-def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR):
+def agent1_pipeline(
+    question,
+    shinhan_dir: str | os.PathLike[str] | None = None,
+    external_dir: str | os.PathLike[str] | None = None,
+):
+    if shinhan_dir is None:
+        shinhan_dir = SHINHAN_DIR
+    if external_dir is None:
+        external_dir = EXTERNAL_DIR
     debug_block = {
         'input': {
             'original': _mask_debug_preview(question, limit=120),
@@ -1871,8 +1891,6 @@ def _resolve_schema_for_question(
     else:
         validator = validator_bundle
     return schema_obj, validator, key
-
-    return prompt_block, "\n- ".join(reason_lines)
 
 def infer_question_type(question_text: str | None) -> str:
     text = (question_text or "").lower()
@@ -2357,7 +2375,9 @@ def call_gemini_agent2(*args, **kwargs):
 
 def main():
     import argparse
-    a1 = None; prompt_text = ''; a2 = None
+    a1 = None
+    prompt_text = ''
+    a2 = None
     parser = argparse.ArgumentParser()
     parser.add_argument('--question', type=str, default=None)
     parser.add_argument('--model', type=str, default='gemini-2.5-flash')
