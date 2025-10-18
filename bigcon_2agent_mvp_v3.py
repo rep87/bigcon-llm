@@ -1872,6 +1872,7 @@ def _resolve_schema_for_question(
         validator = validator_bundle
     return schema_obj, validator, key
 
+    return prompt_block, "\n- ".join(reason_lines)
 
 def infer_question_type(question_text: str | None) -> str:
     text = (question_text or "").lower()
