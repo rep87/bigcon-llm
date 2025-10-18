@@ -212,6 +212,20 @@ def llm_json_safe_parse(text: str, schema_validator: Draft7Validator | None = No
     return None, logs
 
 
+def _coerce_to_answers(payload: dict | None) -> dict | None:
+    """Ensure Agent-2 payload exposes an ``answers`` array for downstream logic."""
+
+    if not isinstance(payload, dict):
+        return payload
+
+    if "answers" in payload or "recommendations" not in payload:
+        return payload
+
+    coerced = dict(payload)
+    coerced["answers"] = payload.get("recommendations")
+    return coerced
+
+
 def _structured_value(agent1_json: dict | None, key: str) -> tuple[float | None, str | None]:
     agent1_json = agent1_json or {}
     debug = agent1_json.get("debug") or {}
@@ -1679,6 +1693,7 @@ ORGANIZER_QUESTION_TYPES = {
     "Q1_CAFE_CHANNELS",
     "Q2_LOW_RETENTION",
     "Q3_FOOD_ISSUE",
+    "GENERIC",
 }
 
 
@@ -2071,32 +2086,58 @@ def call_gemini_agent2_overhauled(
             attempt_record["raw_length"] = len(text_value or "")
             attempt_record["meta"] = info
 
-            parsed, parse_logs = llm_json_safe_parse(text_value, schema_validator)
+            parsed, parse_logs = llm_json_safe_parse(text_value, None)
             attempt_record["parse_logs"] = parse_logs
 
+            validation_error: str | None = None
             if parsed is not None:
-                attempt_record["status"] = "parsed"
-                chosen_payload = parsed
-                chosen_model = used_model
-                AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
-                break
+                coerced = _coerce_to_answers(parsed)
+                attempt_record["coerced_to_answers"] = bool(coerced is not parsed)
+                try:
+                    if schema_validator is not None and coerced is not None:
+                        schema_validator.validate(coerced)
+                except Exception as exc:
+                    validation_error = str(exc)
+                    attempt_record["validation_error"] = validation_error
+                else:
+                    attempt_record["status"] = "parsed"
+                    chosen_payload = coerced
+                    chosen_model = used_model
+                    AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+                    break
 
-            attempt_record["status"] = "parse_failed"
-            if parse_logs:
+            if validation_error:
+                last_error = validation_error
+            elif parse_logs:
                 last_error = parse_logs[-1].get("error") or last_error
+
+            attempt_record["status"] = attempt_record.get("status") or (
+                "validation_failed" if validation_error else "parse_failed"
+            )
 
             repaired_text, repair_meta = _repair_with_llm(model_candidate, text_value)
             attempt_record["repair_preview"] = (repaired_text or "")[:600]
             attempt_record["repair_meta"] = repair_meta
             if repaired_text:
-                repaired, repair_logs = llm_json_safe_parse(repaired_text, schema_validator)
+                repaired, repair_logs = llm_json_safe_parse(repaired_text, None)
                 attempt_record["repair_logs"] = repair_logs
                 if repaired is not None:
-                    attempt_record["status"] = "repaired"
-                    chosen_payload = repaired
-                    chosen_model = model_candidate
-                    AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
-                    break
+                    coerced_repair = _coerce_to_answers(repaired)
+                    attempt_record["repair_coerced_to_answers"] = bool(
+                        coerced_repair is not repaired
+                    )
+                    try:
+                        if schema_validator is not None and coerced_repair is not None:
+                            schema_validator.validate(coerced_repair)
+                    except Exception as exc:
+                        attempt_record["repair_validation_error"] = str(exc)
+                        last_error = str(exc)
+                    else:
+                        attempt_record["status"] = "repaired"
+                        chosen_payload = coerced_repair
+                        chosen_model = model_candidate
+                        AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+                        break
                 if repair_logs:
                     last_error = repair_logs[-1].get("error") or last_error
 

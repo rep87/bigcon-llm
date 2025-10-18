@@ -1143,7 +1143,10 @@ def render_summary_view(
         for line in goal_lines:
             st.markdown(f"- {line}")
 
-    answers = (agent2_json or {}).get("answers") or []
+    agent2_payload = agent2_json or {}
+    answers = agent2_payload.get("answers") or agent2_payload.get("recommendations") or []
+    if not isinstance(answers, list):
+        answers = []
 
     st.subheader("아이디어 제안")
     if not answers:
