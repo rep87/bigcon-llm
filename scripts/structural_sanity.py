@@ -1,26 +1,10 @@
-"""Structural sanity checks for repository Python files.
+#!/usr/bin/env python3
+"""Structural sanity checks for Python sources.
 
-This developer-facing utility walks through all ``.py`` files (excluding
-virtual environments, git metadata, and other transient directories) and
-performs lightweight diagnostics that help catch merge artefacts which often
-manifest as ``SyntaxError: 'return' outside function`` at import time.
-
-Usage::
-
-    python scripts/structural_sanity.py
-
-The script emits a report describing:
-
-* Files that fail to ``ast.parse`` along with a context window around the
-  offending line.
-* Heuristic warnings for potential top-level ``return``/``yield``/``await``/
-  ``raise`` statements that are usually indicative of missing wrappers.
-* Conflict markers (for example, sequences beginning with seven ``<``
-  characters) left over from merges.
-* Suspicious triple-quote counts which may hint at unterminated strings.
-
-No changes are made to the filesystem – the script is read-only and meant for
-rapid diagnosis before running the full application.
+This dev-only script scans the repository for indicators of structural drift
+such as syntax errors, top-level control statements, merge conflict markers,
+and unbalanced triple quotes. Findings are printed with a small context window
+so regressions can be triaged quickly.
 """
 
 from __future__ import annotations
@@ -30,99 +14,96 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable
 
-
-EXCLUDE_DIR_NAMES: set[str] = {".git", "venv", ".venv", "__pycache__"}
-TOP_LEVEL_PATTERN = re.compile(r"^[ ]{0,3}(return|yield|await|raise)\b")
-CONFLICT_MARKERS = ("<" * 7, "=" * 7, ">" * 7)
-TRIPLE_SINGLE = "'" * 3
-TRIPLE_DOUBLE = '"' * 3
+CONTEXT_WINDOW = 20
+TOP_LEVEL_PATTERN = re.compile(r"^(?: {0,3}|\t{0,1})(return|yield|await|raise)\b")
+MERGE_MARKERS = {"<" * 7, "=" * 7, ">" * 7}
+TRIPLE_QUOTE_PATTERNS = ['"' * 3, "'" * 3]
 
 
 def iter_python_files(root: Path) -> Iterable[Path]:
+    skip_names = {".git", "venv", ".venv", "__pycache__"}
     for path in root.rglob("*.py"):
-        parts = set(path.parts)
-        if parts & EXCLUDE_DIR_NAMES:
+        if any(part in skip_names for part in path.parts):
             continue
         yield path
 
 
-def read_lines(path: Path) -> Sequence[str]:
-    return path.read_text(encoding="utf-8", errors="ignore").splitlines()
+def read_lines(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    return text.splitlines()
 
 
-def context_window(lines: Sequence[str], lineno: int, radius: int = 20) -> str:
-    start = max(lineno - radius - 1, 0)
-    end = min(lineno + radius, len(lines))
-    numbered = []
+def print_context(lines: list[str], line_no: int) -> None:
+    start = max(0, line_no - CONTEXT_WINDOW - 1)
+    end = min(len(lines), line_no + CONTEXT_WINDOW)
     for idx in range(start, end):
-        prefix = ">>" if idx == lineno - 1 else "  "
-        numbered.append(f"{prefix}{idx + 1:5d}: {lines[idx]}")
-    return "\n".join(numbered)
+        prefix = ">" if idx == line_no - 1 else " "
+        print(f"{prefix}{idx + 1:5d}: {lines[idx]}")
 
 
-def warn_top_level_statements(path: Path, lines: Sequence[str]) -> list[str]:
-    warnings: list[str] = []
+def check_syntax(path: Path, text: str, summary: dict[str, int]) -> None:
+    try:
+        ast.parse(text, filename=str(path))
+    except SyntaxError as exc:  # pragma: no cover - developer aid
+        summary.setdefault("syntax_errors", 0)
+        summary["syntax_errors"] += 1
+        print(f"\n[SyntaxError] {path}:{exc.lineno}:{exc.offset} — {exc.msg}")
+        lines = text.splitlines()
+        if exc.lineno:
+            print_context(lines, exc.lineno)
+
+
+def check_top_level_statements(path: Path, lines: list[str], summary: dict[str, int]) -> None:
     for idx, line in enumerate(lines, start=1):
-        if TOP_LEVEL_PATTERN.match(line):
-            warnings.append(f"{path}:{idx}: suspect top-level statement -> {line.strip()}")
-    return warnings
+        if TOP_LEVEL_PATTERN.search(line):
+            summary.setdefault("top_level_statements", 0)
+            summary["top_level_statements"] += 1
+            print(f"\n[TopLevel] {path}:{idx} — {line.strip()}")
+            print_context(lines, idx)
 
 
-def warn_conflict_markers(path: Path, lines: Sequence[str]) -> list[str]:
-    warnings: list[str] = []
+def check_merge_markers(path: Path, lines: list[str], summary: dict[str, int]) -> None:
     for idx, line in enumerate(lines, start=1):
-        if any(marker in line for marker in CONFLICT_MARKERS):
-            warnings.append(f"{path}:{idx}: merge conflict marker detected -> {line.strip()}")
-    return warnings
+        if any(marker in line for marker in MERGE_MARKERS):
+            summary.setdefault("merge_markers", 0)
+            summary["merge_markers"] += 1
+            print(f"\n[Conflict] {path}:{idx} — {line.strip()}")
+            print_context(lines, idx)
 
 
-def warn_unbalanced_triple_quotes(path: Path, text: str) -> list[str]:
-    warnings: list[str] = []
-    for triple in (TRIPLE_SINGLE, TRIPLE_DOUBLE):
-        count = text.count(triple)
-        if count % 2 != 0:
-            warnings.append(
-                f"{path}: unmatched triple quote ({triple}) count={count}. "
-                "Check for unterminated multi-line strings."
-            )
-    return warnings
+def check_triple_quotes(path: Path, text: str, summary: dict[str, int]) -> None:
+    counts = {pat: text.count(pat) for pat in TRIPLE_QUOTE_PATTERNS}
+    unbalanced = [pat for pat, count in counts.items() if count % 2 != 0]
+    if unbalanced:
+        summary.setdefault("unbalanced_triple_quotes", 0)
+        summary["unbalanced_triple_quotes"] += 1
+        print(f"\n[TripleQuote] {path} — unmatched delimiters: {', '.join(unbalanced)}")
 
 
 def main() -> int:
     root = Path(os.getcwd())
-    py_files = sorted(iter_python_files(root))
-    parse_failures = 0
-    warning_messages: list[str] = []
+    summary: dict[str, int] = {}
+    for py_file in iter_python_files(root):
+        text_lines = read_lines(py_file)
+        text = "\n".join(text_lines)
+        check_syntax(py_file, text, summary)
+        check_top_level_statements(py_file, text_lines, summary)
+        check_merge_markers(py_file, text_lines, summary)
+        check_triple_quotes(py_file, text, summary)
 
-    for path in py_files:
-        lines = read_lines(path)
-        text = "\n".join(lines)
-
-        try:
-            ast.parse(text, filename=str(path))
-        except SyntaxError as exc:  # pragma: no cover - diagnostic path
-            parse_failures += 1
-            print("=" * 80)
-            print(f"SyntaxError in {path}:{exc.lineno}:{exc.offset} -> {exc.msg}")
-            print(context_window(lines, exc.lineno or 1))
-            print("=" * 80)
-
-        warning_messages.extend(warn_top_level_statements(path, lines))
-        warning_messages.extend(warn_conflict_markers(path, lines))
-        warning_messages.extend(warn_unbalanced_triple_quotes(path, text))
-
-    if warning_messages:
-        print("Warnings:")
-        for message in warning_messages:
-            print(f"  {message}")
-
-    print("-" * 80)
-    print(f"Checked {len(py_files)} Python files. Parse failures: {parse_failures}.")
-    print(f"Warnings emitted: {len(warning_messages)}.")
-    return 0 if parse_failures == 0 else 1
+    if not summary:
+        print("All clear — no structural anomalies detected.")
+    else:
+        print("\nSummary:")
+        for key, value in sorted(summary.items()):
+            print(f"  {key}: {value}")
+    return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry point
+if __name__ == "__main__":
     sys.exit(main())
