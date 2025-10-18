@@ -23,29 +23,16 @@ from app_core.formatters import (
 import pandas as pd
 import streamlit as st
 
+# Optional import-time sanity check to catch indentation leaks during development.
+if os.getenv("STREAMLIT_COMPILE_GUARD", "0") == "1":  # pragma: no cover - dev aid only
+    import py_compile
+
+    py_compile.compile(__file__, doraise=True)
+
 try:
     from rag import RetrievalTool
 except Exception:  # pragma: no cover - optional dependency path
     RetrievalTool = None
-
-    return "\n".join(lines)
-
-
-def _match_evidence_chunk(
-    entry: Dict[str, Any],
-    retrieval_payload: Dict[str, Any] | None,
-) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
-    if not isinstance(entry, dict) or not retrieval_payload:
-        return None, None
-    doc_id = entry.get("doc_id")
-    if not doc_id:
-        return None, None
-    chunk_id = entry.get("chunk_id")
-    chunks = retrieval_payload.get("chunks") or []
-    evidence_list = retrieval_payload.get("evidence") or []
-    target_chunk = None
-    target_meta = None
-    chunk_id_str = str(chunk_id) if chunk_id is not None else None
 
     for chunk in chunks:
         if str(chunk.get("doc_id")) != str(doc_id):
@@ -1506,10 +1493,25 @@ def _collect_overview_row(agent1_json: dict) -> tuple[pd.DataFrame, dict]:
 
 
 def _build_diagnosis(agent1_json: dict) -> List[str]:
+    """Return exactly three diagnosis lines with safe fallbacks."""
+
     try:
-        return three_line_diagnosis(agent1_json or {})
+        lines = three_line_diagnosis(agent1_json or {})
     except Exception:
-        return ["요약 생성 오류", "데이터 확인 필요", "—"]
+        lines = ["요약 생성 오류", "데이터 확인 필요", "—"]
+
+    sanitized: List[str] = []
+    for line in lines:
+        if isinstance(line, str):
+            text = line.strip()
+            sanitized.append(text if text else "—")
+        else:
+            sanitized.append("—")
+
+    while len(sanitized) < 3:
+        sanitized.append("—")
+
+    return sanitized[:3]
 
 
 def _build_goal_lines(agent1_json: dict) -> tuple[str, list[str]]:
