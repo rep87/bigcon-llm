@@ -33,6 +33,77 @@ except Exception as e:
         if missing:
             raise KeyError(f"[panel_fallback] Missing required columns: {sorted(missing)}")
         return df[NEEDED].copy()
+
+    def _fallback_pct(value):
+        try:
+            if value is None:
+                return None
+            val = float(value)
+        except Exception:
+            return None
+        if val < 0 or val > 100:
+            return None
+        return float(val)
+
+    def _fallback_latest_valid_row(df, mct_id, eps: float = 0.5):
+        import pandas as pd  # local import to avoid hard dependency at module import time
+
+        sub = df[df["ENCODED_MCT"].astype(str) == str(mct_id)].copy()
+        if sub.empty:
+            raise ValueError(f"[panel_fallback] No rows for ENCODED_MCT={mct_id}")
+
+        sub["__TA_YM_INT__"] = pd.to_numeric(sub["TA_YM"], errors="coerce").astype("Int64")
+        sub = sub.dropna(subset=["__TA_YM_INT__"])
+        if sub.empty:
+            raise ValueError("[panel_fallback] TA_YM not parseable")
+
+        sub = sub.sort_values("__TA_YM_INT__", ascending=False)
+        row = sub.iloc[0].copy()
+        row.attrs["guard_fallback"] = True
+        return row, int(row["__TA_YM_INT__"])
+
+    # register a synthetic module so downstream imports that depend on panel_extract keep working
+    from types import ModuleType
+
+    fallback_module = ModuleType("app_core.panel_extract")
+    fallback_module.__dict__.update(
+        {
+            "__file__": "<panel_extract_fallback>",
+            "__package__": "app_core",
+            "SAFE_COLS": {
+                "id": ["ENCODED_MCT"],
+                "period": ["TA_YM"],
+                "age_gender": [
+                    "M12_MAL_1020_RAT",
+                    "M12_MAL_30_RAT",
+                    "M12_MAL_40_RAT",
+                    "M12_MAL_50_RAT",
+                    "M12_MAL_60_RAT",
+                    "M12_FME_1020_RAT",
+                    "M12_FME_30_RAT",
+                    "M12_FME_40_RAT",
+                    "M12_FME_50_RAT",
+                    "M12_FME_60_RAT",
+                ],
+                "kpi": ["MCT_UE_CLN_REU_RAT", "MCT_UE_CLN_NEW_RAT"],
+                "flow": [
+                    "RC_M1_SHC_RSD_UE_CLN_RAT",
+                    "RC_M1_SHC_WP_UE_CLN_RAT",
+                    "RC_M1_SHC_FLP_UE_CLN_RAT",
+                ],
+            },
+            "NEEDED": NEEDED,
+            "NEEDED_COLS": NEEDED,
+            "REQUIRED_COLS": NEEDED,
+            "subset_needed": subset_needed,
+            "select_needed": subset_needed,
+            "get_required_subset": subset_needed,
+            "_pct": _fallback_pct,
+            "latest_valid_row": _fallback_latest_valid_row,
+        }
+    )
+    sys.modules.pop("app_core.panel_extract", None)
+    sys.modules["app_core.panel_extract"] = fallback_module
 # --- end minimal safe import block ---
 
 import json
