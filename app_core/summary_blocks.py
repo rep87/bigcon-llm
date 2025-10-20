@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from .panel_extract import NEEDED, _pct, latest_valid_row, subset_needed
+from .panel_extract import _pct, latest_valid_row, subset_needed
 
 
 def _age_buckets_from_row(row: pd.Series) -> list[dict]:
