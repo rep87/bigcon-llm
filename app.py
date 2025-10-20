@@ -892,9 +892,9 @@ def _format_list(values) -> str:
 def _render_status_summary(
     table_dict: dict | None,
     panel_summary: dict | None,
-    *,
-    debug_mode: bool,
 ) -> None:
+    debug_mode = _is_debug_mode()
+
     if not table_dict:
         st.info("요약 정보가 없습니다.")
         return
@@ -912,7 +912,12 @@ def _render_status_summary(
     summary_df = pd.DataFrame(rows, columns=["항목", "값"])
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    if panel_summary and len(panel_summary.get("age_all") or []) > 3:
+    if panel_summary is None:
+        if debug_mode:
+            st.caption("⚠️ panel_summary is None (skip status summary)")
+        return
+
+    if len(panel_summary.get("age_all") or []) > 3:
         details = []
         for bucket in panel_summary.get("age_all", []):
             label = bucket.get("label") or bucket.get("code") or "—"
@@ -921,7 +926,7 @@ def _render_status_summary(
         with st.expander("전체 연령 비중 보기", expanded=False):
             st.markdown(", ".join(details) if details else "—")
 
-    if debug_mode and panel_summary and panel_summary.get("guard_fallback"):
+    if debug_mode and panel_summary.get("guard_fallback"):
         st.caption("[guard fallback] used latest available month; sums outside 100±0.5")
 
 
@@ -970,7 +975,7 @@ def render_summary_view(
 
     if is_public_mode:
         st.subheader("현황 요약")
-        _render_status_summary(table_dict, panel_summary, debug_mode=debug_mode)
+        _render_status_summary(table_dict, panel_summary)
     else:
         st.subheader("현황 표")
         st.table(overview_df)

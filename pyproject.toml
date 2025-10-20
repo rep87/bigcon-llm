@@ -1,0 +1,3 @@
+[tool.ruff]
+lint.select = ["E", "F", "I", "UP", "B"]
+lint.ignore = ["E", "I", "UP", "B"]

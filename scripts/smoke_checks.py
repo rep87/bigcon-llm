@@ -5,6 +5,7 @@ from __future__ import annotations
 import compileall
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -130,6 +131,7 @@ def main() -> None:
     check_summary_blocks()
     check_prompt_with_rag_block()
     compileall.compile_dir(str(PROJECT_ROOT), quiet=1)
+    subprocess.run(["ruff", "check", str(PROJECT_ROOT)], check=True)
 
 
 if __name__ == "__main__":
