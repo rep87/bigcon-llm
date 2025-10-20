@@ -21,7 +21,7 @@ import pandas as pd
 from jsonschema import Draft7Validator
 
 try:
-    from app_core.formatters import merge_age_buckets, to_float_pct
+    import app_core.formatters as formatters
 except ImportError:  # pragma: no cover - fallback for deployments without ``app_core`` package
     def to_float_pct(value):
         """Simplified percentage parser returning ``(value, hint)`` like the shared helper."""
@@ -116,12 +116,12 @@ except ImportError:  # pragma: no cover - fallback for deployments without ``app
 
         records.sort(key=lambda item: item["value"], reverse=True)
         return records
+else:
+    to_float_pct = formatters.to_float_pct
+    merge_age_buckets = formatters.merge_age_buckets
 
 try:
-    from app_core.panel_extract import (
-        NEEDED as PANEL_NEEDED_COLUMNS,
-        extract_panel_for,
-    )
+    import app_core.panel_extract as panel_extract
 except ImportError:  # pragma: no cover - fallback when panel helpers are unavailable
     PANEL_NEEDED_COLUMNS = [
         "ENCODED_MCT",
@@ -145,6 +145,9 @@ except ImportError:  # pragma: no cover - fallback when panel helpers are unavai
 
     def extract_panel_for(df, mct_id, *, allow_alias=False):  # pragma: no cover - fallback path
         raise RuntimeError("panel_extract module unavailable")
+else:
+    PANEL_NEEDED_COLUMNS = panel_extract.NEEDED
+    extract_panel_for = panel_extract.extract_panel_for
 
 try:  # pragma: no cover - optional UI dependency
     import streamlit as st

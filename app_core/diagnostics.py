@@ -59,7 +59,7 @@ def build_analyst_summary_text(
 
     if use_llm:
         try:
-            from app_core.llm import call_llm  # type: ignore[import-not-found]
+            import app_core.llm as llm  # type: ignore[import-not-found]
 
             prompt = f"""
 당신은 '소상공인 데이터 분석 전문가'입니다. 아래 KPI만 근거로 약 600–1000자 한국어 분석 요약을 작성하세요.
@@ -74,7 +74,7 @@ def build_analyst_summary_text(
 
 매장 마스크명: {merchant_mask or '—'}
 """
-            text = call_llm(
+            text = llm.call_llm(
                 system="당신은 데이터 기반 마케팅 분석가입니다.",
                 user=prompt,
                 max_tokens=llm_max_tokens,

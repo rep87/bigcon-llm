@@ -256,3 +256,12 @@ __all__ = [
     "extract_panel_for",
     "_pct",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - developer self-check
+    import pandas as _pd
+
+    _df = _pd.DataFrame(columns=NEEDED)
+    assert list(_df.columns) == NEEDED
+    print("[panel_extract] self-check OK")
+

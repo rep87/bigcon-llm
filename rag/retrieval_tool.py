@@ -24,8 +24,8 @@ from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from app_core.config import get_flag, get_setting
-from app_core.embeddings import EmbedSettings, QueryEncoder
+import app_core.config as app_config
+import app_core.embeddings as embeddings
 
 
 _TOKEN_REGEX = re.compile(r"\w+", re.UNICODE)
@@ -73,7 +73,7 @@ class RetrievalTool:
     """A small helper around local embedding indices."""
 
     def __init__(self, root: str | Path | None = None, embed_version: str = "embed_v1") -> None:
-        resolved_root = root or get_setting("RAG_ROOT", "data/rag") or "data/rag"
+        resolved_root = root or app_config.get_setting("RAG_ROOT", "data/rag") or "data/rag"
         root_path = Path(resolved_root).expanduser().resolve()
         self.root_path = root_path
         self.embed_version = embed_version
@@ -82,26 +82,26 @@ class RetrievalTool:
         self._catalog: list[_DocumentEntry] | None = None
         self._index_cache: dict[str, dict[str, Any]] = {}
         self._hybrid_alpha = 0.3
-        backend_value = str(get_setting("EMBED_BACKEND", "e5") or "e5").lower()
+        backend_value = str(app_config.get_setting("EMBED_BACKEND", "e5") or "e5").lower()
         if backend_value not in {"e5", "hbw"}:
             backend_value = "e5"
         model_name_value = str(
-            get_setting("EMBED_MODEL_NAME", "intfloat/multilingual-e5-base")
+            app_config.get_setting("EMBED_MODEL_NAME", "intfloat/multilingual-e5-base")
             or "intfloat/multilingual-e5-base"
         )
-        prefix_query = str(get_setting("EMBED_PREFIX_QUERY", "query: ") or "query: ")
-        prefix_passage = str(get_setting("EMBED_PREFIX_PASSAGE", "passage: ") or "passage: ")
-        normalize_flag = get_flag("EMBED_NORMALIZE", True)
-        self.encoder_settings = EmbedSettings(
+        prefix_query = str(app_config.get_setting("EMBED_PREFIX_QUERY", "query: ") or "query: ")
+        prefix_passage = str(app_config.get_setting("EMBED_PREFIX_PASSAGE", "passage: ") or "passage: ")
+        normalize_flag = app_config.get_flag("EMBED_NORMALIZE", True)
+        self.encoder_settings = embeddings.EmbedSettings(
             backend=backend_value,  # type: ignore[arg-type]
             model_name=model_name_value,
             prefix_query=prefix_query,
             prefix_passage=prefix_passage,
             normalize=bool(normalize_flag),
         )
-        self.autoswitch = get_flag("RAG_AUTOSWITCH", True)
+        self.autoswitch = app_config.get_flag("RAG_AUTOSWITCH", True)
         self._encoder_cache: dict[
-            Tuple[str, str, str, str, bool], QueryEncoder
+            Tuple[str, str, str, str, bool], embeddings.QueryEncoder
         ] = {}
 
     # ------------------------------------------------------------------
@@ -321,7 +321,7 @@ class RetrievalTool:
             return payload
 
         decision = self._decide_active_settings(doc_specs)
-        active_settings: EmbedSettings = decision["settings"]
+        active_settings: embeddings.EmbedSettings = decision["settings"]
         warnings.extend(decision["warnings"])
 
         try:
@@ -633,7 +633,7 @@ class RetrievalTool:
             "manifest_path": str(entry.manifest_path),
         }
 
-    def _get_encoder(self, settings: EmbedSettings) -> QueryEncoder:
+    def _get_encoder(self, settings: embeddings.EmbedSettings) -> embeddings.QueryEncoder:
         key = (
             settings.backend,
             settings.model_name,
@@ -643,7 +643,7 @@ class RetrievalTool:
         )
         encoder = self._encoder_cache.get(key)
         if encoder is None:
-            encoder = QueryEncoder(settings)
+            encoder = embeddings.QueryEncoder(settings)
             self._encoder_cache[key] = encoder
         return encoder
 
@@ -672,7 +672,7 @@ class RetrievalTool:
             normalize = target_spec.get("normalize")
             prefix_query = target_spec.get("prefix_query") or self.encoder_settings.prefix_query
             prefix_passage = target_spec.get("prefix_passage") or self.encoder_settings.prefix_passage
-            target_settings = EmbedSettings(
+            target_settings = embeddings.EmbedSettings(
                 backend=backend,  # type: ignore[arg-type]
                 model_name=str(model_name),
                 prefix_query=str(prefix_query),
@@ -697,7 +697,7 @@ class RetrievalTool:
             "warnings": warnings,
         }
 
-    def _settings_equal(self, lhs: EmbedSettings, rhs: EmbedSettings) -> bool:
+    def _settings_equal(self, lhs: embeddings.EmbedSettings, rhs: embeddings.EmbedSettings) -> bool:
         return (
             lhs.backend == rhs.backend
             and lhs.model_name == rhs.model_name
@@ -726,7 +726,7 @@ class RetrievalTool:
             token in tokenizer for token in legacy_tokens
         )
 
-    def _settings_to_dict(self, settings: EmbedSettings) -> dict:
+    def _settings_to_dict(self, settings: embeddings.EmbedSettings) -> dict:
         return {
             "backend": settings.backend,
             "model": settings.model_name,
@@ -738,8 +738,8 @@ class RetrievalTool:
     def _build_encoder_info(
         self,
         doc_specs: Sequence[dict],
-        encoder: QueryEncoder | None,
-        active_settings: EmbedSettings,
+        encoder: embeddings.QueryEncoder | None,
+        active_settings: embeddings.EmbedSettings,
         *,
         warnings: Sequence[str],
         mode: str,
