@@ -1,33 +1,24 @@
-"""Lightweight import smoke tests for critical modules."""
-from __future__ import annotations
-
 import importlib
-import os
-import sys
 import traceback
+import sys
+import os
 from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+ROOT = Path(__file__).resolve().parents[1]
+ROOT_STR = str(ROOT)
+if ROOT_STR not in sys.path:
+    sys.path.insert(0, ROOT_STR)
 
 print("[smoke] cwd:", os.getcwd())
+print("[smoke] repo_root:", ROOT_STR)
 try:
-    module = importlib.import_module("app_core.panel_extract")
-    names = [name for name in dir(module) if not name.startswith("_")]
+    m = importlib.import_module("app_core.panel_extract")
+    names = [n for n in dir(m) if not n.startswith("_")]
+    print("[smoke] file:", getattr(m, "__file__", "<?>"))
     print("[smoke] exports:", sorted(names))
-    assert (
-        hasattr(module, "subset_needed")
-        or hasattr(module, "select_needed")
-        or hasattr(module, "get_required_subset")
-    )
-    assert (
-        hasattr(module, "NEEDED")
-        or hasattr(module, "REQUIRED_COLS")
-        or hasattr(module, "NEEDED_COLS")
-    )
-    print("[smoke] panel_extract OK")
+    assert any(hasattr(m, n) for n in ("subset_needed", "select_needed", "get_required_subset"))
+    assert any(hasattr(m, n) for n in ("NEEDED", "REQUIRED_COLS", "NEEDED_COLS"))
+    print("[smoke] OK")
 except Exception:
     traceback.print_exc()
     raise SystemExit(1)
