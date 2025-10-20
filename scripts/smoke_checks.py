@@ -14,9 +14,9 @@ if str(PROJECT_ROOT) not in sys.path:
 # ruff: noqa: E402
 import pandas as pd
 
-from app_core.formatters import merge_age_buckets, three_line_diagnosis
-from app_core.panel_extract import NEEDED, subset_needed
-from app_core.summary_blocks import pick_latest_baseline_trend_yoy
+import app_core.formatters as formatters
+import app_core.panel_extract as panel_extract
+import app_core.summary_blocks as summary_blocks
 import bigcon_2agent_mvp_v3 as agent2
 
 
@@ -52,10 +52,10 @@ def check_age_merge() -> None:
         }
     }
 
-    buckets = merge_age_buckets(agent1)
+    buckets = formatters.merge_age_buckets(agent1)
     _print("Age buckets", buckets)
 
-    lines = three_line_diagnosis(agent1)
+    lines = formatters.three_line_diagnosis(agent1)
     _print("Three-line diagnosis", lines)
 
 
@@ -82,10 +82,10 @@ def check_summary_blocks() -> None:
     }
     df = pd.DataFrame(raw)
 
-    subset = subset_needed(df)
-    assert list(subset.columns) == NEEDED
+    subset = panel_extract.subset_needed(df)
+    assert list(subset.columns) == panel_extract.NEEDED
 
-    summary = pick_latest_baseline_trend_yoy(subset, "m1")
+    summary = summary_blocks.pick_latest_baseline_trend_yoy(subset, "m1")
     required_keys = {"latest_ym", "age_top3", "flow", "kpi", "trend"}
     assert required_keys.issubset(summary)
     assert len(summary.get("age_top3") or []) <= 3
