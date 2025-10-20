@@ -1,104 +1,115 @@
 from __future__ import annotations
 
-import compileall
+# --- minimal safe import block (panel_extract) ---
+import sys, os, traceback
+from app_core.import_utils import ensure_repo_on_sys_path, import_or_raise
+
+ensure_repo_on_sys_path(__file__)
+
+try:
+    pe = import_or_raise("app_core.panel_extract")
+    NEEDED = getattr(pe, "NEEDED", None) \
+          or getattr(pe, "REQUIRED_COLS", None) \
+          or getattr(pe, "NEEDED_COLS", None)
+    subset_needed = getattr(pe, "subset_needed", None) \
+                 or getattr(pe, "select_needed", None) \
+                 or getattr(pe, "get_required_subset", None)
+    if NEEDED is None or subset_needed is None:
+        avail = [n for n in dir(pe) if not n.startswith("_")]
+        raise ImportError(f"[panel_extract] required symbols missing; avail={sorted(avail)} file={getattr(pe,'__file__','<?>')}")
+except Exception as e:
+    print("[import-fallback] panel_extract failed:", repr(e))
+    traceback.print_exc()
+    # keep the app alive with a minimal inline implementation
+    NEEDED = [
+        "ENCODED_MCT","TA_YM",
+        "M12_MAL_1020_RAT","M12_MAL_30_RAT","M12_MAL_40_RAT","M12_MAL_50_RAT","M12_MAL_60_RAT",
+        "M12_FME_1020_RAT","M12_FME_30_RAT","M12_FME_40_RAT","M12_FME_50_RAT","M12_FME_60_RAT",
+        "MCT_UE_CLN_REU_RAT","MCT_UE_CLN_NEW_RAT",
+        "RC_M1_SHC_RSD_UE_CLN_RAT","RC_M1_SHC_WP_UE_CLN_RAT","RC_M1_SHC_FLP_UE_CLN_RAT",
+    ]
+    def subset_needed(df):
+        missing = [c for c in NEEDED if c not in df.columns]
+        if missing:
+            raise KeyError(f"[panel_fallback] Missing required columns: {sorted(missing)}")
+        return df[NEEDED].copy()
+
+    def _fallback_pct(value):
+        try:
+            if value is None:
+                return None
+            val = float(value)
+        except Exception:
+            return None
+        if val < 0 or val > 100:
+            return None
+        return float(val)
+
+    def _fallback_latest_valid_row(df, mct_id, eps: float = 0.5):
+        import pandas as pd  # local import to avoid hard dependency at module import time
+
+        sub = df[df["ENCODED_MCT"].astype(str) == str(mct_id)].copy()
+        if sub.empty:
+            raise ValueError(f"[panel_fallback] No rows for ENCODED_MCT={mct_id}")
+
+        sub["__TA_YM_INT__"] = pd.to_numeric(sub["TA_YM"], errors="coerce").astype("Int64")
+        sub = sub.dropna(subset=["__TA_YM_INT__"])
+        if sub.empty:
+            raise ValueError("[panel_fallback] TA_YM not parseable")
+
+        sub = sub.sort_values("__TA_YM_INT__", ascending=False)
+        row = sub.iloc[0].copy()
+        row.attrs["guard_fallback"] = True
+        return row, int(row["__TA_YM_INT__"])
+
+    # register a synthetic module so downstream imports that depend on panel_extract keep working
+    from types import ModuleType
+
+    fallback_module = ModuleType("app_core.panel_extract")
+    fallback_module.__dict__.update(
+        {
+            "__file__": "<panel_extract_fallback>",
+            "__package__": "app_core",
+            "SAFE_COLS": {
+                "id": ["ENCODED_MCT"],
+                "period": ["TA_YM"],
+                "age_gender": [
+                    "M12_MAL_1020_RAT",
+                    "M12_MAL_30_RAT",
+                    "M12_MAL_40_RAT",
+                    "M12_MAL_50_RAT",
+                    "M12_MAL_60_RAT",
+                    "M12_FME_1020_RAT",
+                    "M12_FME_30_RAT",
+                    "M12_FME_40_RAT",
+                    "M12_FME_50_RAT",
+                    "M12_FME_60_RAT",
+                ],
+                "kpi": ["MCT_UE_CLN_REU_RAT", "MCT_UE_CLN_NEW_RAT"],
+                "flow": [
+                    "RC_M1_SHC_RSD_UE_CLN_RAT",
+                    "RC_M1_SHC_WP_UE_CLN_RAT",
+                    "RC_M1_SHC_FLP_UE_CLN_RAT",
+                ],
+            },
+            "NEEDED": NEEDED,
+            "NEEDED_COLS": NEEDED,
+            "REQUIRED_COLS": NEEDED,
+            "subset_needed": subset_needed,
+            "select_needed": subset_needed,
+            "get_required_subset": subset_needed,
+            "_pct": _fallback_pct,
+            "latest_valid_row": _fallback_latest_valid_row,
+        }
+    )
+    sys.modules.pop("app_core.panel_extract", None)
+    sys.modules["app_core.panel_extract"] = fallback_module
+# --- end minimal safe import block ---
+
 import json
-import os
-import sys
-import traceback
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-
-def _bootstrap_repo_path() -> str:
-    here = Path(__file__).resolve()
-    repo_root = here.parent
-    repo_str = str(repo_root)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
-    return repo_str
-
-
-_BOOTSTRAPPED_REPO = _bootstrap_repo_path()
-
-try:
-    import app_core.import_utils as import_utils
-except Exception as import_utils_error:  # pragma: no cover - defensive bootstrap
-    traceback.print_exc()
-    raise RuntimeError(
-        "Failed to import app_core.import_utils. Ensure the repository layout is intact."
-    ) from import_utils_error
-
-
-REPO_ROOT = import_utils.ensure_repo_on_sys_path(anchor_file=__file__, levels_up=1)
-
-
-def _compile_panel_extract_smoke() -> None:
-    panel_extract_path = Path(REPO_ROOT) / "app_core" / "panel_extract.py"
-    if not panel_extract_path.exists():
-        print(
-            "[import-debug] TODO: Provide the location of app_core/panel_extract.py;"
-            " computed path missing:",
-            panel_extract_path,
-        )
-        return
-    try:
-        compiled = compileall.compile_file(str(panel_extract_path), quiet=1)
-        if not compiled:
-            print(
-                "[import-debug] compileall did not succeed for",
-                panel_extract_path,
-            )
-    except Exception:  # pragma: no cover - diagnostics only
-        print("[import-debug] compileall raised an exception for", panel_extract_path)
-        traceback.print_exc()
-
-
-_compile_panel_extract_smoke()
-
-try:
-    panel_extract = import_utils.import_with_debug("app_core.panel_extract")
-except Exception as import_error:
-    hints = [
-        "Check case-sensitive paths on Linux (e.g., app_core vs App_core).",
-        "Verify app_core/__init__.py exists and is committed.",
-        "Confirm that panel_extract.py defines NEEDED and subset_needed exactly.",
-        "Run python scripts/smoke_imports.py and share the output.",
-    ]
-    hint_text = "\n".join(f"[import-hint] {hint}" for hint in hints)
-    raise ImportError(
-        "Unable to import app_core.panel_extract after path bootstrap.\n"
-        f"Repository root: {REPO_ROOT}\n"
-        f"{hint_text}"
-    ) from import_error
-
-AVAILABLE = sorted(n for n in dir(panel_extract) if not n.startswith("_"))
-
-_subset = (
-    getattr(panel_extract, "subset_needed", None)
-    or getattr(panel_extract, "select_needed", None)
-    or getattr(panel_extract, "get_required_subset", None)
-)
-if _subset is None:
-    raise ImportError(
-        "[panel_extract] Expected function not found. "
-        "Looked for subset_needed/select_needed/get_required_subset. "
-        f"Available: {AVAILABLE}"
-    )
-subset_needed = _subset
-
-_NEEDED = (
-    getattr(panel_extract, "NEEDED", None)
-    or getattr(panel_extract, "REQUIRED_COLS", None)
-    or getattr(panel_extract, "NEEDED_COLS", None)
-)
-if _NEEDED is None:
-    raise ImportError(
-        "[panel_extract] NEEDED (whitelist) missing. "
-        "Looked for NEEDED/REQUIRED_COLS/NEEDED_COLS. "
-        f"Available: {AVAILABLE}"
-    )
-NEEDED = _NEEDED
 
 import app_core.config as app_config
 import app_core.diagnostics as diagnostics
@@ -107,6 +118,8 @@ import app_core.formatters as formatters
 import app_core.summary_blocks as summary_blocks
 import pandas as pd
 import streamlit as st
+
+
 def _pick_best_chunk(
     chunks: list[dict] | None, metas: list[dict] | None
 ) -> Tuple[Any, Any]:
