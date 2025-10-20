@@ -547,13 +547,17 @@ def _collect_major_customers(agent1_json: dict) -> str:
     if not buckets:
         return "—"
     segments: list[str] = []
-    for bucket in buckets[:3]:
+    visible_limit = 3
+    for bucket in buckets[:visible_limit]:
         label = bucket.get("label") or bucket.get("key") or "—"
         value = bucket.get("value")
         if isinstance(value, (int, float)):
             segments.append(f"{label} {value:.1f}%")
         else:
             segments.append(f"{label} —")
+    hidden_count = max(0, len(buckets) - visible_limit)
+    if hidden_count:
+        segments.append(f"+ {hidden_count}개 더")
     return ", ".join(segments) if segments else "—"
 
 
@@ -1266,6 +1270,21 @@ def _build_debug_report_markdown(
     )
     if prompt_trace.get("rag_context_doc_ids"):
         lines.append(f"- rag doc_ids: {prompt_trace.get('rag_context_doc_ids')}")
+    lines.append(f"- length_policy: {prompt_trace.get('length_policy')}")
+    token_limit = prompt_trace.get("prompt_token_limit")
+    token_est = prompt_trace.get("prompt_tokens_est")
+    if token_est is not None:
+        limit_text = f" / limit={token_limit}" if token_limit else ""
+        max_out = prompt_trace.get("max_output_tokens")
+        max_out_text = f" max_out={max_out}" if max_out is not None else ""
+        lines.append(f"- prompt_tokens_est: {token_est}{limit_text}{max_out_text}")
+    notes = prompt_trace.get("truncation_notes")
+    if notes:
+        if isinstance(notes, (list, tuple)):
+            note_text = ", ".join(str(n) for n in notes)
+        else:
+            note_text = str(notes)
+        lines.append(f"- truncation_notes: {note_text}")
 
     response_trace = response_trace or {}
     lines.append("\n**Agent-2 Response Trace**")
@@ -1422,6 +1441,38 @@ def main() -> None:
     API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY", "")
     if not API_KEY:
         st.warning("GEMINI_API_KEY가 설정되지 않았습니다. (앱 설정의 App secrets에 등록하세요)")
+
+    st.sidebar.header("⚙️ 설정")
+    st.sidebar.slider(
+        "LLM 입력 토큰 한도",
+        min_value=512,
+        max_value=64000,
+        step=512,
+        value=int(st.session_state.get("llm_in_ctx", 8192)),
+        key="llm_in_ctx",
+    )
+    st.sidebar.slider(
+        "LLM 출력 토큰 한도",
+        min_value=256,
+        max_value=8192,
+        step=256,
+        value=int(st.session_state.get("llm_out_max", 2048)),
+        key="llm_out_max",
+    )
+    length_options = ["short", "balanced", "long"]
+    current_policy = st.session_state.get("llm_length_policy", "balanced")
+    policy_index = length_options.index(current_policy) if current_policy in length_options else 1
+    st.sidebar.selectbox(
+        "LLM 길이 정책",
+        options=length_options,
+        index=policy_index,
+        key="llm_length_policy",
+    )
+    st.sidebar.toggle(
+        "영문화 매핑 허용",
+        value=bool(st.session_state.get("panel_allow_alias", False)),
+        key="panel_allow_alias",
+    )
 
     # ===== 사이드바: 데이터 상태 =====
     st.sidebar.header("데이터 상태")

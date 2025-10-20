@@ -5,14 +5,16 @@
 import ast
 import datetime
 import json
+import math
 import os
 import random
 import re
+from dataclasses import dataclass
 from time import perf_counter
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -141,8 +143,13 @@ except ImportError:  # pragma: no cover - fallback when panel helpers are unavai
         "RC_M1_SHC_FLP_UE_CLN_RAT",
     ]
 
-    def extract_panel_for(df, mct_id):  # pragma: no cover - fallback path
+    def extract_panel_for(df, mct_id, *, allow_alias=False):  # pragma: no cover - fallback path
         raise RuntimeError("panel_extract module unavailable")
+
+try:  # pragma: no cover - optional UI dependency
+    import streamlit as st
+except ImportError:  # pragma: no cover - allow CLI usage
+    st = None
 
 __all__ = [
     "agent1_pipeline",
@@ -175,6 +182,102 @@ _SCHEMA_CACHE = None
 _SCHEMA_VALIDATOR = None
 AGENT2_PROMPT_TRACE: dict = {}
 AGENT2_RESPONSE_TRACE: dict = {}
+
+
+@dataclass
+class PromptSection:
+    name: str
+    text: str
+    priority: int
+    required: bool = False
+    min_policy: int = 0
+
+
+def _get_llm_preferences() -> Dict[str, Any]:
+    defaults = {
+        "in_ctx": 8192,
+        "out_max": 2048,
+        "length_policy": "balanced",
+    }
+    policy = defaults["length_policy"]
+    alias_flag = False
+    if st is not None:
+        try:
+            defaults["in_ctx"] = int(st.session_state.get("llm_in_ctx", defaults["in_ctx"]))
+            defaults["out_max"] = int(
+                st.session_state.get("llm_out_max", defaults["out_max"])
+            )
+            policy = st.session_state.get("llm_length_policy", policy)
+        except Exception:  # pragma: no cover - defensive UI guard
+            pass
+        alias_flag = bool(st.session_state.get("panel_allow_alias", False))
+    else:
+        raw_in = os.getenv("LLM_IN_CTX")
+        if raw_in:
+            try:
+                defaults["in_ctx"] = int(raw_in)
+            except ValueError:
+                pass
+        raw_out = os.getenv("LLM_OUT_MAX")
+        if raw_out:
+            try:
+                defaults["out_max"] = int(raw_out)
+            except ValueError:
+                pass
+        policy = os.getenv("LLM_LENGTH_POLICY", policy)
+        alias_env = os.getenv("LLM_ALLOW_ALIAS", "").strip().lower()
+        alias_flag = alias_env in {"1", "true", "yes", "on"}
+
+    defaults["in_ctx"] = max(512, min(64000, defaults["in_ctx"]))
+    defaults["out_max"] = max(256, min(8192, defaults["out_max"]))
+
+    if policy not in {"short", "balanced", "long"}:
+        policy = "balanced"
+    defaults["length_policy"] = policy
+    defaults["allow_alias"] = alias_flag
+    return defaults
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, math.ceil(len(text) / 4))
+
+
+def _render_sections_with_limit(
+    sections: Sequence[PromptSection],
+    token_limit: int,
+) -> tuple[str, List[str], List[str], int, bool]:
+    included = [section for section in sections if section.text]
+    removed: List[str] = []
+
+    def _compose(parts: Sequence[PromptSection]) -> str:
+        return "\n\n".join(part.text for part in parts if part.text)
+
+    prompt_text = _compose(included)
+    token_est = _estimate_tokens(prompt_text)
+    optional = sorted(
+        [sec for sec in included if not sec.required],
+        key=lambda sec: sec.priority,
+        reverse=True,
+    )
+    while token_limit and token_est > token_limit and optional:
+        dropped = optional.pop(0)
+        if dropped in included:
+            included.remove(dropped)
+            removed.append(dropped.name)
+            prompt_text = _compose(included)
+            token_est = _estimate_tokens(prompt_text)
+
+    truncated = False
+    if token_limit and token_est > token_limit:
+        max_chars = max(128, token_limit * 4)
+        prompt_text = prompt_text[:max_chars]
+        token_est = _estimate_tokens(prompt_text)
+        truncated = True
+
+    used_names = [section.name for section in included if section.text]
+    return prompt_text, used_names, removed, token_est, truncated
 
 
 def tick():
@@ -1418,7 +1521,7 @@ def subset_period(panel, months: int | None = None):
     thr = maxd - pd.Timedelta(days=31*months)
     return panel[panel['_date'] >= thr]
 
-def kpi_summary(panel_sub):
+def kpi_summary(panel_sub, *, allow_alias: bool = False):
     if panel_sub.empty:
         return {}, {'latest_raw_snapshot': None, 'sanitized_snapshot': None}
     latest_idx = panel_sub.groupby('_merchant_id')['_date'].idxmax()
@@ -1453,10 +1556,8 @@ def kpi_summary(panel_sub):
         if missing_cols:
             panel_error = f"missing_columns:{','.join(sorted(set(missing_cols)))}"
         else:
-            working = panel_sub[PANEL_NEEDED_COLUMNS].copy()
-            working['ENCODED_MCT'] = working['ENCODED_MCT'].astype(str)
             try:
-                safe_panel = extract_panel_for(working, merchant_id)
+                safe_panel = extract_panel_for(panel_sub, merchant_id, allow_alias=allow_alias)
             except Exception as exc:  # pragma: no cover - defensive guard
                 panel_error = str(exc)
     else:
@@ -1576,6 +1677,7 @@ def agent1_pipeline(
     shinhan_dir: str | os.PathLike[str] | None = None,
     external_dir: str | os.PathLike[str] | None = None,
 ):
+    preferences = _get_llm_preferences()
     if shinhan_dir is None:
         shinhan_dir = SHINHAN_DIR
     if external_dir is None:
@@ -1587,6 +1689,7 @@ def agent1_pipeline(
                 'USE_LLM': USE_LLM,
                 'DEBUG_MAX_PREVIEW': DEBUG_MAX_PREVIEW,
                 'DEBUG_SHOW_RAW': DEBUG_SHOW_RAW,
+                'ALLOW_ALIAS': preferences.get('allow_alias', False),
             },
         },
         'errors': [],
@@ -1728,6 +1831,7 @@ def agent1_pipeline(
         'elapsed_ms': panel_elapsed,
         'stats': panel_stats,
     })
+    panel_stage['allow_alias'] = preferences.get('allow_alias', False)
     debug_block['panel'] = panel_stage
 
     wxm = None
@@ -1738,7 +1842,7 @@ def agent1_pipeline(
         wxm = None
 
     snapshot_t0 = tick()
-    kpis, kpi_debug = kpi_summary(sub)
+    kpis, kpi_debug = kpi_summary(sub, allow_alias=preferences.get("allow_alias", False))
     snapshot_elapsed = to_ms(snapshot_t0)
 
     raw_snapshot = {}
@@ -2018,34 +2122,125 @@ def build_agent2_prompt_overhauled(
 
     rag_block, rag_reason = _summarise_rag_context(rag_context)
 
-    sections = [
-        "당신은 한국어 소상공인 컨설턴트입니다.",
-        f"question_type={inferred_type}",
-        f"질문 유형 설명: {info['label']}",
-        f"질문 원문: {question_text or '—'}",
-        "[출력 규칙]",
-        "- " + "\n- ".join(base_rules),
+    preferences = _get_llm_preferences()
+    policy = preferences.get("length_policy", "balanced")
+    out_max = int(preferences.get("out_max", 2048))
+    policy_levels = {"short": 0, "balanced": 1, "long": 2}
+    policy_level = policy_levels.get(policy, 1)
+
+    data_payload = agent1_json or {}
+    if policy_level == 0:
+        data_text = json.dumps(data_payload, ensure_ascii=False, separators=(",", ":"))
+    else:
+        data_text = json.dumps(data_payload, ensure_ascii=False, indent=2)
+
+    sections: List[PromptSection] = [
+        PromptSection(
+            name="role",
+            text="당신은 한국어 소상공인 컨설턴트입니다.",
+            priority=0,
+            required=True,
+        ),
+        PromptSection(
+            name="question_meta",
+            text="\n".join(
+                [
+                    f"question_type={inferred_type}",
+                    f"질문 유형 설명: {info['label']}",
+                    f"질문 원문: {question_text or '—'}",
+                ]
+            ),
+            priority=0,
+            required=True,
+        ),
+        PromptSection(
+            name="rules",
+            text="[출력 규칙]\n- " + "\n- ".join(base_rules),
+            priority=0,
+            required=True,
+        ),
+        PromptSection(
+            name="type_rules",
+            text="[질문 유형별 지침]\n- " + "\n- ".join(type_rules) if type_rules else "",
+            priority=15,
+            required=False,
+            min_policy=0,
+        ),
+        PromptSection(
+            name="schema",
+            text="[출력 스키마(JSON)]\n" + schema_text,
+            priority=0,
+            required=True,
+        ),
+        PromptSection(
+            name="data",
+            text="[데이터(JSON)]\n" + data_text,
+            priority=10,
+            required=True,
+        ),
     ]
 
-    if type_rules:
-        sections.append("[질문 유형별 지침]")
-        sections.append("- " + "\n- ".join(type_rules))
-
-    sections.append("[출력 스키마(JSON)]")
-    sections.append(schema_text)
-    sections.append("[데이터(JSON)]")
-    sections.append(json.dumps(agent1_json, ensure_ascii=False, indent=2))
-
     if rag_block:
-        sections.append("[RAG_CONTEXT]")
-        sections.append(rag_block)
+        sections.append(
+            PromptSection(
+                name="rag_context",
+                text="[RAG_CONTEXT]\n" + rag_block,
+                priority=25,
+                required=False,
+                min_policy=1,
+            )
+        )
     elif rag_reason:
-        sections.append(f"[RAG 참고 메모]\n- {rag_reason}")
+        sections.append(
+            PromptSection(
+                name="rag_note",
+                text=f"[RAG 참고 메모]\n- {rag_reason}",
+                priority=25,
+                required=False,
+                min_policy=1,
+            )
+        )
 
-    sections.append("[응답 형식]")
-    sections.append("JSON만 출력하세요. 마크다운/설명/코드블럭 금지. 문자열 내 줄바꿈은 \\n으로 표기하세요.")
+    if policy_level >= 2:
+        debug_extra: list[str] = []
+        debug_block = (agent1_json or {}).get("debug")
+        if isinstance(debug_block, dict):
+            sanitized = debug_block.get("sanitized_snapshot")
+            if sanitized:
+                debug_extra.append(
+                    json.dumps({"sanitized_snapshot": sanitized}, ensure_ascii=False, indent=2)
+                )
+            panel_warn = debug_block.get("panel_warnings")
+            if panel_warn:
+                debug_extra.append("panel_warnings=" + ", ".join(map(str, panel_warn)))
+        if debug_extra:
+            sections.append(
+                PromptSection(
+                    name="debug_extra",
+                    text="[추가 컨텍스트]\n" + "\n".join(debug_extra),
+                    priority=30,
+                    required=False,
+                    min_policy=2,
+                )
+            )
 
-    guide = "\n\n".join(sections)
+    sections.append(
+        PromptSection(
+            name="response_format",
+            text=(
+                "[응답 형식]\n"
+                "JSON만 출력하세요. 마크다운/설명/코드블럭 금지. 문자열 내 줄바꿈은 \\n으로 표기하세요."
+            ),
+            priority=0,
+            required=True,
+        )
+    )
+
+    eligible_sections = [sec for sec in sections if policy_level >= sec.min_policy]
+    guide, used_sections, removed_sections, token_est, truncated = _render_sections_with_limit(
+        eligible_sections,
+        int(preferences.get("in_ctx", 8192)),
+    )
     schema_keys = []
     if isinstance(schema_obj, dict) and isinstance(schema_obj.get("properties"), dict):
         schema_keys = sorted(schema_obj["properties"].keys())
@@ -2058,6 +2253,12 @@ def build_agent2_prompt_overhauled(
         rag_threshold = rag_context.get("threshold")
         rag_max_score = rag_context.get("max_score")
         rag_mode = rag_context.get("mode")
+    truncation_notes: List[str] = []
+    if removed_sections:
+        truncation_notes.append("removed:" + ",".join(removed_sections))
+    if truncated:
+        truncation_notes.append("tail_trimmed")
+
     global AGENT2_PROMPT_TRACE
     AGENT2_PROMPT_TRACE = {
         "question_type": inferred_type,
@@ -2069,6 +2270,15 @@ def build_agent2_prompt_overhauled(
         "rag_threshold": rag_threshold,
         "rag_max_score": rag_max_score,
         "rag_mode": rag_mode,
+        "length_policy": policy,
+        "prompt_sections_used": used_sections,
+        "prompt_sections_removed": removed_sections,
+        "prompt_tokens_est": token_est,
+        "prompt_token_limit": int(preferences.get("in_ctx", 8192)),
+        "prompt_truncated": truncated,
+        "prompt_char_len": len(guide),
+        "max_output_tokens": out_max,
+        "truncation_notes": truncation_notes,
     }
     return guide
 
@@ -2087,6 +2297,11 @@ def call_gemini_agent2_overhauled(
 
     if kwargs:
         _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841 - reserved for debugging
+
+    preferences = _get_llm_preferences()
+    in_ctx = int(preferences.get("in_ctx", 8192))
+    out_max = int(preferences.get("out_max", 2048))
+    length_policy = preferences.get("length_policy", "balanced")
 
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
@@ -2129,7 +2344,7 @@ def call_gemini_agent2_overhauled(
         "temperature": 0.2,
         "top_p": 0.1,
         "top_k": 32,
-        "max_output_tokens": 2048,
+        "max_output_tokens": out_max,
     }
 
     prompt_payload = (prompt_text or "").rstrip()
@@ -2158,6 +2373,13 @@ def call_gemini_agent2_overhauled(
         "schema_error": schema_error,
         "prompt_length": len(prompt_payload),
         "attempts": [],
+        "input_token_limit": in_ctx,
+        "length_policy": length_policy,
+        "prompt_tokens_est": AGENT2_PROMPT_TRACE.get("prompt_tokens_est"),
+        "truncation_notes": AGENT2_PROMPT_TRACE.get("truncation_notes"),
+        "prompt_sections_used": AGENT2_PROMPT_TRACE.get("prompt_sections_used"),
+        "prompt_sections_removed": AGENT2_PROMPT_TRACE.get("prompt_sections_removed"),
+        "max_output_tokens": out_max,
     }
 
     def _extract_text(resp) -> str:
