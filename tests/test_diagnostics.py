@@ -5,7 +5,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app_core.diagnostics import build_analyst_summary_text
+import app_core.diagnostics as diagnostics
 
 
 def test_baseline_summary_length_and_format():
@@ -20,7 +20,7 @@ def test_baseline_summary_length_and_format():
             "revisit_rate_avg": 0.51,
         }
     }
-    text = build_analyst_summary_text(sample, "가*", use_llm=False)
+    text = diagnostics.build_analyst_summary_text(sample, "가*", use_llm=False)
     assert isinstance(text, str)
     assert 600 <= len(text) <= 1000
     assert "```" not in text
@@ -28,7 +28,7 @@ def test_baseline_summary_length_and_format():
 
 
 def test_baseline_summary_handles_missing_values():
-    text = build_analyst_summary_text({}, None, use_llm=False)
+    text = diagnostics.build_analyst_summary_text({}, None, use_llm=False)
     assert isinstance(text, str)
     assert len(text) > 0
     assert "\n" not in text

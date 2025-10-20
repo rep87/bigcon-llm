@@ -1,29 +1,110 @@
 from __future__ import annotations
 
+import compileall
 import json
 import os
+import sys
 import traceback
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from app_core.config import get_flag, get_setting
-from app_core.failsoft import (
-    compose_fail_soft_answer,
-    external_adapter,
-    rag_adapter,
-    structured_adapter,
-    weather_adapter,
-)
-from app_core.diagnostics import build_analyst_summary_text
-from app_core.formatters import (
-    get_age_bucket_details,
-    merge_age_buckets,
-    to_float_pct,
-)
-from app_core.panel_extract import NEEDED, subset_needed
-from app_core.summary_blocks import pick_latest_baseline_trend_yoy
 
+def _bootstrap_repo_path() -> str:
+    here = Path(__file__).resolve()
+    repo_root = here.parent
+    repo_str = str(repo_root)
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
+    return repo_str
+
+
+_BOOTSTRAPPED_REPO = _bootstrap_repo_path()
+
+try:
+    import app_core.import_utils as import_utils
+except Exception as import_utils_error:  # pragma: no cover - defensive bootstrap
+    traceback.print_exc()
+    raise RuntimeError(
+        "Failed to import app_core.import_utils. Ensure the repository layout is intact."
+    ) from import_utils_error
+
+
+REPO_ROOT = import_utils.ensure_repo_on_sys_path(anchor_file=__file__, levels_up=1)
+
+
+def _compile_panel_extract_smoke() -> None:
+    panel_extract_path = Path(REPO_ROOT) / "app_core" / "panel_extract.py"
+    if not panel_extract_path.exists():
+        print(
+            "[import-debug] TODO: Provide the location of app_core/panel_extract.py;"
+            " computed path missing:",
+            panel_extract_path,
+        )
+        return
+    try:
+        compiled = compileall.compile_file(str(panel_extract_path), quiet=1)
+        if not compiled:
+            print(
+                "[import-debug] compileall did not succeed for",
+                panel_extract_path,
+            )
+    except Exception:  # pragma: no cover - diagnostics only
+        print("[import-debug] compileall raised an exception for", panel_extract_path)
+        traceback.print_exc()
+
+
+_compile_panel_extract_smoke()
+
+try:
+    panel_extract = import_utils.import_with_debug("app_core.panel_extract")
+except Exception as import_error:
+    hints = [
+        "Check case-sensitive paths on Linux (e.g., app_core vs App_core).",
+        "Verify app_core/__init__.py exists and is committed.",
+        "Confirm that panel_extract.py defines NEEDED and subset_needed exactly.",
+        "Run python scripts/smoke_imports.py and share the output.",
+    ]
+    hint_text = "\n".join(f"[import-hint] {hint}" for hint in hints)
+    raise ImportError(
+        "Unable to import app_core.panel_extract after path bootstrap.\n"
+        f"Repository root: {REPO_ROOT}\n"
+        f"{hint_text}"
+    ) from import_error
+
+AVAILABLE = sorted(n for n in dir(panel_extract) if not n.startswith("_"))
+
+_subset = (
+    getattr(panel_extract, "subset_needed", None)
+    or getattr(panel_extract, "select_needed", None)
+    or getattr(panel_extract, "get_required_subset", None)
+)
+if _subset is None:
+    raise ImportError(
+        "[panel_extract] Expected function not found. "
+        "Looked for subset_needed/select_needed/get_required_subset. "
+        f"Available: {AVAILABLE}"
+    )
+subset_needed = _subset
+
+_NEEDED = (
+    getattr(panel_extract, "NEEDED", None)
+    or getattr(panel_extract, "REQUIRED_COLS", None)
+    or getattr(panel_extract, "NEEDED_COLS", None)
+)
+if _NEEDED is None:
+    raise ImportError(
+        "[panel_extract] NEEDED (whitelist) missing. "
+        "Looked for NEEDED/REQUIRED_COLS/NEEDED_COLS. "
+        f"Available: {AVAILABLE}"
+    )
+NEEDED = _NEEDED
+
+import app_core.config as app_config
+import app_core.diagnostics as diagnostics
+import app_core.failsoft as failsoft
+import app_core.formatters as formatters
+import app_core.summary_blocks as summary_blocks
 import pandas as pd
 import streamlit as st
 def _pick_best_chunk(
@@ -68,9 +149,9 @@ def _render_main_views(
     debug_mode = _is_debug_mode()
     show_debug_panel = _is_debug_panel_visible()
     flags_snapshot = st.session_state.get("_data_flags", {}).copy()
-    structured_payload = structured_adapter(agent1_payload)
-    weather_payload = weather_adapter(question_text, enabled=flags_snapshot.get("use_weather", False))
-    external_payload = external_adapter(question_text, enabled=flags_snapshot.get("use_external", False))
+    structured_payload = failsoft.structured_adapter(agent1_payload)
+    weather_payload = failsoft.weather_adapter(question_text, enabled=flags_snapshot.get("use_weather", False))
+    external_payload = failsoft.external_adapter(question_text, enabled=flags_snapshot.get("use_external", False))
     if rag_info_override is not None:
         rag_info = rag_info_override
     else:
@@ -86,7 +167,7 @@ def _render_main_views(
     st.session_state['_latest_rag_info'] = rag_info
     st.session_state['_latest_rag_prompt_context'] = _prepare_rag_prompt_context(rag_info)
 
-    fail_soft_payload = compose_fail_soft_answer(
+    fail_soft_payload = failsoft.compose_fail_soft_answer(
         question_text,
         structured_payload,
         weather_payload,
@@ -245,7 +326,7 @@ def render_debug_view(agent1_json: dict | None, show_raw: bool | None = None) ->
     if not sanitized_df.empty:
         st.caption("정규화(sanitized)")
         st.table(sanitized_df)
-    age_details = get_age_bucket_details(agent1_json or {})
+    age_details = formatters.get_age_bucket_details(agent1_json or {})
     if age_details:
         st.caption("연령 분포 결정")
         st.table(pd.DataFrame(age_details))
@@ -505,11 +586,11 @@ def _format_pp_delta(value: Any) -> str:
 
 
 def _resolve_panel_path() -> Path:
-    override = get_setting("PANEL_CSV_PATH", None)
+    override = app_config.get_setting("PANEL_CSV_PATH", None)
     if override:
         return Path(str(override)).expanduser()
 
-    data_root = get_setting("DATA_DIR", None)
+    data_root = app_config.get_setting("DATA_DIR", None)
     base = Path(str(data_root)).expanduser() if data_root else Path("data")
     return (base / "shinhan" / "big_data_set3_f.csv").expanduser()
 
@@ -536,7 +617,7 @@ def _get_panel_dataframe() -> pd.DataFrame | None:
 
 
 def _collect_major_customers(agent1_json: dict) -> str:
-    buckets = merge_age_buckets(agent1_json or {})
+    buckets = formatters.merge_age_buckets(agent1_json or {})
     if not buckets:
         return "—"
     segments: list[str] = []
@@ -617,7 +698,7 @@ def _collect_overview_row(
         try:
             subset = panel_df[panel_df["ENCODED_MCT"] == merchant_id]
             if not subset.empty:
-                panel_summary = pick_latest_baseline_trend_yoy(subset, merchant_id)
+                panel_summary = summary_blocks.pick_latest_baseline_trend_yoy(subset, merchant_id)
         except Exception:
             panel_summary = None
 
@@ -862,7 +943,7 @@ def render_summary_view(
         or context.get("merchant_mask")
         or merchant_title
     )
-    summary_text = build_analyst_summary_text(
+    summary_text = diagnostics.build_analyst_summary_text(
         agent1_json or {},
         merchant_mask=merchant_mask_value,
         use_llm=bool(st.session_state.get("use_llm_analyst", True)),
@@ -977,14 +1058,14 @@ def render_summary_view(
                     st.markdown(f"{idx}. {preview}")
                 with cols[1]:
                     _render_evidence_badge(chunk, meta)
-DEFAULT_DEBUG_SHOW_RAW = get_flag("DEBUG_SHOW_RAW", True)
+DEFAULT_DEBUG_SHOW_RAW = app_config.get_flag("DEBUG_SHOW_RAW", True)
 DEBUG_SHOW_RAW = DEFAULT_DEBUG_SHOW_RAW
 
 
 DEFAULT_RAG_ROOT = "data/rag"
-RAG_ROOT = str(get_setting("RAG_ROOT", DEFAULT_RAG_ROOT))
-RAG_EMBED_VERSION = str(get_setting("RAG_EMBED_VERSION", "embed_v1"))
-_DEFAULT_APP_MODE = str(get_setting("APP_MODE", "public")).lower()
+RAG_ROOT = str(app_config.get_setting("RAG_ROOT", DEFAULT_RAG_ROOT))
+RAG_EMBED_VERSION = str(app_config.get_setting("RAG_EMBED_VERSION", "embed_v1"))
+_DEFAULT_APP_MODE = str(app_config.get_setting("APP_MODE", "public")).lower()
 if _DEFAULT_APP_MODE not in {"public", "debug"}:
     _DEFAULT_APP_MODE = "public"
 DEFAULT_QUESTION = "{페로**********} 카페의 주요 방문 고객 특성에 따른 마케팅 채널 추천 및 홍보안을 작성"
@@ -1097,7 +1178,7 @@ def _compute_rag_info(question_text: str, flags_snapshot: Dict[str, Any]) -> Dic
     rag_mode = str(flags_snapshot.get("rag_mode", "auto"))
     rag_threshold = float(flags_snapshot.get("rag_threshold", 0.35))
     rag_top_k = int(flags_snapshot.get("rag_top_k", 5))
-    return rag_adapter(
+    return failsoft.rag_adapter(
         question_text,
         RETRIEVAL_TOOL,
         enabled=rag_requested and bool(selected_docs),
@@ -1189,7 +1270,7 @@ _DEBUG_M_KEYS = ["M", "m", "MAL", "male", "남", "남성"]
 
 
 def _format_debug_pct(value: Any) -> str:
-    pct, hint = to_float_pct(value)
+    pct, hint = formatters.to_float_pct(value)
     if pct is None:
         return f"{value!r} ({hint})"
     return f"{pct:.1f}% ({hint})"
@@ -1288,7 +1369,7 @@ def _build_debug_report_markdown(
             lines.append(f"    - {note}")
 
     lines.append("\n**Age Merge Decision**")
-    age_details = get_age_bucket_details(agent1_json or {})
+    age_details = formatters.get_age_bucket_details(agent1_json or {})
     if age_details:
         for item in age_details:
             final_val = item.get("final_value")
