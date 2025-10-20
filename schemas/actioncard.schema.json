@@ -1,89 +1,246 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ActionCardResponse",
-  "type": "object",
-  "required": ["recommendations"],
-  "properties": {
-    "recommendations": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "object",
-        "required": [
-          "title",
-          "what",
-          "when",
-          "where",
-          "how",
-          "copy",
-          "kpi",
-          "risks",
-          "checklist",
-          "evidence"
-        ],
-        "properties": {
-          "title": {"type": "string"},
-          "what": {"type": "string"},
-          "when": {"type": "string"},
-          "where": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1
-          },
-          "how": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1
-          },
-          "copy": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "maxItems": 3
-          },
-          "kpi": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Agent2SchemaBundle",
+    "version": "2025-Organizer-Public",
+    "schemas": {
+        "organizer": {
             "type": "object",
-            "required": ["target", "expected_uplift", "range"],
+            "required": [
+                "answers"
+            ],
             "properties": {
-              "target": {"type": "string"},
-              "expected_uplift": {
-                "anyOf": [
-                  {"type": "number"},
-                  {"type": "null"}
-                ]
-              },
-              "range": {
-                "type": "array",
-                "minItems": 2,
-                "maxItems": 2,
-                "items": {
-                  "anyOf": [
-                    {"type": "number"},
-                    {"type": "null"}
-                  ]
+                "answers": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "idea_title",
+                            "audience",
+                            "channels",
+                            "execution",
+                            "copy_samples",
+                            "measurement",
+                            "evidence"
+                        ],
+                        "properties": {
+                            "idea_title": {
+                                "type": "string"
+                            },
+                            "audience": {
+                                "type": "string"
+                            },
+                            "channels": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            },
+                            "execution": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            },
+                            "copy_samples": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            },
+                            "measurement": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            },
+                            "evidence": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "required": [
+                                        "source"
+                                    ],
+                                    "properties": {
+                                        "source": {
+                                            "type": "string",
+                                            "enum": [
+                                                "STRUCTURED",
+                                                "RAG"
+                                            ]
+                                        },
+                                        "key": {
+                                            "type": "string"
+                                        },
+                                        "value": {
+                                            "type": [
+                                                "string",
+                                                "number",
+                                                "null"
+                                            ]
+                                        },
+                                        "period": {
+                                            "type": [
+                                                "string",
+                                                "null"
+                                            ]
+                                        },
+                                        "snippet": {
+                                            "type": [
+                                                "string",
+                                                "null"
+                                            ]
+                                        },
+                                        "doc_id": {
+                                            "type": [
+                                                "string",
+                                                "null"
+                                            ]
+                                        },
+                                        "score": {
+                                            "type": [
+                                                "number",
+                                                "null"
+                                            ]
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "additionalProperties": false
+                    }
                 }
-              }
-            }
-          },
-          "risks": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1
-          },
-          "checklist": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1
-          },
-          "evidence": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1
-          }
+            },
+            "additionalProperties": false
         },
-        "additionalProperties": false
-      }
+        "legacy": {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "ActionCardResponse",
+            "type": "object",
+            "required": [
+                "recommendations"
+            ],
+            "properties": {
+                "recommendations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "title",
+                            "what",
+                            "when",
+                            "where",
+                            "how",
+                            "copy",
+                            "kpi",
+                            "risks",
+                            "checklist",
+                            "evidence"
+                        ],
+                        "properties": {
+                            "title": {
+                                "type": "string"
+                            },
+                            "what": {
+                                "type": "string"
+                            },
+                            "when": {
+                                "type": "string"
+                            },
+                            "where": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            },
+                            "how": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            },
+                            "copy": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1,
+                                "maxItems": 3
+                            },
+                            "kpi": {
+                                "type": "object",
+                                "required": [
+                                    "target",
+                                    "expected_uplift",
+                                    "range"
+                                ],
+                                "properties": {
+                                    "target": {
+                                        "type": "string"
+                                    },
+                                    "expected_uplift": {
+                                        "anyOf": [
+                                            {
+                                                "type": "number"
+                                            },
+                                            {
+                                                "type": "null"
+                                            }
+                                        ]
+                                    },
+                                    "range": {
+                                        "type": "array",
+                                        "minItems": 2,
+                                        "maxItems": 2,
+                                        "items": {
+                                            "anyOf": [
+                                                {
+                                                    "type": "number"
+                                                },
+                                                {
+                                                    "type": "null"
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            },
+                            "risks": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            },
+                            "checklist": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            },
+                            "evidence": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "minItems": 1
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "additionalProperties": false
+        }
     }
-  },
-  "additionalProperties": false
 }

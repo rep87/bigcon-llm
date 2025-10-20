@@ -2,13 +2,161 @@
 # BIGCON 2-Agent MVP (Colab, Gemini API) — v3 (fits actual 3-dataset structure)
 # %pip -q install google-generativeai pandas openpyxl
 
-import os, json, re, random, sys, glob, datetime
+import ast
+import datetime
+import json
+import os
+import random
+import re
+from time import perf_counter
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
-import pandas as pd
+from typing import Any, Dict, List
+
 import numpy as np
-from jsonschema import Draft7Validator, ValidationError
+import pandas as pd
+from jsonschema import Draft7Validator
+
+try:
+    from app_core.formatters import merge_age_buckets, to_float_pct
+except ImportError:  # pragma: no cover - fallback for deployments without ``app_core`` package
+    def to_float_pct(value):
+        """Simplified percentage parser returning ``(value, hint)`` like the shared helper."""
+
+        if value is None:
+            return None, "none"
+        if isinstance(value, bool):
+            return None, "bad"
+
+        hint = "p100"
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+        else:
+            text = str(value).strip().replace("%", "").replace(",", "")
+            if not text:
+                return None, "none"
+            hint = "str"
+            try:
+                numeric = float(text)
+            except (TypeError, ValueError):
+                return None, "bad"
+
+        if numeric is None:
+            return None, "bad"
+        if 0.0 <= numeric <= 1.0:
+            numeric *= 100.0
+            hint = "p1"
+        if numeric < 0.0 or numeric > 100.0:
+            return None, "bad"
+        return round(numeric, 1), hint
+
+    def merge_age_buckets(agent1):
+        """Minimal fallback that prefers combined buckets and sums gender splits when necessary."""
+
+        agent1 = agent1 or {}
+        combined = agent1.get("age_distribution") or {}
+        by_gender = agent1.get("age_by_gender") or agent1.get("age_gender") or {}
+        label_map = {
+            "1020": "10‒20대",
+            "2029": "20대",
+            "2030": "20‒30대",
+            "3039": "30대",
+            "30": "30대",
+            "3040": "30‒40대",
+            "4049": "40대",
+            "40": "40대",
+            "4050": "40‒50대",
+            "5059": "50대",
+            "50": "50대",
+            "60": "60대",
+            "60+": "60대+",
+            "60_plus": "60대+",
+        }
+
+        keys = sorted({str(k) for k in list(combined.keys()) + list(by_gender.keys())})
+        records = []
+
+        for key in keys:
+            label = label_map.get(key, key)
+            value = None
+            source = None
+            if key in combined:
+                value, _ = to_float_pct(combined.get(key))
+                if value is not None:
+                    source = "combined"
+            if value is None:
+                mapping = by_gender.get(key) or {}
+                f_value = None
+                for alias in ("F", "f", "FME", "female", "여", "여성"):
+                    if alias in mapping:
+                        f_value, _ = to_float_pct(mapping[alias])
+                        break
+                m_value = None
+                for alias in ("M", "m", "MAL", "male", "남", "남성"):
+                    if alias in mapping:
+                        m_value, _ = to_float_pct(mapping[alias])
+                        break
+                if f_value is not None and m_value is not None:
+                    total = f_value + m_value
+                    if 0.0 <= total <= 100.0:
+                        value = round(total, 1)
+                        source = "F+M"
+            if value is not None:
+                records.append(
+                    {
+                        "key": key,
+                        "label": label,
+                        "value": value,
+                        "source": source or "combined",
+                    }
+                )
+
+        records.sort(key=lambda item: item["value"], reverse=True)
+        return records
+
+try:
+    from app_core.panel_extract import (
+        NEEDED as PANEL_NEEDED_COLUMNS,
+        extract_panel_for,
+    )
+except ImportError:  # pragma: no cover - fallback when panel helpers are unavailable
+    PANEL_NEEDED_COLUMNS = [
+        "ENCODED_MCT",
+        "TA_YM",
+        "M12_MAL_1020_RAT",
+        "M12_MAL_30_RAT",
+        "M12_MAL_40_RAT",
+        "M12_MAL_50_RAT",
+        "M12_MAL_60_RAT",
+        "M12_FME_1020_RAT",
+        "M12_FME_30_RAT",
+        "M12_FME_40_RAT",
+        "M12_FME_50_RAT",
+        "M12_FME_60_RAT",
+        "MCT_UE_CLN_REU_RAT",
+        "MCT_UE_CLN_NEW_RAT",
+        "RC_M1_SHC_RSD_UE_CLN_RAT",
+        "RC_M1_SHC_WP_UE_CLN_RAT",
+        "RC_M1_SHC_FLP_UE_CLN_RAT",
+    ]
+
+    def extract_panel_for(df, mct_id):  # pragma: no cover - fallback path
+        raise RuntimeError("panel_extract module unavailable")
+
+__all__ = [
+    "agent1_pipeline",
+    "build_agent2_prompt",
+    "build_agent2_prompt_overhauled",
+    "call_gemini_agent2",
+    "call_gemini_agent2_overhauled",
+    "infer_question_type",
+    "load_actioncard_schema",
+    "load_actioncard_schema_current",
+    "AGENT2_PROMPT_TRACE",
+    "AGENT2_RESPONSE_TRACE",
+    "llm_json_safe_parse",
+]
 
 APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / 'data'
@@ -24,6 +172,526 @@ random.seed(SEED); np.random.seed(SEED)
 
 _SCHEMA_CACHE = None
 _SCHEMA_VALIDATOR = None
+AGENT2_PROMPT_TRACE: dict = {}
+AGENT2_RESPONSE_TRACE: dict = {}
+
+
+def tick():
+    return perf_counter()
+
+
+def to_ms(t0):
+    return int((perf_counter() - t0) * 1000)
+
+
+def _env_flag(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value if value is not None else default
+
+
+def _strip_code_fences(text: str) -> str:
+    if not text:
+        return ""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines)
+    return stripped.strip()
+
+
+def _estimate_token_length(text: str) -> int:
+    """Rough token estimator using character and whitespace heuristics."""
+
+    if not text:
+        return 0
+    tokens_by_space = len(re.findall(r"\S+", text))
+    tokens_by_char = max(1, len(text) // 4)
+    return max(tokens_by_space, tokens_by_char)
+
+
+def _shrink_agent1_payload(agent1_json: dict | None) -> dict:
+    """Return a compact subset of the Agent-1 payload for prompt fallback."""
+
+    if not isinstance(agent1_json, dict):
+        return {}
+
+    keep_keys = [
+        "context",
+        "kpis",
+        "snapshot",
+        "summary",
+        "render",
+    ]
+    compact: Dict[str, Any] = {}
+    for key in keep_keys:
+        if key in agent1_json:
+            compact[key] = agent1_json[key]
+
+    debug_block = agent1_json.get("debug")
+    if isinstance(debug_block, dict):
+        allowed_debug_keys = {"snapshot", "sanitized_snapshot", "panel"}
+        debug_subset = {
+            key: debug_block[key]
+            for key in allowed_debug_keys
+            if key in debug_block
+        }
+        if debug_subset:
+            compact.setdefault("debug", {}).update(debug_subset)
+
+    return compact
+
+
+def _json_error_window(text: str, exc: Exception, radius: int = 120) -> str:
+    pos = getattr(exc, "pos", None)
+    if pos is None and isinstance(exc, json.JSONDecodeError):
+        pos = exc.pos
+    if pos is None:
+        return ""
+    start = max(pos - radius, 0)
+    end = min(len(text), pos + radius)
+    return text[start:end]
+
+
+def _extract_json_candidate(text: str) -> tuple[str | None, int | None]:
+    if not text:
+        return None, None
+    cleaned = _strip_code_fences(text)
+    start = cleaned.find("{")
+    while start != -1:
+        depth = 0
+        for idx in range(start, len(cleaned)):
+            ch = cleaned[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    snippet = cleaned[start : idx + 1]
+                    return snippet, start
+        start = cleaned.find("{", start + 1)
+    return None, None
+
+
+def _apply_json_repairs(text: str) -> list[str]:
+    candidates: list[str] = []
+    if not text:
+        return candidates
+    base = text.strip()
+    seen = set()
+
+    def _push(value: str):
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append(value)
+
+    _push(base)
+    repaired = re.sub(r",\s*(\]|\})", r"\1", base)
+    _push(repaired)
+    repaired = re.sub(r"'", '"', repaired)
+    repaired = re.sub(r"\bNaN\b", "null", repaired)
+    repaired = re.sub(r"\bInfinity\b", "null", repaired)
+    repaired = re.sub(r"\b-?inf\b", "null", repaired, flags=re.IGNORECASE)
+    _push(repaired)
+    return candidates
+
+
+def _attempt_literal_eval(text: str):
+    try:
+        value = ast.literal_eval(text)
+    except Exception:
+        return None
+    try:
+        return json.loads(json.dumps(value))
+    except Exception:
+        return None
+
+
+def llm_json_safe_parse(text: str, schema_validator: Draft7Validator | None = None):
+    logs: list[dict] = []
+    if text is None:
+        logs.append({"pass": "strict", "success": False, "error": "empty_response"})
+        return None, logs
+
+    cleaned = text.strip()
+    if not cleaned:
+        logs.append({"pass": "strict", "success": False, "error": "empty_response"})
+        return None, logs
+
+    def _validate(obj):
+        if schema_validator is not None:
+            schema_validator.validate(obj)
+
+    # Strict pass ---------------------------------------------------------
+    try:
+        parsed = json.loads(cleaned)
+        _validate(parsed)
+        logs.append({"pass": "strict", "success": True})
+        return parsed, logs
+    except Exception as exc:
+        entry = {"pass": "strict", "success": False, "error": str(exc)}
+        if isinstance(exc, json.JSONDecodeError):
+            entry.update({"line": exc.lineno, "col": exc.colno, "excerpt": _json_error_window(cleaned, exc)})
+        logs.append(entry)
+
+    # Extract pass --------------------------------------------------------
+    snippet, offset = _extract_json_candidate(cleaned)
+    if snippet:
+        try:
+            parsed = json.loads(snippet)
+            _validate(parsed)
+            logs.append({"pass": "extract", "success": True, "offset": offset})
+            return parsed, logs
+        except Exception as exc:
+            entry = {"pass": "extract", "success": False, "error": str(exc), "offset": offset}
+            if isinstance(exc, json.JSONDecodeError):
+                entry.update({"line": exc.lineno, "col": exc.colno, "excerpt": _json_error_window(snippet, exc)})
+            logs.append(entry)
+    else:
+        logs.append({"pass": "extract", "success": False, "error": "candidate_not_found"})
+
+    candidate = snippet or cleaned
+
+    # Repair pass ---------------------------------------------------------
+    for idx, variant in enumerate(_apply_json_repairs(candidate)):
+        try:
+            parsed = json.loads(variant)
+            _validate(parsed)
+            logs.append({"pass": "repair", "success": True, "variant": idx})
+            return parsed, logs
+        except Exception as exc:
+            entry = {"pass": "repair", "success": False, "variant": idx, "error": str(exc)}
+            if isinstance(exc, json.JSONDecodeError):
+                entry.update({"line": exc.lineno, "col": exc.colno, "excerpt": _json_error_window(variant, exc)})
+            logs.append(entry)
+
+    literal_candidate = _attempt_literal_eval(candidate)
+    if literal_candidate is not None:
+        try:
+            _validate(literal_candidate)
+            logs.append({"pass": "literal_eval", "success": True})
+            return literal_candidate, logs
+        except Exception as exc:
+            logs.append({"pass": "literal_eval", "success": False, "error": str(exc)})
+
+    return None, logs
+
+
+def _coerce_to_answers(payload: dict | None) -> dict | None:
+    """Ensure Agent-2 payload exposes an ``answers`` array for downstream logic."""
+
+    if not isinstance(payload, dict):
+        return payload
+
+    if "answers" in payload or "recommendations" not in payload:
+        return payload
+
+    coerced = dict(payload)
+    coerced["answers"] = payload.get("recommendations")
+    return coerced
+
+
+def _structured_value(agent1_json: dict | None, key: str) -> tuple[float | None, str | None]:
+    agent1_json = agent1_json or {}
+    debug = agent1_json.get("debug") or {}
+    snapshot = debug.get("snapshot") or {}
+    sanitized = snapshot.get("sanitized") or {}
+    kpis = agent1_json.get("kpis") or {}
+    raw_value = sanitized.get(key, kpis.get(key))
+    value, _ = to_float_pct(raw_value)
+    return value, sanitized.get("latest_ta_ym") or debug.get("panel", {}).get("latest_ta_ym")
+
+
+def _structured_evidence_entry(
+    key: str,
+    value: float | None,
+    *,
+    period: str | None,
+    snippet: str | None = None,
+) -> dict:
+    if value is None:
+        return {
+            "source": "STRUCTURED",
+            "key": key or "근거 없음",
+            "value": "—",
+            "period": period or "—",
+            "snippet": snippet or "근거 없음",
+            "doc_id": None,
+            "chunk_id": None,
+            "score": None,
+        }
+    display_value = f"{value:.1f}%" if isinstance(value, (int, float)) else value
+    return {
+        "source": "STRUCTURED",
+        "key": key,
+        "value": display_value,
+        "period": period or "recent_8m",
+        "snippet": snippet or display_value,
+        "doc_id": None,
+        "chunk_id": None,
+        "score": None,
+    }
+
+
+def _structured_fallback_cards(agent1_json: dict | None, question_type: str | None) -> dict:
+    question_type = question_type or "GENERIC"
+    age_records = merge_age_buckets(agent1_json or {})
+    top_age = age_records[0] if age_records else None
+    top_age_label = top_age.get("label") if top_age else "핵심 고객층"
+    top_age_value = top_age.get("value") if top_age else None
+    top_age_key = top_age.get("key") if top_age else "age_distribution"
+
+    flow_pct, period_hint = _structured_value(agent1_json, "flow_pct")
+    resident_pct, _ = _structured_value(agent1_json, "resident_pct")
+    work_pct, _ = _structured_value(agent1_json, "work_pct")
+    new_pct, _ = _structured_value(agent1_json, "new_pct")
+    revisit_pct, _ = _structured_value(agent1_json, "revisit_pct")
+
+    if period_hint is None:
+        panel = ((agent1_json or {}).get("debug") or {}).get("panel") or {}
+        period_hint = panel.get("latest_ta_ym") or "recent_8m"
+
+    def _make_card(
+        idea_title: str,
+        audience: str,
+        channels: list[str],
+        execution: list[str],
+        copy_samples: list[str],
+        measurement: list[str],
+        evidence_specs: list[dict],
+    ) -> dict:
+        evidence = [item for item in evidence_specs if item]
+        if not evidence:
+            evidence = [
+                _structured_evidence_entry(
+                    "근거 없음",
+                    None,
+                    period=period_hint,
+                    snippet="근거 없음",
+                )
+            ]
+        return {
+            "idea_title": idea_title,
+            "audience": audience,
+            "channels": channels,
+            "execution": execution,
+            "copy_samples": copy_samples,
+            "measurement": measurement,
+            "evidence": evidence,
+        }
+
+    age_evidence = _structured_evidence_entry(
+        f"age_distribution.{top_age_key}",
+        top_age_value,
+        period=period_hint,
+        snippet=f"{top_age_label} {top_age_value:.1f}%" if isinstance(top_age_value, (int, float)) else None,
+    ) if top_age_value is not None else None
+    flow_evidence = _structured_evidence_entry(
+        "customer_mix_detail.유동",
+        flow_pct,
+        period=period_hint,
+        snippet=f"유동 {flow_pct:.1f}%" if isinstance(flow_pct, (int, float)) else None,
+    ) if flow_pct is not None else None
+    resident_evidence = _structured_evidence_entry(
+        "customer_mix_detail.거주",
+        resident_pct,
+        period=period_hint,
+        snippet=f"거주 {resident_pct:.1f}%" if isinstance(resident_pct, (int, float)) else None,
+    ) if resident_pct is not None else None
+    work_evidence = _structured_evidence_entry(
+        "customer_mix_detail.직장",
+        work_pct,
+        period=period_hint,
+        snippet=f"직장 {work_pct:.1f}%" if isinstance(work_pct, (int, float)) else None,
+    ) if work_pct is not None else None
+    new_evidence = _structured_evidence_entry(
+        "new_pct",
+        new_pct,
+        period=period_hint,
+        snippet=f"신규 {new_pct:.1f}%" if isinstance(new_pct, (int, float)) else None,
+    ) if new_pct is not None else None
+    revisit_evidence = _structured_evidence_entry(
+        "revisit_pct",
+        revisit_pct,
+        period=period_hint,
+        snippet=f"재방문 {revisit_pct:.1f}%" if isinstance(revisit_pct, (int, float)) else None,
+    ) if revisit_pct is not None else None
+
+    cards: list[dict] = []
+
+    if question_type == "Q2_LOW_RETENTION":
+        cards.append(
+            _make_card(
+                "단골 회수 메시지 캠페인",
+                top_age_label,
+                ["카카오톡 채널", "SMS"],
+                [
+                    "재방문 고객에게 이탈 기간별 리마인드 메시지를 발송합니다.",
+                    "멤버십 쿠폰을 재발급해 재방문 유인을 만듭니다.",
+                ],
+                [
+                    f"다시 찾아주시면 {top_age_label} 전용 혜택을 준비했어요!",
+                    "이번 주 안에 방문 시 추가 리필을 드립니다.",
+                ],
+                ["재방문 고객 수", "쿠폰 재사용률"],
+                [revisit_evidence or new_evidence, age_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "스탬프 적립 프로모션",
+                "재방문 유도 고객",
+                ["현장 POP", "멤버십 앱"],
+                [
+                    "현장 스탬프판을 비치하고 3회 방문 시 무료 메뉴를 제공합니다.",
+                    "앱에서 실시간 적립 현황을 보여줍니다.",
+                ],
+                [
+                    "스탬프 3개 모으면 아메리카노 무료!",
+                    "이번 주 멤버십 적립률 TOP 고객 공지",
+                ],
+                ["스탬프 적립률", "혜택 교환 건수"],
+                [new_evidence, revisit_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "현장 체류 경험 강화",
+                "점심/퇴근 고객",
+                ["오프라인 이벤트", "지역 커뮤니티"],
+                [
+                    "점심시간 한정 시식/시연 이벤트를 기획합니다.",
+                    "지역 커뮤니티에 리뷰 인증 시 혜택을 제공합니다.",
+                ],
+                [
+                    "점심 인증샷 업로드 시 디저트 증정",
+                    "퇴근길에 들르면 마감 할인 제공",
+                ],
+                ["이벤트 참여자 수", "리뷰 증가량"],
+                [flow_evidence, resident_evidence or work_evidence],
+            )
+        )
+    elif question_type == "Q3_FOOD_ISSUE":
+        cards.append(
+            _make_card(
+                "시그니처 메뉴 집중 홍보",
+                top_age_label,
+                ["SNS", "지도 리뷰"],
+                [
+                    "대표 메뉴 조리 과정을 짧은 영상으로 제작합니다.",
+                    "지도 리뷰에 맛/위생 키워드 응답을 상시 관리합니다.",
+                ],
+                [
+                    f"{top_age_label} 손님이 좋아한 시그니처 레시피 공개",
+                    "오늘 만든 신선한 원두/재료 강조",
+                ],
+                ["영상 조회수", "긍정 리뷰 비중"],
+                [age_evidence, flow_evidence or resident_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "피크타임 회전율 개선",
+                "점심 피크 고객",
+                ["현장 안내", "테이블 오더"],
+                [
+                    "피크 시간 사전 주문/픽업 라인을 운영합니다.",
+                    "혼잡도를 현장 안내판으로 공지합니다.",
+                ],
+                [
+                    "점심 전 미리 주문하면 대기 없이 픽업!",
+                    "테이블에서 QR 주문하고 바로 받아가세요",
+                ],
+                ["테이블 회전 시간", "픽업 사전 주문 비중"],
+                [work_evidence, flow_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "리뷰 기반 품질 보완",
+                "재방문 잠재 고객",
+                ["리뷰 DM", "멤버십"],
+                [
+                    "리뷰에서 제기된 맛/서비스 이슈를 정리하고 개선 공지를 보냅니다.",
+                    "개선 후 재방문 고객에게 보상 쿠폰을 제공합니다.",
+                ],
+                [
+                    "리뷰 남겨주신 의견을 반영해 레시피를 새로 손봤습니다.",
+                    "재방문 시 무료 토핑을 드립니다.",
+                ],
+                ["리뷰 응답률", "재방문 고객 수"],
+                [revisit_evidence or new_evidence, resident_evidence],
+            )
+        )
+    else:  # Q1_CAFE_CHANNELS or generic
+        cards.append(
+            _make_card(
+                "핵심 연령대 SNS 집중 광고",
+                top_age_label,
+                ["인스타그램", "네이버 플레이스"],
+                [
+                    "연령대 관심사에 맞춘 숏폼 콘텐츠를 주 3회 게시합니다.",
+                    "플레이스 리뷰 상단에 시즌 한정 메뉴를 노출합니다.",
+                ],
+                [
+                    f"#{top_age_label} 취향 저격 신메뉴 공개",
+                    "방문 인증 시 음료 1+1",
+                ],
+                ["SNS 참여율", "플레이스 클릭수"],
+                [age_evidence, flow_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "오피스 타겟 쿠폰 제휴",
+                "직장인 고객",
+                ["회사 제휴", "배달앱 광고"],
+                [
+                    "근처 오피스와 제휴해 점심 시간 할인 쿠폰을 제공합니다.",
+                    "배달앱 홈 배너에 오피스 타겟 전용 메뉴를 노출합니다.",
+                ],
+                [
+                    "점심 11-14시 전용 2,000원 할인 쿠폰",
+                    "회사 이메일 인증 시 추가 적립",
+                ],
+                ["쿠폰 사용률", "점심 매출"],
+                [work_evidence, resident_evidence or flow_evidence],
+            )
+        )
+        cards.append(
+            _make_card(
+                "단골 확보 멤버십 메시지",
+                "재방문 잠재 고객",
+                ["멤버십 앱", "카카오톡 채널"],
+                [
+                    "재방문율이 낮은 고객에게 주말 한정 혜택을 보냅니다.",
+                    "멤버십 포인트로 시즌 굿즈 교환 이벤트를 알립니다.",
+                ],
+                [
+                    "이번 주말 재방문 시 포인트 2배 적립",
+                    "굿즈 한정 수량 예약 링크",
+                ],
+                ["재방문 고객 수", "멤버십 활성화율"],
+                [revisit_evidence, new_evidence],
+            )
+        )
+
+    return {"answers": cards[:4]}
+
+USE_LLM = _env_flag("AGENT1_USE_LLM", "true").lower() not in {"0", "false", "no"}
+DEBUG_MAX_PREVIEW = int(_env_flag("DEBUG_MAX_PREVIEW", "200") or 200)
+DEBUG_SHOW_RAW = _env_flag("DEBUG_SHOW_RAW", "true").lower() in {"1", "true", "yes"}
+
+
+def _mask_debug_preview(text: str | None, limit: int = DEBUG_MAX_PREVIEW) -> str:
+    if not text:
+        return ""
+    masked = re.sub(r"\{[^{}]*\}", "{***}", str(text))
+    masked = re.sub(r"([A-Za-z0-9]{4})[A-Za-z0-9]{4,}", r"\1***", masked)
+    return masked[:limit]
 
 
 def _normalize_str(value: str) -> str:
@@ -53,7 +721,7 @@ def _wildcard_to_regex(masked: str | None) -> re.Pattern | None:
     except re.error:
         return None
 
-def load_actioncard_schema():
+def load_actioncard_schema_current():
     global _SCHEMA_CACHE, _SCHEMA_VALIDATOR
     if _SCHEMA_CACHE is not None and _SCHEMA_VALIDATOR is not None:
         return _SCHEMA_CACHE, _SCHEMA_VALIDATOR
@@ -61,7 +729,17 @@ def load_actioncard_schema():
         raise FileNotFoundError(f"스키마 파일을 찾을 수 없습니다: {SCHEMA_PATH}")
     with open(SCHEMA_PATH, 'r', encoding='utf-8') as f:
         _SCHEMA_CACHE = json.load(f)
-    _SCHEMA_VALIDATOR = Draft7Validator(_SCHEMA_CACHE)
+
+    if isinstance(_SCHEMA_CACHE, dict) and "schemas" in _SCHEMA_CACHE:
+        validators: dict[str, Draft7Validator] = {}
+        for key, schema_obj in _SCHEMA_CACHE.get("schemas", {}).items():
+            try:
+                validators[key] = Draft7Validator(schema_obj)
+            except Exception:
+                continue
+        _SCHEMA_VALIDATOR = validators
+    else:
+        _SCHEMA_VALIDATOR = Draft7Validator(_SCHEMA_CACHE)
     return _SCHEMA_CACHE, _SCHEMA_VALIDATOR
 
 def read_csv_smart(path):
@@ -196,6 +874,95 @@ def load_weather_monthly(external_dir):
     monthly['_date'] = pd.to_datetime(monthly['TA_YM'] + '01', format='%Y%m%d', errors='coerce')
     return monthly[['TA_YM','_date','RAIN_SUM']]
 
+
+def _format_percent_debug(value):
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num < 0 or num > 100:
+        return None
+    return round(num, 2)
+
+
+def _format_percent_text(value):
+    pct = _format_percent_debug(value)
+    if pct is None:
+        return '—'
+    return f"{pct:.1f}%"
+
+
+def _format_customer_mix_debug(detail):
+    if not isinstance(detail, dict):
+        return '—'
+    ordered_labels = ['유동', '거주', '직장']
+    parts = []
+    for label in ordered_labels:
+        pct = _format_percent_text(detail.get(label))
+        if pct != '—':
+            parts.append(f"{label} {pct}")
+    for label, value in detail.items():
+        if label in ordered_labels:
+            continue
+        pct = _format_percent_text(value)
+        if pct != '—':
+            parts.append(f"{label} {pct}")
+    return ', '.join(parts[:3]) if parts else '—'
+
+
+def _format_age_segments_debug(segments):
+    if not isinstance(segments, (list, tuple)):
+        return '—'
+    formatted = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        label = seg.get('label') or seg.get('code')
+        value = _format_percent_text(seg.get('value'))
+        if label and value != '—':
+            formatted.append(f"{label} {value}")
+    return ', '.join(formatted[:3]) if formatted else '—'
+
+
+def _build_debug_table(qinfo, merchant_match, sanitized_snapshot):
+    industry_candidate = None
+    if merchant_match:
+        industry_candidate = merchant_match.get('category')
+    if not industry_candidate:
+        industry_candidate = qinfo.get('merchant_industry_label') or qinfo.get('industry')
+    industry_labels = {
+        'cafe': '카페',
+        'restaurant': '음식점',
+        'retail': '소매',
+    }
+    industry = industry_labels.get(industry_candidate, industry_candidate or '—')
+
+    address = '—'
+    if merchant_match:
+        addr = merchant_match.get('address')
+        if isinstance(addr, (list, tuple)):
+            addr = ' / '.join([str(v) for v in addr if v])
+        if addr:
+            address = str(addr)
+
+    revisit = _format_percent_text((sanitized_snapshot or {}).get('revisit_pct'))
+    new = _format_percent_text((sanitized_snapshot or {}).get('new_pct'))
+    revisit_block = '—'
+    if revisit != '—' or new != '—':
+        revisit_block = f"신규 {new} / 재방문 {revisit}"
+
+    table = {
+        '업종': industry,
+        '주소': address,
+        '주요 고객층': _format_age_segments_debug((sanitized_snapshot or {}).get('age_top_segments')),
+        '고객 유형': _format_customer_mix_debug((sanitized_snapshot or {}).get('customer_mix_detail')),
+        '신규/재방문': revisit_block,
+        '객단가 구간': (sanitized_snapshot or {}).get('avg_ticket_band_label') or '—',
+    }
+    return table
+
 def build_panel(shinhan_dir, merchants_df=None, target_id=None):
     s1 = merchants_df if merchants_df is not None else load_set1(shinhan_dir)
     s2_all = load_set2(shinhan_dir)
@@ -229,9 +996,10 @@ def build_panel(shinhan_dir, merchants_df=None, target_id=None):
         panel['YOUTH_SHARE'] = np.nan
     panel['REVISIT_RATE'] = pd.to_numeric(panel.get('MCT_UE_CLN_REU_RAT', np.nan), errors='coerce')
     panel['NEW_RATE'] = pd.to_numeric(panel.get('MCT_UE_CLN_NEW_RAT', np.nan), errors='coerce')
-    panel.rename(columns={'ENCODED_MCT':'_merchant_id'}, inplace=True)
-    if '_merchant_id' in panel.columns:
-        panel['_merchant_id'] = panel['_merchant_id'].astype(str)
+    if 'ENCODED_MCT' in panel.columns:
+        panel['_merchant_id'] = panel['ENCODED_MCT'].astype(str)
+    else:
+        panel['_merchant_id'] = ""
     stats['merchants_after'] = int(panel['_merchant_id'].nunique()) if '_merchant_id' in panel.columns else 0
     stats['set2_merchants_after'] = int(s2['ENCODED_MCT'].astype(str).nunique()) if 'ENCODED_MCT' in s2.columns else 0
     stats['set3_merchants_after'] = int(s3['ENCODED_MCT'].astype(str).nunique()) if 'ENCODED_MCT' in s3.columns else 0
@@ -239,19 +1007,32 @@ def build_panel(shinhan_dir, merchants_df=None, target_id=None):
 
 
 def call_llm_for_mask(original_question: str | None, merchant_mask: str | None, sigungu: str | None):
+    meta = {
+        'used': False,
+        'model': 'models/gemini-2.5-flash',
+        'prompt_preview': '',
+        'resp_bytes': 0,
+        'safety_blocked': False,
+        'elapsed_ms': 0,
+        'error': None,
+    }
+
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         print('⚠️ GEMINI_API_KEY 미설정으로 LLM 보조 매칭을 건너뜁니다.')
-        return None
+        meta['error'] = 'missing_api_key'
+        return None, meta
     try:
         import google.generativeai as genai
     except ImportError:
         print('⚠️ google-generativeai 미설치로 LLM 보조 매칭을 건너뜁니다.')
-        return None
+        meta['error'] = 'missing_dependency'
+        return None, meta
 
     genai.configure(api_key=api_key)
+    model_name = meta['model']
     model = genai.GenerativeModel(
-        model_name='models/gemini-2.5-flash',
+        model_name=model_name,
         generation_config={
             'temperature': 0.1,
             'top_p': 0.8,
@@ -270,39 +1051,89 @@ JSON 형식:
 {{"merchant_mask":"문자열 또는 null","sigungu":"문자열 또는 null","notes":"간단 메모"}}
 """
 
+    meta['prompt_preview'] = _mask_debug_preview(prompt)
+    t0 = tick()
+
     try:
         response = model.generate_content(prompt)
     except Exception as exc:
+        meta['elapsed_ms'] = to_ms(t0)
+        meta['error'] = str(exc)
         print('⚠️ LLM 보조 매칭 호출 실패:', exc)
-        return None
+        return None, meta
 
     def _response_text(resp):
-        parts = []
+        parts: list[str] = []
+
+        def _append_text(value):
+            if value:
+                parts.append(str(value))
+
         for part in getattr(resp, 'parts', []) or []:
-            text = getattr(part, 'text', None)
-            if text:
-                parts.append(text)
-        if hasattr(resp, 'text') and resp.text:
-            parts.append(resp.text)
-        return '\n'.join(parts)
+            _append_text(getattr(part, 'text', None))
+
+        # google.generativeai 응답은 candidates[*].content.parts 에도 텍스트가 담길 수 있다.
+        for candidate in getattr(resp, 'candidates', []) or []:
+            content = getattr(candidate, 'content', None)
+            if content is None:
+                continue
+            for part in getattr(content, 'parts', []) or []:
+                _append_text(getattr(part, 'text', None))
+
+        if hasattr(resp, 'text'):
+            try:
+                quick_text = resp.text
+            except ValueError:
+                quick_text = None
+            _append_text(quick_text)
+
+        return '\n'.join([p for p in parts if p])
 
     text = _response_text(response)
+    meta['elapsed_ms'] = to_ms(t0)
+
+    prompt_feedback = getattr(response, 'prompt_feedback', None)
+    block_reason = None
+    if prompt_feedback is not None:
+        block_reason = getattr(prompt_feedback, 'block_reason', None)
+    safety_blocked = bool(block_reason and str(block_reason).lower() != 'block_none')
+
+    if not safety_blocked:
+        # 후보의 finish_reason 이 안전 차단을 나타내면 안전 차단으로 간주한다.
+        for candidate in getattr(response, 'candidates', []) or []:
+            finish_reason = getattr(candidate, 'finish_reason', None)
+            if finish_reason is None:
+                continue
+            fr_text = str(finish_reason).lower()
+            if 'safety' in fr_text or 'blocked' in fr_text or fr_text in {'block_safety', '2'}:
+                safety_blocked = True
+                break
+
+    meta['safety_blocked'] = safety_blocked
+
     if not text:
         print('⚠️ LLM 보조 매칭 응답이 비었습니다.')
-        return None
+        meta['used'] = True
+        meta['error'] = 'empty_text'
+        return None, meta
+
+    meta['used'] = True
+    meta['resp_bytes'] = len(text.encode('utf-8'))
 
     match = re.search(r'\{[\s\S]*\}', text)
     if not match:
         print('⚠️ LLM 보조 매칭에서 JSON을 찾지 못했습니다.')
-        return None
+        meta['error'] = 'json_not_found'
+        return None, meta
 
     try:
         data = json.loads(match.group(0))
     except Exception as exc:
         print('⚠️ LLM 보조 매칭 JSON 파싱 실패:', exc)
-        return None
+        meta['error'] = f'json_parse_error: {exc}'
+        return None, meta
 
-    return data if isinstance(data, dict) else None
+    return (data if isinstance(data, dict) else None), meta
 
 
 def resolve_merchant(
@@ -464,10 +1295,11 @@ def resolve_merchant(
 
     # Rule-2 failed → optional LLM assist
     if allow_llm:
-        llm_result = call_llm_for_mask(original_question, masked_name, sigungu)
+        llm_result, llm_meta = call_llm_for_mask(original_question, masked_name, sigungu)
         debug_info['notes'] = 'llm_invoked'
+        if llm_meta:
+            debug_info['llm'] = {'parsed': llm_result, **llm_meta}
         if llm_result:
-            debug_info['llm'] = llm_result
             new_mask = llm_result.get('merchant_mask') or masked_name
             new_prefix = (new_mask.split('*', 1)[0].strip() if new_mask else mask_prefix)
             new_sigungu = llm_result.get('sigungu') or sigungu
@@ -481,7 +1313,8 @@ def resolve_merchant(
                     allow_llm=False,
                 )
                 if isinstance(nested_debug, dict):
-                    nested_debug.setdefault('llm', llm_result)
+                    if llm_meta:
+                        nested_debug.setdefault('llm', {'parsed': llm_result, **llm_meta})
                     nested_debug['notes'] = nested_debug.get('notes') or 'llm_invoked'
                     if not nested_debug.get('path'):
                         nested_debug['path'] = 'llm'
@@ -561,16 +1394,23 @@ def parse_question(q):
         industry = 'restaurant'
 
     merchant_mask = None
+    pattern_used = 'none'
     brace_match = re.search(r'\{([^{}]+)\}', normalized)
     if brace_match:
         merchant_mask = brace_match.group(1).strip()
+        pattern_used = 'curly_brace'
 
     mask_prefix = None
     if merchant_mask:
         mask_prefix = merchant_mask.split('*', 1)[0].strip()
 
+    sigungu_pattern = 'hangul_gu_regex'
     sigungu_match = re.search(r'(?P<sigungu>[가-힣]{2,}구)', normalized)
-    merchant_sigungu = sigungu_match.group('sigungu') if sigungu_match else '성동구'
+    if sigungu_match:
+        merchant_sigungu = sigungu_match.group('sigungu')
+    else:
+        merchant_sigungu = '성동구'
+        sigungu_pattern = 'default_sigungu'
 
     merchant_info = {
         'masked_name': merchant_mask,
@@ -597,6 +1437,8 @@ def parse_question(q):
         'merchant_sigungu': merchant_info['sigungu'],
         'merchant_industry_label': merchant_info['industry_label'],
         'merchant_explicit_id': explicit_id,
+        'merchant_pattern_used': pattern_used,
+        'merchant_sigungu_pattern': sigungu_pattern,
     }
 
 def subset_period(panel, months=DEFAULT_MONTHS):
@@ -631,36 +1473,78 @@ def kpi_summary(panel_sub):
         return round(f, 1)
 
     detail_row = snap.iloc[0]
-    youth_latest = _safe_float(detail_row.get('YOUTH_SHARE'))
-    revisit_latest = _safe_float(detail_row.get('REVISIT_RATE'))
-    new_latest = _safe_float(detail_row.get('NEW_RATE'))
+    merchant_id = detail_row.get('ENCODED_MCT') or detail_row.get('_merchant_id')
+    merchant_id = str(merchant_id) if merchant_id is not None else None
 
-    age_labels = {
-        '1020': '청년(10-20)',
-        '30': '30대',
-        '40': '40대',
-        '50': '50대',
-        '60': '60대',
+    safe_panel = None
+    panel_error = None
+    allow_aliases_env = os.getenv("PANEL_ALLOW_ALIASES", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "y",
     }
-    age_distribution = []
-    for code, label in age_labels.items():
-        cols = [f'M12_MAL_{code}_RAT', f'M12_FME_{code}_RAT']
-        vals = pd.to_numeric(pd.Series([detail_row.get(c) for c in cols]), errors='coerce')
-        total = vals.sum(skipna=True)
-        if pd.notna(total):
-            cleaned = _clean_pct(total)
-            if cleaned is not None:
-                age_distribution.append({'code': code, 'label': label, 'value': cleaned})
-    age_distribution.sort(key=lambda x: x['value'], reverse=True)
+    if merchant_id is not None:
+        working = panel_sub.copy()
+        working['ENCODED_MCT'] = working['ENCODED_MCT'].astype(str)
+        try:
+            safe_panel = extract_panel_for(
+                working,
+                merchant_id,
+                allow_aliases=allow_aliases_env,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            panel_error = str(exc)
+    else:
+        panel_error = 'encoded_mct_unavailable'
 
-    customer_mix_map = [
-        ('유동', 'RC_M1_SHC_FLP_UE_CLN_RAT'),
-        ('거주', 'RC_M1_SHC_RSD_UE_CLN_RAT'),
-        ('직장', 'RC_M1_SHC_WP_UE_CLN_RAT'),
-    ]
-    customer_mix_detail = {}
-    for label, col in customer_mix_map:
-        customer_mix_detail[label] = _clean_pct(_safe_float(detail_row.get(col)))
+    age_distribution: List[Dict[str, Any]] = []
+    age_allowlist: List[str] = []
+    customer_mix_detail: Dict[str, Any] = {label: None for label in ('유동', '거주', '직장')}
+    gender_share: Dict[str, Any] = {'female': None, 'male': None}
+    youth_latest = None
+    revisit_latest = None
+    new_latest = None
+    panel_warnings: List[str] | None = None
+
+    if safe_panel:
+        for bucket in safe_panel.get('age_distribution', []):
+            value = _clean_pct(bucket.get('value'))
+            if value is None:
+                continue
+            code = bucket.get('code') or bucket.get('label')
+            age_distribution.append({
+                'code': bucket.get('code'),
+                'label': bucket.get('label') or code,
+                'value': value,
+            })
+            if bucket.get('code'):
+                age_allowlist.append(str(bucket['code']))
+            if bucket.get('code') == '1020':
+                youth_latest = value
+        age_distribution.sort(key=lambda item: item['value'], reverse=True)
+
+        flow_map = safe_panel.get('flow') or {}
+        flow_mapping = {
+            '유동': flow_map.get('floating'),
+            '거주': flow_map.get('residential'),
+            '직장': flow_map.get('workplace'),
+        }
+        for label, raw_val in flow_mapping.items():
+            customer_mix_detail[label] = _clean_pct(raw_val)
+
+        gender_map = safe_panel.get('gender_share') or {}
+        gender_share = {
+            'female': _clean_pct(gender_map.get('female')),
+            'male': _clean_pct(gender_map.get('male')),
+        }
+
+        kpi_map = safe_panel.get('kpis') or {}
+        revisit_latest = _clean_pct(kpi_map.get('revisit_rate'))
+        new_latest = _clean_pct(kpi_map.get('new_rate'))
+
+        panel_warnings = safe_panel.get('warnings') or None
 
     ticket_band_raw = detail_row.get('APV_CE_RAT')
     ticket_band = None
@@ -676,7 +1560,9 @@ def kpi_summary(panel_sub):
         'new_rate_avg': _clean_pct(new_latest),
         'age_distribution': age_distribution,
         'age_top_segments': age_distribution[:3],
+        'age_allowlist': age_allowlist,
         'customer_mix_detail': customer_mix_detail,
+        'gender_share': gender_share,
         'avg_ticket_band_label': ticket_band,
         'n_merchants': int(snap['_merchant_id'].nunique()),
     }
@@ -684,13 +1570,9 @@ def kpi_summary(panel_sub):
     raw_snapshot = {
         'TA_YM': detail_row.get('TA_YM'),
         '_date': str(detail_row.get('_date')),
-        'MCT_UE_CLN_REU_RAT_raw': detail_row.get('MCT_UE_CLN_REU_RAT_raw'),
-        'MCT_UE_CLN_NEW_RAT_raw': detail_row.get('MCT_UE_CLN_NEW_RAT_raw'),
-        'M12_MAL_1020_RAT_raw': detail_row.get('M12_MAL_1020_RAT_raw'),
-        'M12_FME_1020_RAT_raw': detail_row.get('M12_FME_1020_RAT_raw'),
-        'RC_M1_SHC_FLP_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_FLP_UE_CLN_RAT_raw'),
-        'RC_M1_SHC_RSD_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_RSD_UE_CLN_RAT_raw'),
-        'RC_M1_SHC_WP_UE_CLN_RAT_raw': detail_row.get('RC_M1_SHC_WP_UE_CLN_RAT_raw'),
+        'panel_dict': safe_panel,
+        'panel_error': panel_error,
+        'panel_warnings': panel_warnings,
     }
 
     sanitized_snapshot = {
@@ -699,28 +1581,22 @@ def kpi_summary(panel_sub):
         'youth_pct': sanitized['youth_share_avg'],
         'customer_mix_detail': sanitized['customer_mix_detail'],
         'age_top_segments': sanitized['age_top_segments'],
+        'age_allowlist': sanitized['age_allowlist'],
+        'gender_share': sanitized['gender_share'],
         'avg_ticket_band_label': sanitized['avg_ticket_band_label'],
     }
 
-    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
-    print("✅ KPI sanitized:", json.dumps(sanitized_snapshot, ensure_ascii=False))
-
-    return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
-
-
-    sanitized_snapshot = {
-        'revisit_pct': sanitized['revisit_rate_avg'],
-        'new_pct': sanitized['new_rate_avg'],
-        'youth_pct': sanitized['youth_share_avg'],
-        'customer_mix_detail': sanitized['customer_mix_detail'],
-        'age_top_segments': sanitized['age_top_segments'],
-        'avg_ticket_band_label': sanitized['avg_ticket_band_label'],
+    debug_payload = {
+        'latest_raw_snapshot': raw_snapshot,
+        'sanitized_snapshot': sanitized_snapshot,
     }
+    debug_payload['panel_alias_allowed'] = allow_aliases_env
+    if panel_warnings:
+        debug_payload['panel_warnings'] = panel_warnings
+    if panel_error:
+        debug_payload['panel_error'] = panel_error
 
-    print("🗂 KPI raw snapshot:", json.dumps(raw_snapshot, ensure_ascii=False))
-    print("✅ KPI sanitized:", json.dumps(sanitized_snapshot, ensure_ascii=False))
-
-    return sanitized, {'latest_raw_snapshot': raw_snapshot, 'sanitized_snapshot': sanitized_snapshot}
+    return sanitized, debug_payload
 
 
 def weather_effect(panel_sub, wx_monthly):
@@ -734,8 +1610,35 @@ def weather_effect(panel_sub, wx_monthly):
     return {'metric':'REVISIT_RATE','effect':float(corr), 'ci':[None,None], 'note':'피어슨 상관(월단위)'}
 
 def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR):
+    debug_block = {
+        'input': {
+            'original': _mask_debug_preview(question, limit=120),
+            'flags': {
+                'USE_LLM': USE_LLM,
+                'DEBUG_MAX_PREVIEW': DEBUG_MAX_PREVIEW,
+                'DEBUG_SHOW_RAW': DEBUG_SHOW_RAW,
+            },
+        },
+        'errors': [],
+    }
+
     merchants_df = load_set1(shinhan_dir)
-    qinfo = parse_question(question)
+
+    parse_t0 = tick()
+    try:
+        qinfo = parse_question(question)
+    except Exception as exc:
+        debug_block['errors'].append({'stage': 'parse', 'msg': str(exc)})
+        debug_block['parse'] = {'elapsed_ms': to_ms(parse_t0)}
+        raise
+    parse_elapsed = to_ms(parse_t0)
+    debug_block['parse'] = {
+        'merchant_mask': qinfo.get('merchant_masked_name'),
+        'mask_prefix': qinfo.get('merchant_mask_prefix'),
+        'sigungu': qinfo.get('merchant_sigungu'),
+        'pattern_used': qinfo.get('merchant_pattern_used'),
+        'elapsed_ms': parse_elapsed,
+    }
 
     run_id = datetime.datetime.utcnow().isoformat()
     parse_log = {
@@ -748,20 +1651,6 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
     print("🆔 agent1_run:", run_id)
     print("🧾 question_fields:", json.dumps(parse_log, ensure_ascii=False))
 
-    print(
-        "🧪 parse_debug:",
-        json.dumps(
-            {
-                'original': qinfo.get('original_question'),
-                'normalized': qinfo.get('normalized_question'),
-                'merchant_mask': qinfo.get('merchant_masked_name'),
-                'mask_prefix': qinfo.get('merchant_mask_prefix'),
-                'sigungu': qinfo.get('merchant_sigungu'),
-            },
-            ensure_ascii=False,
-        ),
-    )
-
     merchant_match = None
     resolve_meta = {
         'candidates': [],
@@ -770,72 +1659,141 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         'suggestions': None,
         'llm': None,
     }
-    explicit_id = qinfo.get('merchant_explicit_id')
-    if explicit_id:
-        lookup = merchants_df[merchants_df['ENCODED_MCT'] == explicit_id]
-        print(
-            "🏷 explicit_id_lookup:",
-            json.dumps({'explicit_id': explicit_id, 'row_count': int(len(lookup))}, ensure_ascii=False),
-        )
-        if not lookup.empty:
-            row = lookup.iloc[0]
-            merchant_match = {
-                'encoded_mct': str(row['ENCODED_MCT']),
-                'masked_name': row.get('MCT_NM'),
-                'address': row.get('ADDR_BASE'),
-                'sigungu': row.get('SIGUNGU'),
-                'category': row.get('CATEGORY'),
-                'score': None,
-            }
-            resolve_meta['path'] = 'explicit_id'
 
-    if merchant_match is None:
-        merchant_match, resolve_meta = resolve_merchant(
-            qinfo.get('merchant_masked_name'),
-            qinfo.get('merchant_mask_prefix'),
-            qinfo.get('merchant_sigungu'),
-            merchants_df,
-            original_question=qinfo.get('normalized_question') or question,
-            allow_llm=True,
-        )
+    resolve_stage = {
+        'path': 'none',
+        'candidates_top3': [],
+        'resolved_merchant_id': None,
+    }
+
+    resolve_t0 = tick()
+    try:
+        explicit_id = qinfo.get('merchant_explicit_id')
+        if explicit_id:
+            lookup = merchants_df[merchants_df['ENCODED_MCT'] == explicit_id]
+            print(
+                "🏷 explicit_id_lookup:",
+                json.dumps({'explicit_id': explicit_id, 'row_count': int(len(lookup))}, ensure_ascii=False),
+            )
+            if not lookup.empty:
+                row = lookup.iloc[0]
+                merchant_match = {
+                    'encoded_mct': str(row['ENCODED_MCT']),
+                    'masked_name': row.get('MCT_NM'),
+                    'address': row.get('ADDR_BASE'),
+                    'sigungu': row.get('SIGUNGU'),
+                    'category': row.get('CATEGORY'),
+                    'score': None,
+                }
+                resolve_meta['path'] = 'user'
+
+        if merchant_match is None:
+            merchant_match, resolve_meta = resolve_merchant(
+                qinfo.get('merchant_masked_name'),
+                qinfo.get('merchant_mask_prefix'),
+                qinfo.get('merchant_sigungu'),
+                merchants_df,
+                original_question=qinfo.get('normalized_question') or question,
+                allow_llm=USE_LLM,
+            )
+    except Exception as exc:
+        debug_block['errors'].append({'stage': 'resolve', 'msg': str(exc)})
+        raise
+    finally:
+        resolve_stage['elapsed_ms'] = to_ms(resolve_t0)
 
     target_id = None
     if merchant_match and merchant_match.get('encoded_mct') is not None:
         target_id = str(merchant_match['encoded_mct'])
         merchant_match['encoded_mct'] = target_id
 
-    panel, panel_stats = build_panel(shinhan_dir, merchants_df=merchants_df, target_id=target_id)
-    panel_focus = panel
-    print(
-        "📦 panel_filter:",
-        json.dumps({
-            'target_id': target_id,
-            **panel_stats,
-        }, ensure_ascii=False),
-    )
-    print("🏁 merchant_match:", json.dumps(merchant_match, ensure_ascii=False))
-    print(
-        "🧭 resolve_summary:",
-        json.dumps(
-            {
-                'path': resolve_meta.get('path'),
-                'notes': resolve_meta.get('notes'),
-                'candidates': resolve_meta.get('candidates'),
-            },
-            ensure_ascii=False,
-            default=str,
-        ),
-    )
+    if resolve_meta.get('path') is None:
+        resolve_meta['path'] = 'llm' if resolve_meta.get('llm') else 'none'
+    resolve_stage['path'] = resolve_meta.get('path') or 'none'
+    resolve_stage['resolved_merchant_id'] = target_id
 
-    sub = subset_period(panel_focus, months=qinfo['months'])
+    candidate_payload = []
+    for cand in resolve_meta.get('candidates') or []:
+        cid = cand.get('ENCODED_MCT') or cand.get('encoded_mct')
+        try:
+            score_val = cand.get('score')
+            score = round(float(score_val), 4) if score_val is not None else None
+        except (TypeError, ValueError):
+            score = None
+        candidate_payload.append({
+            'id': str(cid) if cid is not None else None,
+            'name': cand.get('MCT_NM') or cand.get('masked_name'),
+            'sigungu': cand.get('SIGUNGU') or cand.get('sigungu'),
+            'score': score,
+        })
+    resolve_stage['candidates_top3'] = candidate_payload[:3]
+    debug_block['resolve'] = resolve_stage
+
+    llm_meta = resolve_meta.get('llm') or {}
+    agent1_llm = {
+        'used': bool(llm_meta.get('used')),
+        'model': llm_meta.get('model'),
+        'prompt_preview': llm_meta.get('prompt_preview', ''),
+        'resp_bytes': llm_meta.get('resp_bytes'),
+        'safety_blocked': bool(llm_meta.get('safety_blocked')),
+        'elapsed_ms': llm_meta.get('elapsed_ms'),
+    }
+    debug_block['agent1_llm'] = agent1_llm
+
+    panel_stage = {}
+    panel_t0 = tick()
+    try:
+        panel, panel_stats = build_panel(shinhan_dir, merchants_df=merchants_df, target_id=target_id)
+    except Exception as exc:
+        panel_stage['elapsed_ms'] = to_ms(panel_t0)
+        debug_block['errors'].append({'stage': 'panel', 'msg': str(exc)})
+        debug_block['panel'] = panel_stage
+        raise
+    panel_elapsed = to_ms(panel_t0)
+    sub = subset_period(panel, months=qinfo['months'])
+    panel_stage.update({
+        'rows_before': int(len(panel)),
+        'rows_after': int(len(sub)),
+        'latest_ta_ym': str(sub['TA_YM'].max()) if not sub.empty and 'TA_YM' in sub.columns else None,
+        'elapsed_ms': panel_elapsed,
+        'stats': panel_stats,
+    })
+    debug_block['panel'] = panel_stage
 
     wxm = None
     try:
         wxm = load_weather_monthly(external_dir)
-    except Exception:
+    except Exception as exc:
+        debug_block['errors'].append({'stage': 'weather', 'msg': str(exc)})
         wxm = None
 
+    snapshot_t0 = tick()
     kpis, kpi_debug = kpi_summary(sub)
+    snapshot_elapsed = to_ms(snapshot_t0)
+
+    raw_snapshot = {}
+    raw_source = (kpi_debug or {}).get('latest_raw_snapshot') or {}
+    for key, value in raw_source.items():
+        if key.endswith('_raw'):
+            raw_snapshot[key[:-4]] = value
+        else:
+            raw_snapshot[key] = value
+    sanitized_snapshot = (kpi_debug or {}).get('sanitized_snapshot') or {}
+    debug_block['snapshot'] = {
+        'raw': raw_snapshot,
+        'sanitized': sanitized_snapshot,
+        'elapsed_ms': snapshot_elapsed,
+    }
+    if kpi_debug and kpi_debug.get('panel_warnings'):
+        debug_block.setdefault('panel', {}).setdefault('warnings', kpi_debug['panel_warnings'])
+    if kpi_debug and kpi_debug.get('panel_error'):
+        debug_block.setdefault('panel', {})['error'] = kpi_debug['panel_error']
+
+    render_table = _build_debug_table(qinfo, merchant_match, sanitized_snapshot)
+    debug_block['render'] = {
+        'table_dict': render_table,
+    }
+
     wfx = weather_effect(sub, wxm)
 
     notes = []
@@ -868,9 +1826,9 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
             'parsed': qinfo,
             'merchant_query': merchant_query,
             'run_id': run_id,
-            'panel_stats': panel_stats,
+            'panel_stats': panel_stage.get('stats', {}),
             'merchant_candidates': resolve_meta.get('candidates'),
-            'merchant_resolution_path': resolve_meta.get('path'),
+            'merchant_resolution_path': resolve_stage['path'],
         },
         'kpis': kpis,
         'weather_effect': wfx,
@@ -884,19 +1842,7 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
         'sample': {
             'merchants_covered': merchants_covered
         },
-        'debug': {
-            'parsed': parse_log,
-            'resolved_merchant_id': target_id,
-            'resolve_path': resolve_meta.get('path'),
-            'resolve_candidates': resolve_meta.get('candidates'),
-            'resolve_notes': resolve_meta.get('notes'),
-            'resolve_suggestions': resolve_meta.get('suggestions'),
-            'llm_result': resolve_meta.get('llm'),
-            'latest_raw_snapshot': kpi_debug.get('latest_raw_snapshot'),
-            'sanitized_snapshot': kpi_debug.get('sanitized_snapshot'),
-            'panel_stats': panel_stats,
-            'merchants_covered': merchants_covered,
-        },
+        'debug': debug_block,
     }
 
     if merchant_match:
@@ -909,73 +1855,424 @@ def agent1_pipeline(question, shinhan_dir=SHINHAN_DIR, external_dir=EXTERNAL_DIR
     print('✅ Agent-1 JSON 저장:', out_path)
     return out
 
+QUESTION_TYPE_INFO = {
+    "Q1_CAFE_CHANNELS": {
+        "label": "주요 방문 고객 특성에 따른 채널 추천 및 홍보안",
+        "instructions": [
+            "연령/성별·유동/거주 구성 비중을 활용해 채널과 메시지를 제시합니다.",
+            "온·오프라인 3~4개 홍보 아이디어를 간결하게 작성합니다.",
+            "각 아이디어는 고객군 → 채널 → 실행 요약을 포함합니다.",
+        ],
+    },
+    "Q2_LOW_RETENTION": {
+        "label": "재방문률 30% 이하 개선 아이디어",
+        "instructions": [
+            "재방문·신규 비중을 근거로 재방문 촉진 액션을 제시합니다.",
+            "3~4개의 프로모션/멤버십/CRM 아이디어를 제공합니다.",
+            "각 아이디어는 타깃 고객과 실행 단계를 분명히 합니다.",
+        ],
+    },
+    "Q3_FOOD_ISSUE": {
+        "label": "요식업의 가장 큰 문제 가설 + 보완 아이디어",
+        "instructions": [
+            "식음업 특성(방문 고객/시간대/유동)을 근거로 문제 가설을 세웁니다.",
+            "3~4개의 개선 아이디어를 제시하고 실행 단계를 나열합니다.",
+            "문제 가설과 해결 아이디어를 한 세트로 서술합니다.",
+        ],
+    },
+    "GENERIC": {
+        "label": "일반 컨설팅 질문",
+        "instructions": [
+            "핵심 고객·성과 데이터를 근거로 3~4개의 실행 아이디어를 제공합니다.",
+            "각 아이디어는 대상, 채널, 실행 단계, 측정 지표를 포함합니다.",
+        ],
+    },
+}
 
 
-def build_agent2_prompt(agent1_json):
+ORGANIZER_QUESTION_TYPES = {
+    "Q1_CAFE_CHANNELS",
+    "Q2_LOW_RETENTION",
+    "Q3_FOOD_ISSUE",
+    "GENERIC",
+}
+
+
+def _schema_key_for_question(question_type: str | None) -> str:
+    if question_type in ORGANIZER_QUESTION_TYPES:
+        return "organizer"
+    return "legacy"
+
+
+def _resolve_schema_for_question(
+    question_type: str | None,
+) -> tuple[dict, Draft7Validator | None, str]:
+    schema_bundle, validator_bundle = load_actioncard_schema_current()
+    key = _schema_key_for_question(question_type)
+    if isinstance(schema_bundle, dict) and "schemas" in schema_bundle:
+        schema_obj = schema_bundle.get("schemas", {}).get(key) or {}
+    else:
+        schema_obj = schema_bundle if isinstance(schema_bundle, dict) else {}
+        key = "legacy"
+
+    validator = None
+    if isinstance(validator_bundle, dict):
+        validator = validator_bundle.get(key)
+    else:
+        validator = validator_bundle
+    return schema_obj, validator, key
+
+
+def infer_question_type(question_text: str | None) -> str:
+    text = (question_text or "").lower()
+    if not text:
+        return "GENERIC"
+    if any(keyword in text for keyword in ["채널", "홍보", "sns", "캠페인"]):
+        return "Q1_CAFE_CHANNELS"
+    if any(keyword in text for keyword in ["재방문", "retention", "재구매", "단골"]):
+        return "Q2_LOW_RETENTION"
+    if any(keyword in text for keyword in ["요식", "식당", "food", "맛집"]):
+        return "Q3_FOOD_ISSUE"
+    return "GENERIC"
+
+
+def _summarise_rag_context(rag_context: dict | None) -> tuple[str, str]:
+    if not isinstance(rag_context, dict):
+        return ("", "RAG 비활성화: 컨텍스트가 전달되지 않았습니다.")
+
+    enabled = bool(rag_context.get("enabled"))
+    threshold = rag_context.get("threshold")
+    max_score = rag_context.get("max_score")
+    raw_hits = rag_context.get("hits")
+    chunks_for_hits = rag_context.get("chunks") if isinstance(rag_context.get("chunks"), list) else []
+    hits = int(raw_hits if raw_hits is not None else len(chunks_for_hits))
+    selected_docs = rag_context.get("selected_doc_ids") or []
+    mode = rag_context.get("mode") or "auto"
+    reason_lines: list[str] = []
+
+    if not enabled:
+        if rag_context.get("selection_missing"):
+            reason_lines.append("RAG 요청됨이나 선택된 문서가 없습니다.")
+        elif rag_context.get("requested") and rag_context.get("error"):
+            reason_lines.append(f"오류: {rag_context['error']}")
+        else:
+            reason_lines.append("UI 토글 또는 모드로 인해 비활성화되었습니다.")
+    else:
+        reason_lines.append(f"모드={mode}, 선택 문서={selected_docs or '없음'}")
+        if max_score is None:
+            reason_lines.append("최고 점수를 계산하지 못했습니다.")
+        elif threshold is not None and max_score < threshold and mode != "always":
+            reason_lines.append(f"최고 점수 {max_score:.2f} < 임계값 {threshold:.2f}")
+
+    include_rag = bool(
+        enabled
+        and hits > 0
+        and (mode == "always" or threshold is None or (max_score is not None and max_score >= threshold))
+    )
+
+    prompt_block = ""
+    if include_rag:
+        snippets = []
+        for chunk in (rag_context.get("chunks") or [])[: hits or 5]:
+            text = str(chunk.get("text") or "").strip()
+            if len(text) > 220:
+                text = text[:220].rstrip() + "…"
+            snippets.append(
+                {
+                    "doc_id": chunk.get("doc_id"),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "score": float(chunk.get("score") or 0.0),
+                    "snippet": text,
+                }
+            )
+        rag_payload = json.dumps(snippets, ensure_ascii=False, indent=2)
+        summary = f"RAG 포함: hits={hits}, max_score={max_score}, threshold={threshold}, mode={mode}"
+        prompt_block = f"{summary}\n{rag_payload}"
+        rag_context['prompt_note'] = summary
+    else:
+        reason = " ; ".join(reason_lines) if reason_lines else "근거 없음"
+        rag_context['prompt_note'] = f"RAG 제외: {reason}"
+
+    return prompt_block, "\n- ".join(reason_lines)
+
+
+def build_agent2_prompt_overhauled(
+    agent1_json,
+    *,
+    question_text: str | None = None,
+    question_type: str | None = None,
+    rag_context: dict | None = None,
+    length_policy: str | None = None,
+    input_token_limit: int | None = None,
+):
+    inferred_type = question_type or infer_question_type(question_text)
+    info = QUESTION_TYPE_INFO.get(inferred_type, QUESTION_TYPE_INFO["GENERIC"])
+    schema_obj = {}
     try:
-        schema, _ = load_actioncard_schema()
-        schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
-    except Exception as e:
-        schema_text = json.dumps({"schema_error": str(e)}, ensure_ascii=False, indent=2)
+        schema_obj, _, _ = _resolve_schema_for_question(inferred_type)
+    except Exception as exc:
+        schema_obj = {"schema_error": str(exc)}
+    schema_text = json.dumps(schema_obj, ensure_ascii=False, indent=2)
 
-    rules = [
-        "Agent-1 JSON만 근거로 활용하고 외부 추정은 금지합니다.",
-        "모든 카드에 타겟 → 채널 → 방법 → 카피(2개 이상) → KPI → 리스크/완화 → 근거를 채웁니다.",
-        "근거 문장은 반드시 숫자+컬럼명+기간 형식이며 정보가 없으면 null 또는 '—'로 둡니다.",
-        "품질이 낮거나 데이터가 부족하면 마지막 카드에 '데이터 보강 제안'을 추가합니다.",
-        "상호명은 항상 마스킹된 형태로 유지합니다.",
-        "KPI.expected_uplift와 range는 근거가 있을 때만 값을 넣고, 없으면 null을 유지합니다."
+    snapshot = (agent1_json or {}).get("debug", {}).get("snapshot", {})
+    if isinstance(snapshot, dict):
+        sanitized_snapshot = snapshot.get("sanitized") or {}
+    else:
+        sanitized_snapshot = {}
+    age_allowlist = []
+    if isinstance(sanitized_snapshot, dict):
+        allowlist_candidate = sanitized_snapshot.get("age_allowlist")
+        if isinstance(allowlist_candidate, list):
+            age_allowlist = [str(code) for code in allowlist_candidate if str(code)]
+        elif isinstance(allowlist_candidate, (tuple, set)):
+            age_allowlist = [str(code) for code in allowlist_candidate if str(code)]
+        if not age_allowlist:
+            distribution = sanitized_snapshot.get("age_distribution") or []
+            if isinstance(distribution, list):
+                for item in distribution:
+                    code = str(item.get("code")) if isinstance(item, dict) else None
+                    if code:
+                        age_allowlist.append(code)
+    age_allowlist = list(dict.fromkeys(age_allowlist))
+
+    policy_rank = {"short": 1, "balanced": 2, "long": 3}
+    resolved_policy = (length_policy or "balanced").lower()
+    policy_value = policy_rank.get(resolved_policy, 2)
+
+    base_rules = [
+        "질문에 직접 답하십시오. 목표치나 구간을 임의로 추정하지 마십시오(제공된 경우에만 사용).",
+        "주요 근거는 Agent-1 JSON이며, RAG가 활성화되고 유효할 때만 RAG 스니펫을 근거로 포함합니다.",
+        "모든 아이디어에 최소 1개 이상의 근거를 붙이고, 없으면 '근거 없음'으로 명시합니다.",
+        "근거에는 출처(STRUCTURED/RAG)와 핵심 수치 또는 스니펫을 함께 제시합니다.",
+        "상호명은 항상 마스킹 상태를 유지합니다.",
+        "answers 배열에 3~4개의 간결한 아이디어를 작성합니다.",
+        "age cohort 규칙: Agent-1 JSON에 존재하는 연령대만 사용하고, 0~100% 범위를 벗어나면 '—'로 표기합니다.",
     ]
+    if age_allowlist:
+        base_rules.append(f"사용 가능한 연령대 코드: {', '.join(age_allowlist)}")
 
-    rules_text = "- " + "\n- ".join(rules)
+    type_rules = info.get("instructions", [])
 
-    guide = f"""당신은 한국어 소상공인 컨설턴트입니다. 아래 Agent-1 JSON만 근거로 사용하여,
-반드시 액션카드 스키마(JSON)로만 답하세요. 불확실한 수치는 null 또는 '—'로 남겨두세요.
+    rag_block, rag_reason = _summarise_rag_context(rag_context)
 
-[출력 규칙]
-{rules_text}
+    sections: List[Dict[str, Any]] = []
 
-[액션카드 스키마(JSON)]
-{schema_text}
+    def add_section(
+        key: str,
+        content: str,
+        *,
+        min_policy: int = 1,
+        removable: bool = True,
+        priority: int = 1,
+        variants: List[str] | None = None,
+    ) -> None:
+        if not content:
+            return
+        entry = {
+            "key": key,
+            "content": content,
+            "min_policy": min_policy,
+            "removable": removable,
+            "priority": priority,
+            "variants": list(variants or []),
+            "variant_index": 0,
+        }
+        sections.append(entry)
 
-[데이터(JSON)]
-{json.dumps(agent1_json, ensure_ascii=False, indent=2)}
-"""
+    add_section("intro", "당신은 한국어 소상공인 컨설턴트입니다.", removable=False, priority=0)
+    add_section("question_type", f"question_type={inferred_type}", priority=2)
+    add_section("question_label", f"질문 유형 설명: {info['label']}", min_policy=2, priority=3)
+    add_section("question_text", f"질문 원문: {question_text or '—'}", priority=2)
+    add_section("rules_header", "[출력 규칙]", removable=False, priority=0)
+    add_section("rules_body", "- " + "\n- ".join(base_rules), removable=False, priority=0)
+
+    if type_rules:
+        add_section("type_rules_header", "[질문 유형별 지침]", min_policy=2, priority=2)
+        add_section("type_rules_body", "- " + "\n- ".join(type_rules), min_policy=2, priority=2)
+
+    add_section("schema_header", "[출력 스키마(JSON)]", removable=False, priority=0)
+    add_section("schema_body", schema_text, removable=False, priority=0)
+
+    trimmed_agent1 = _shrink_agent1_payload(agent1_json)
+    data_variants: List[str] = []
+    full_pretty = json.dumps(agent1_json, ensure_ascii=False, indent=2)
+    data_variants.append(full_pretty)
+    full_compact = json.dumps(agent1_json, ensure_ascii=False, separators=(",", ":"))
+    if full_compact not in data_variants:
+        data_variants.append(full_compact)
+    trimmed_pretty = json.dumps(trimmed_agent1, ensure_ascii=False, indent=2)
+    if trimmed_pretty not in data_variants:
+        data_variants.append(trimmed_pretty)
+    trimmed_compact = json.dumps(trimmed_agent1, ensure_ascii=False, separators=(",", ":"))
+    if trimmed_compact not in data_variants:
+        data_variants.append(trimmed_compact)
+
+    add_section("data_header", "[데이터(JSON)]", removable=False, priority=0)
+    add_section(
+        "data_body",
+        data_variants[0],
+        removable=False,
+        priority=0,
+        variants=data_variants,
+    )
+
+    if rag_block:
+        add_section("rag_context", "[RAG_CONTEXT]\n" + rag_block, min_policy=2, priority=4)
+    elif rag_reason:
+        add_section("rag_reason", f"[RAG 참고 메모]\n- {rag_reason}", min_policy=2, priority=3)
+
+    add_section("format_header", "[응답 형식]", removable=False, priority=0)
+    add_section(
+        "format_note",
+        "JSON만 출력하세요. 마크다운/설명/코드블럭 금지. 문자열 내 줄바꿈은 \\n으로 표기하세요.",
+        removable=False,
+        priority=0,
+    )
+
+    active_sections = [s for s in sections if policy_value >= s["min_policy"]]
+    if not active_sections:
+        active_sections = [s for s in sections if s["min_policy"] == 1]
+
+    def render_sections(items: List[Dict[str, Any]]) -> str:
+        return "\n\n".join(section["content"] for section in items)
+
+    resolved_limit = input_token_limit
+    if resolved_limit is None:
+        try:
+            import streamlit as st  # type: ignore
+
+            resolved_limit = int(st.session_state.get("llm_in_ctx", 8192))
+        except Exception:  # pragma: no cover - Streamlit optional
+            resolved_limit = 8192
+
+    truncation_notes: List[str] = []
+    prompt_body = render_sections(active_sections)
+    tokens_est = _estimate_token_length(prompt_body)
+
+    changed = True
+    while resolved_limit and tokens_est > resolved_limit and changed:
+        changed = False
+        # Step 1: attempt to switch to a more compact variant
+        for section in active_sections:
+            variants = section.get("variants") or []
+            idx = section.get("variant_index", 0)
+            if variants and idx + 1 < len(variants):
+                section["variant_index"] = idx + 1
+                section["content"] = variants[idx + 1]
+                truncation_notes.append(f"variant:{section['key']}->{idx + 1}")
+                changed = True
+                break
+        if changed:
+            prompt_body = render_sections(active_sections)
+            tokens_est = _estimate_token_length(prompt_body)
+            continue
+
+        removable_sections = [s for s in active_sections if s.get("removable", True)]
+        if removable_sections:
+            removable_sections.sort(
+                key=lambda item: (
+                    item.get("priority", 0),
+                    _estimate_token_length(item["content"]),
+                ),
+                reverse=True,
+            )
+            removed = removable_sections[0]
+            active_sections.remove(removed)
+            truncation_notes.append(f"removed:{removed['key']}")
+            changed = True
+            prompt_body = render_sections(active_sections)
+            tokens_est = _estimate_token_length(prompt_body)
+
+    if resolved_limit and tokens_est > resolved_limit:
+        truncation_notes.append("limit_exceeded_post_trim")
+
+    guide = prompt_body
+    schema_keys = []
+    if isinstance(schema_obj, dict) and isinstance(schema_obj.get("properties"), dict):
+        schema_keys = sorted(schema_obj["properties"].keys())
+    rag_doc_ids = []
+    rag_threshold = None
+    rag_max_score = None
+    rag_mode = None
+    if isinstance(rag_context, dict):
+        rag_doc_ids = list(rag_context.get("selected_doc_ids") or [])
+        rag_threshold = rag_context.get("threshold")
+        rag_max_score = rag_context.get("max_score")
+        rag_mode = rag_context.get("mode")
+    global AGENT2_PROMPT_TRACE
+    AGENT2_PROMPT_TRACE = {
+        "question_type": inferred_type,
+        "organizer_mode": inferred_type in ORGANIZER_QUESTION_TYPES,
+        "schema_keys": schema_keys,
+        "rag_included": bool(rag_block),
+        "rag_reason": rag_reason,
+        "rag_context_doc_ids": rag_doc_ids,
+        "rag_threshold": rag_threshold,
+        "rag_max_score": rag_max_score,
+        "rag_mode": rag_mode,
+        "length_policy": resolved_policy,
+        "input_token_limit": resolved_limit,
+        "prompt_tokens_est": tokens_est,
+        "truncation_notes": truncation_notes,
+    }
     return guide
 
-def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
-    """
-    Gemini 2.5 Flash 전용 호출:
-    - google-generativeai==0.8.3 기준
-    - 2.5 flash 가용성 자동 확인(list_models) 후 2.5 flash 계열만 시도
-    - response_mime_type 강제 해제(빈 응답 회피), 텍스트→JSON 추출
-    - 세이프티/빈응답/가용성 이슈 시 폴백 카드 반환 (앱은 계속 동작)
-    - 디버그 로그: outputs/gemini_debug.json
-    """
+def call_gemini_agent2_overhauled(
+    prompt_text,
+    model_name: str = 'models/gemini-2.5-flash',
+    *,
+    question_type: str | None = None,
+    agent1_json: dict | None = None,
+    input_token_limit: int | None = None,
+    max_output_tokens: int | None = None,
+    length_policy: str | None = None,
+    **kwargs,
+):
+    """Call Gemini for Agent-2 with robust JSON parsing and fallback cards."""
+
     import google.generativeai as genai
-    import re, json, datetime
+    import datetime
+
+    if kwargs:
+        _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841 - reserved for debugging
+
+    resolved_input_limit = input_token_limit
+    resolved_output_limit = max_output_tokens
+    resolved_policy = (length_policy or "balanced").lower()
+    if resolved_input_limit is None:
+        try:
+            import streamlit as st  # type: ignore
+
+            resolved_input_limit = int(st.session_state.get("llm_in_ctx", 8192))
+        except Exception:  # pragma: no cover - Streamlit optional
+            resolved_input_limit = 8192
+    if resolved_output_limit is None:
+        try:
+            import streamlit as st  # type: ignore
+
+            resolved_output_limit = int(st.session_state.get("llm_out_max", 2048))
+        except Exception:  # pragma: no cover - Streamlit optional
+            resolved_output_limit = 2048
+    resolved_output_limit = max(256, min(int(resolved_output_limit), 8192))
 
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         raise RuntimeError('GEMINI_API_KEY가 설정되지 않았습니다.')
     genai.configure(api_key=api_key)
 
-    # 1) 계정에서 실제 가능한 2.5-flash 계열 모델만 수집
-    candidates = []
+    candidates: list[str] = []
     try:
-        avail = []
-        for m in genai.list_models():
-            if "generateContent" in getattr(m, "supported_generation_methods", []):
-                avail.append(m.name)  # 예: 'models/gemini-2.5-flash'
-        # 2.5 flash 계열만 필터
-        for name in avail:
-            tail = name.split("/")[-1]
-            if "2.5" in tail and "flash" in tail:
+        available = []
+        for model in genai.list_models():
+            if "generateContent" in getattr(model, "supported_generation_methods", []):
+                available.append(model.name)
+        for name in available:
+            tail = name.split('/')[-1]
+            if '2.5' in tail and 'flash' in tail:
                 candidates.append(name)
     except Exception:
         pass
 
-    # 가용성 조회 실패/비어있으면 합리적 후보(2.5 flash 계열)만 시도
     if not candidates:
         candidates = [
             "models/gemini-2.5-flash",
@@ -986,11 +2283,9 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
             "gemini-2.5-flash-001",
         ]
 
-    # 사용자가 인자를 줬다면 맨 앞에 둠(역시 2.5 flash 계열이어야 함)
     if model_name and model_name not in candidates:
         candidates.insert(0, model_name)
 
-    # 세이프티(완화) + 토큰 보수적
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -999,172 +2294,271 @@ def call_gemini_agent2(prompt_text, model_name='models/gemini-2.5-flash'):
     ]
     generation_config = {
         "temperature": 0.2,
-        "top_p": 0.9,
+        "top_p": 0.1,
         "top_k": 32,
-        "max_output_tokens": 900,
-        # "response_mime_type": "application/json",  # 강제하지 않음(빈 응답 회피)
+        "max_output_tokens": resolved_output_limit,
     }
 
-    def _extract_text(resp):
-        text = ""
+    prompt_payload = (prompt_text or "").rstrip()
+    if "JSON만 출력하세요" not in prompt_payload:
+        prompt_payload = (
+            prompt_payload
+            + "\n\nJSON만 출력하세요. 마크다운/설명/코드블럭 금지. 문자열 내 줄바꿈은 \\n으로 표기하세요."
+        )
+
+    prompt_tokens_est = _estimate_token_length(prompt_payload)
+    prompt_over_limit = False
+    if resolved_input_limit and prompt_tokens_est > resolved_input_limit:
+        prompt_over_limit = True
+
+    try:
+        _, schema_validator, schema_key = _resolve_schema_for_question(question_type)
+        schema_error = None
+    except Exception as exc:
+        schema_validator = None
+        schema_key = "unknown"
+        schema_error = str(exc)
+
+    global AGENT2_RESPONSE_TRACE
+    AGENT2_RESPONSE_TRACE = {
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "question_type": question_type,
+        "requested_model": model_name,
+        "model_candidates": list(dict.fromkeys(candidates)),
+        "generation_config": dict(generation_config),
+        "schema_key": schema_key,
+        "schema_error": schema_error,
+        "prompt_length": len(prompt_payload),
+        "attempts": [],
+        "prompt_tokens_est": prompt_tokens_est,
+        "input_token_limit": resolved_input_limit,
+        "prompt_over_limit": prompt_over_limit,
+        "length_policy": resolved_policy,
+        "max_output_tokens": resolved_output_limit,
+    }
+    if isinstance(AGENT2_PROMPT_TRACE, dict):
+        AGENT2_RESPONSE_TRACE["prompt_truncation_notes"] = AGENT2_PROMPT_TRACE.get(
+            "truncation_notes"
+        )
+
+    def _extract_text(resp) -> str:
+        text_value = ''
         try:
-            t = getattr(resp, "text", None)
-            if t: text = t
+            payload = getattr(resp, 'text', None)
+            if payload:
+                text_value = payload
         except Exception:
             pass
-        if (not text) and getattr(resp, "candidates", None):
+        if (not text_value) and getattr(resp, 'candidates', None):
             try:
                 cand0 = resp.candidates[0]
-                if cand0 and getattr(cand0, "content", None) and cand0.content.parts:
-                    for p in cand0.content.parts:
-                        pt = getattr(p, "text", "")
-                        if pt: text += pt
+                if cand0 and getattr(cand0, 'content', None) and cand0.content.parts:
+                    for part in cand0.content.parts:
+                        piece = getattr(part, 'text', '')
+                        if piece:
+                            text_value += piece
             except Exception:
                 pass
-        return (text or "").strip()
+        return (text_value or '').strip()
 
     def _blocked_info(resp):
         info = {}
-        try: info["prompt_feedback"] = getattr(resp, "prompt_feedback", None)
-        except Exception: pass
         try:
-            if getattr(resp, "candidates", None):
-                info["candidate_safety"] = getattr(resp.candidates[0], "safety_ratings", None)
-                info["finish_reason"] = getattr(resp.candidates[0], "finish_reason", None)
-        except Exception: pass
+            info['prompt_feedback'] = getattr(resp, 'prompt_feedback', None)
+        except Exception:
+            pass
+        try:
+            if getattr(resp, 'candidates', None):
+                info['candidate_safety'] = getattr(resp.candidates[0], 'safety_ratings', None)
+                info['finish_reason'] = getattr(resp.candidates[0], 'finish_reason', None)
+        except Exception:
+            pass
         return info
 
-    def _run_once(name: str):
+    def _run_once(name: str, prompt_body: str):
         model = genai.GenerativeModel(
             model_name=name,
             generation_config=generation_config,
-            safety_settings=safety_settings
+            safety_settings=safety_settings,
         )
-        resp = model.generate_content(prompt_text)
-        text = _extract_text(resp)
-        info = _blocked_info(resp)
-        return text, info, name
+        response = model.generate_content(
+            prompt_body,
+            response_mime_type="application/json",
+        )
+        text_value = _extract_text(response)
+        info = _blocked_info(response)
+        return text_value, info, name
 
-    try:
-        _, schema_validator = load_actioncard_schema()
-        schema_error = None
-    except Exception as e:
-        schema_validator = None
-        schema_error = str(e)
+    def _repair_with_llm(name: str, failing_text: str):
+        snippet = _strip_code_fences(failing_text or "").strip()
+        if len(snippet) > 4000:
+            snippet = snippet[:4000]
+        repair_prompt = (
+            "아래 JSON을 스키마에 맞게 고쳐 JSON만 반환하세요. 고칠 수 없으면 {\"answers\": []}를 반환하세요."
+            "\n\n=== JSON 후보 ===\n" + snippet
+        )
+        repair_config = dict(generation_config)
+        repair_config.update(
+            {
+                "temperature": 0.1,
+                "top_p": 0.05,
+                "max_output_tokens": min(1024, generation_config.get("max_output_tokens", 1024)),
+            }
+        )
+        try:
+            model = genai.GenerativeModel(
+                model_name=name,
+                generation_config=repair_config,
+                safety_settings=safety_settings,
+            )
+            response = model.generate_content(
+                repair_prompt,
+                response_mime_type="application/json",
+            )
+            repaired_text = _extract_text(response)
+            info = _blocked_info(response)
+            return repaired_text, {"meta": info}
+        except Exception as exc:  # pragma: no cover - network guard
+            return None, {"error": str(exc)}
 
-    all_attempt_logs = []
-    last_error = schema_error
+    chosen_payload = None
+    chosen_model = None
+    last_error = schema_error or "unknown"
 
     for attempt in range(2):
-        attempt_logs = []
-        for mname in candidates:
+        for model_candidate in candidates:
+            attempt_record = {
+                "attempt": attempt + 1,
+                "model": model_candidate,
+            }
             try:
-                text, info, used = _run_once(mname)
-                log_entry = {"model": used, "has_text": bool(text), "meta": info}
-                if not text:
-                    log_entry["error"] = "empty_text"
-                    attempt_logs.append(log_entry)
-                    last_error = "LLM 응답이 비어 있습니다."
-                    continue
+                text_value, info, used_model = _run_once(model_candidate, prompt_payload)
+            except Exception as exc:  # pragma: no cover - network guard
+                attempt_record["error"] = str(exc)
+                last_error = str(exc)
+                AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+                continue
 
-                core = None
-                m = re.search(r"\{[\s\S]*\}", text)
-                if m:
-                    try:
-                        core = json.loads(m.group(0))
-                    except Exception as je:
-                        log_entry["error"] = f"json_parse_error: {je}"
-                        attempt_logs.append(log_entry)
-                        last_error = f"JSON 파싱 실패: {je}"
-                        continue
+            attempt_record["raw_preview"] = (text_value or "")[:600]
+            attempt_record["raw_length"] = len(text_value or "")
+            attempt_record["meta"] = info
+
+            parsed, parse_logs = llm_json_safe_parse(text_value, None)
+            attempt_record["parse_logs"] = parse_logs
+
+            validation_error: str | None = None
+            if parsed is not None:
+                coerced = _coerce_to_answers(parsed)
+                attempt_record["coerced_to_answers"] = bool(coerced is not parsed)
+                try:
+                    if schema_validator is not None and coerced is not None:
+                        schema_validator.validate(coerced)
+                except Exception as exc:
+                    validation_error = str(exc)
+                    attempt_record["validation_error"] = validation_error
                 else:
-                    log_entry["error"] = "json_not_found"
-                    attempt_logs.append(log_entry)
-                    last_error = "응답에서 JSON 블록을 찾지 못했습니다."
-                    continue
+                    attempt_record["status"] = "parsed"
+                    chosen_payload = coerced
+                    chosen_model = used_model
+                    AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+                    break
 
-                if not isinstance(core, dict):
-                    log_entry["error"] = "json_not_object"
-                    attempt_logs.append(log_entry)
-                    last_error = "추출된 JSON이 객체 형식이 아닙니다."
-                    continue
+            if validation_error:
+                last_error = validation_error
+            elif parse_logs:
+                last_error = parse_logs[-1].get("error") or last_error
 
-                validation_ok = True
-                if schema_validator is not None:
+            attempt_record["status"] = attempt_record.get("status") or (
+                "validation_failed" if validation_error else "parse_failed"
+            )
+
+            repaired_text, repair_meta = _repair_with_llm(model_candidate, text_value)
+            attempt_record["repair_preview"] = (repaired_text or "")[:600]
+            attempt_record["repair_meta"] = repair_meta
+            if repaired_text:
+                repaired, repair_logs = llm_json_safe_parse(repaired_text, None)
+                attempt_record["repair_logs"] = repair_logs
+                if repaired is not None:
+                    coerced_repair = _coerce_to_answers(repaired)
+                    attempt_record["repair_coerced_to_answers"] = bool(
+                        coerced_repair is not repaired
+                    )
                     try:
-                        schema_validator.validate(core)
-                    except ValidationError as ve:
-                        validation_ok = False
-                        log_entry["validation_error"] = ve.message
-                        last_error = f"스키마 검증 실패: {ve.message}"
+                        if schema_validator is not None and coerced_repair is not None:
+                            schema_validator.validate(coerced_repair)
+                    except Exception as exc:
+                        attempt_record["repair_validation_error"] = str(exc)
+                        last_error = str(exc)
+                    else:
+                        attempt_record["status"] = "repaired"
+                        chosen_payload = coerced_repair
+                        chosen_model = model_candidate
+                        AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+                        break
+                if repair_logs:
+                    last_error = repair_logs[-1].get("error") or last_error
 
-                if validation_ok:
-                    attempt_logs.append(log_entry)
-                    all_attempt_logs.append({"attempt": attempt + 1, "logs": attempt_logs})
-                    # 디버그 기록
-                    try:
-                        debug = {
-                            "ts": datetime.datetime.utcnow().isoformat(),
-                            "chosen_model": used,
-                            "attempts": all_attempt_logs,
-                            "preview_text": text[:400],
-                            "schema_error": schema_error
-                        }
-                        with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
-                            json.dump(debug, f, ensure_ascii=False, indent=2)
-                    except Exception:
-                        pass
-
-                    outp = OUTPUT_DIR / 'agent2_result.json'
-                    with open(outp, 'w', encoding='utf-8') as f:
-                        json.dump(core, f, ensure_ascii=False, indent=2)
-                    print('✅ Agent-2 결과 저장:', outp)
-                    return core
-
-                attempt_logs.append(log_entry)
-            except Exception as e:
-                attempt_logs.append({"model": mname, "error": str(e)})
-                last_error = str(e)
-
-        all_attempt_logs.append({"attempt": attempt + 1, "logs": attempt_logs})
-        if schema_validator is None:
+            AGENT2_RESPONSE_TRACE["attempts"].append(attempt_record)
+        if chosen_payload is not None:
             break
 
-    # 모두 실패 → 폴백(앱 다운 방지)
-    fallback = {
-        "recommendations": [{
-            "title": "데이터 보강 제안",
-            "what": "모델 가용성/세이프티/쿼터로 카드 생성을 보류합니다.",
-            "when": "환경 확인 후 재시도",
-            "where": ["대시보드"],
-            "how": ["2.5 flash 가용성 확인", "API 키/쿼터 확인", "프롬프트 길이 축소"],
-            "copy": ["데이터를 조금만 더 주세요!"],
-            "kpi": {"target": "revisit_rate", "expected_uplift": None, "range": [None, None]},
-            "risks": ["LLM 안전 필터/쿼터/모델 가용성"],
-            "checklist": ["App secrets 확인", "list_models() 결과에서 2.5 flash 검색"],
-            "evidence": [
-                "gemini_debug.json 로그 참조",
-                f"사유: {last_error or '원인 미상'}"
-            ]
-        }]
-    }
+    if chosen_payload is not None:
+        AGENT2_RESPONSE_TRACE.update({"status": "success", "chosen_model": chosen_model})
+        try:
+            debug_payload = {
+                "ts": datetime.datetime.utcnow().isoformat(),
+                "chosen_model": chosen_model,
+                "attempts": AGENT2_RESPONSE_TRACE["attempts"],
+                "schema_key": schema_key,
+            }
+            (OUTPUT_DIR / 'gemini_debug.json').write_text(
+                json.dumps(debug_payload, ensure_ascii=False, indent=2),
+                encoding='utf-8',
+            )
+        except Exception:
+            pass
+        (OUTPUT_DIR / 'agent2_result.json').write_text(
+            json.dumps(chosen_payload, ensure_ascii=False, indent=2),
+            encoding='utf-8',
+        )
+        return chosen_payload
+
+    AGENT2_RESPONSE_TRACE.update({
+        "status": "fallback",
+        "last_error": last_error,
+    })
+    fallback = _structured_fallback_cards(agent1_json, question_type)
+    AGENT2_RESPONSE_TRACE["fallback_answers"] = len(fallback.get("answers", []))
     try:
-        debug = {
-            "ts": datetime.datetime.utcnow().isoformat(),
-            "attempts": all_attempt_logs,
-            "schema_error": schema_error,
-            "last_error": last_error
-        }
-        with open(OUTPUT_DIR / "gemini_debug.json", "w", encoding="utf-8") as f:
-            json.dump(debug, f, ensure_ascii=False, indent=2)
+        if schema_validator is not None:
+            schema_validator.validate(fallback)
     except Exception:
         pass
-
-    outp = OUTPUT_DIR / 'agent2_result.json'
-    with open(outp, 'w', encoding='utf-8') as f:
-        json.dump(fallback, f, ensure_ascii=False, indent=2)
-    print('⚠️ Agent-2: 2.5 flash 가용성/세이프티 문제 → 폴백 카드 반환')
+    (OUTPUT_DIR / 'agent2_result.json').write_text(
+        json.dumps(fallback, ensure_ascii=False, indent=2),
+        encoding='utf-8',
+    )
     return fallback
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility shims
+# ---------------------------------------------------------------------------
+
+def load_actioncard_schema(*args, **kwargs):
+    """Backward-compatible wrapper for legacy imports."""
+    return load_actioncard_schema_current(*args, **kwargs)
+
+
+def build_agent2_prompt(*args, **kwargs):
+    """Backward-compatible wrapper for the overhauled Agent-2 prompt builder."""
+    return build_agent2_prompt_overhauled(*args, **kwargs)
+
+
+def call_gemini_agent2(*args, **kwargs):
+    """Backward-compatible wrapper that delegates to the updated Gemini caller."""
+    return call_gemini_agent2_overhauled(*args, **kwargs)
+
 
 def main():
     import argparse
@@ -1185,10 +2579,15 @@ def main():
 
     try:
         a1 = agent1_pipeline(q, SHINHAN_DIR, EXTERNAL_DIR)
-        prompt_text = build_agent2_prompt(a1)
+        prompt_text = build_agent2_prompt_overhauled(a1, question_text=q)
         print('\n==== Gemini Prompt Preview (앞부분) ====')
         print(prompt_text[:800] + ('\n... (생략)' if len(prompt_text)>800 else ''))
-        a2 = call_gemini_agent2(prompt_text, model_name=args.model)
+        a2 = call_gemini_agent2_overhauled(
+            prompt_text,
+            model_name=args.model,
+            agent1_json=a1,
+            question_type=infer_question_type(q),
+        )
         print('\n==== Agent-2 결과 (앞부분) ====')
         print(json.dumps(a2, ensure_ascii=False, indent=2)[:800] + '\n...')
     except FileNotFoundError as e:
