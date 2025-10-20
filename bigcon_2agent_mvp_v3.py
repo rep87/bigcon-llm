@@ -168,7 +168,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MONTHS = 8
 SEED = 42
-random.seed(SEED); np.random.seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
 
 _SCHEMA_CACHE = None
 _SCHEMA_VALIDATOR = None
@@ -780,16 +781,22 @@ def load_set1(shinhan_dir):
     ren = {}
     for c in df.columns:
         cu = str(c).upper()
-        if cu == 'ENCODED_MCT': ren[c] = 'ENCODED_MCT'
-        elif 'SIGUNGU' in cu:   ren[c] = 'SIGUNGU'
-        elif 'BSE_AR' in cu:    ren[c] = 'ADDR_BASE'
-        elif ('ZCD' in cu) or ('BZN' in cu) or ('업종' in cu): ren[c] = 'CATEGORY'
-        elif cu == 'MCT_NM':    ren[c] = 'MCT_NM'
+        if cu == 'ENCODED_MCT':
+            ren[c] = 'ENCODED_MCT'
+        elif 'SIGUNGU' in cu:
+            ren[c] = 'SIGUNGU'
+        elif 'BSE_AR' in cu:
+            ren[c] = 'ADDR_BASE'
+        elif ('ZCD' in cu) or ('BZN' in cu) or ('업종' in cu):
+            ren[c] = 'CATEGORY'
+        elif cu == 'MCT_NM':
+            ren[c] = 'MCT_NM'
     df = df.rename(columns=ren)
     df = df.loc[:, ~df.columns.duplicated()]
     keep = ['ENCODED_MCT','MCT_NM','ADDR_BASE','SIGUNGU','CATEGORY']
     for k in keep:
-        if k not in df.columns: df[k] = np.nan
+        if k not in df.columns:
+            df[k] = np.nan
     df = df[keep].drop_duplicates('ENCODED_MCT')
     if 'ENCODED_MCT' in df.columns:
         df['ENCODED_MCT'] = df['ENCODED_MCT'].apply(lambda v: str(v).strip() if pd.notna(v) else '')
@@ -834,10 +841,11 @@ def load_set3(shinhan_dir):
 
 def load_weather_monthly(external_dir):
     f = None
-    for e in ('.csv','.parquet','.parq','.feather'):
-        cand = list(external_dir.glob(f'**/*{e}'))
-        if cand:
-            f = cand[0]; break
+    for ext in ('.csv', '.parquet', '.parq', '.feather'):
+        candidates = list(external_dir.glob(f"**/*{ext}"))
+        if candidates:
+            f = candidates[0]
+            break
     if not f:
         print('⚠️ 외부(날씨) 데이터가 없습니다. 날씨 분석은 제한됩니다.')
         return None
@@ -851,19 +859,21 @@ def load_weather_monthly(external_dir):
         return None
 
     c_dt = None
-    for c in wx.columns:
-        cl = str(c).lower()
-        if any(k in cl for k in ['date','ymd','dt','일자','날짜','yyyymm']):
-            c_dt = c; break
+    for column in wx.columns:
+        lower = str(column).lower()
+        if any(key in lower for key in ['date', 'ymd', 'dt', '일자', '날짜', 'yyyymm']):
+            c_dt = column
+            break
     if c_dt is None:
         raise ValueError('날씨 데이터에 날짜(또는 YYYYMM) 컬럼을 찾지 못했습니다.')
     dt = pd.to_datetime(wx[c_dt].astype(str), errors='coerce')
     wx['_ym'] = dt.dt.strftime('%Y%m')
     c_rain = None
-    for c in wx.columns:
-        cl = c.lower()
-        if any(k in cl for k in ['rain','precip','rn_mm','rainfall','rr','강수','강수량','비']):
-            c_rain = c; break
+    for column in wx.columns:
+        lower = column.lower()
+        if any(key in lower for key in ['rain', 'precip', 'rn_mm', 'rainfall', 'rr', '강수', '강수량', '비']):
+            c_rain = column
+            break
     if c_rain is None:
         wx['_rain_val'] = 0.0
     else:
@@ -2562,7 +2572,9 @@ def call_gemini_agent2(*args, **kwargs):
 
 def main():
     import argparse
-    a1 = None; prompt_text = ''; a2 = None
+    a1 = None
+    prompt_text = ''
+    a2 = None
     parser = argparse.ArgumentParser()
     parser.add_argument('--question', type=str, default=None)
     parser.add_argument('--model', type=str, default='gemini-2.5-flash')
