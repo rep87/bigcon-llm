@@ -145,6 +145,8 @@ import app_core.summary_blocks as summary_blocks
 import pandas as pd
 import streamlit as st
 
+from rag.preview import rag_preview_search
+
 
 def _pick_best_chunk(
     chunks: list[dict] | None, metas: list[dict] | None
@@ -239,6 +241,73 @@ def _render_main_views(
     except Exception:
         st.error("요약 뷰를 렌더링하는 중 오류가 발생했습니다.")
         st.code(traceback.format_exc())
+
+    preview_query = (
+        ((agent1_payload or {}).get("context") or {})
+        .get("parsed", {})
+        .get("original_question")
+        or question_text
+    )
+    selected_doc_ids = st.session_state.get("rag_selected_docs")
+    if selected_doc_ids is None:
+        selected_doc_ids = (
+            st.session_state.get("_data_flags", {}).get("rag_selected_ids")
+        )
+    threshold_value = float(st.session_state.get("_data_flags", {}).get("rag_threshold", 0.35))
+    render_rag_preview(preview_query, selected_doc_ids, threshold_value)
+
+
+def render_rag_preview(
+    query_text: str, selected_doc_ids: list[str] | None, threshold: float
+) -> None:
+    payload = rag_preview_search(
+        query_text,
+        k=8,
+        threshold=threshold,
+        selected_docs=selected_doc_ids,
+    )
+    hits = payload.get("items", []) or []
+    model_name = payload.get("model_name", "unknown")
+    reason = payload.get("reason", "ok")
+    error_text = payload.get("error")
+
+    with st.expander("🔍 RAG 유사도 미리보기", expanded=False):
+        selected_display = payload.get("selected_docs") or "ALL"
+        st.caption(
+            f"Query encoder: **{model_name}** · threshold: {payload.get('threshold')} · selected: {selected_display}"
+        )
+        if reason != "ok":
+            reason_text = f"Reason: `{reason}`"
+            if error_text:
+                reason_text += f" · error: `{error_text}`"
+            st.caption(reason_text)
+
+        if not hits:
+            st.write("No retrieved chunks.")
+            return
+
+        rows = []
+        for idx, hit in enumerate(hits, start=1):
+            score = getattr(hit, "score", None)
+            doc_id = getattr(hit, "doc_id", None)
+            chunk_id = getattr(hit, "chunk_id", None)
+            text = getattr(hit, "text", None)
+            if isinstance(hit, dict):
+                score = hit.get("score")
+                doc_id = hit.get("doc_id")
+                chunk_id = hit.get("chunk_id")
+                text = hit.get("text")
+            preview = (text or "")[:200]
+            rows.append(
+                {
+                    "rank": idx,
+                    "score": round(float(score or 0.0), 3),
+                    "doc_id": doc_id,
+                    "chunk_id": chunk_id,
+                    "preview": preview,
+                }
+            )
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 
 def render_debug_view(agent1_json: dict | None, show_raw: bool | None = None) -> None:
     if show_raw is None:
@@ -1826,12 +1895,16 @@ def main() -> None:
         )
         selected_ids = [label_map[label] for label in selected_labels]
         data_flags["rag_selected_ids"] = selected_ids
+        st.session_state["rag_selected_docs"] = selected_ids
 
         if data_flags.get("use_rag") and not selected_ids:
             st.sidebar.info("선택된 RAG 문서가 없어 이번 실행에서는 RAG를 사용하지 않습니다.")
     elif not rag_toggle_disabled:
         # Toggle가 꺼져 있으면 기존 선택을 유지하되 필터 입력만 초기화하지 않습니다.
         data_flags.setdefault("rag_selected_ids", data_flags.get("rag_selected_ids", []))
+        st.session_state.setdefault(
+            "rag_selected_docs", data_flags.get("rag_selected_ids", [])
+        )
 
     st.session_state["_data_flags"] = data_flags
 
