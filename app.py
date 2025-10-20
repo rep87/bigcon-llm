@@ -15,6 +15,7 @@ from app_core.failsoft import (
     structured_adapter,
     weather_adapter,
 )
+from app_core.diagnostics import build_analyst_summary_text
 from app_core.formatters import (
     get_age_bucket_details,
     merge_age_buckets,
@@ -23,60 +24,6 @@ from app_core.formatters import (
 
 import pandas as pd
 import streamlit as st
-
-
-# ===== Helpers (pure; no top-level execution) =====
-
-
-def _safe_pct(x) -> str:
-    try:
-        v = float(x)
-        if 0.0 <= v <= 1.0:
-            v *= 100.0
-        if not (0.0 <= v <= 100.0):
-            return "—"
-        return f"{v:.1f}%"
-    except Exception:
-        return "—"
-
-
-def _three_line_diagnosis(agent1: dict) -> str:
-    k = (agent1.get("kpis") or {})
-    mix = (k.get("customer_mix_detail") or {})
-    line1 = " · ".join(
-        [
-            p
-            for p in [
-                f"유동 {_safe_pct(mix.get('유동'))}" if "유동" in mix else None,
-                f"직장 {_safe_pct(mix.get('직장'))}" if "직장" in mix else None,
-                f"거주 {_safe_pct(mix.get('거주'))}" if "거주" in mix else None,
-            ]
-            if p
-        ]
-    ).strip(" ·")
-    ages = (k.get("age_distribution") or [])
-    if ages:
-        top = max(ages, key=lambda a: float(a.get("value", -1)))
-        label = top.get("label") or top.get("code") or "—"
-        line2 = f"최다 연령 {label} {_safe_pct(top.get('value'))}"
-    else:
-        line2 = "최다 연령 —"
-    newv = k.get("new_rate_avg") if "new_rate_avg" in k else k.get("new_rate")
-    reuv = k.get("revisit_rate_avg") if "revisit_rate_avg" in k else k.get("revisit_rate")
-    line3 = " · ".join(
-        [
-            p
-            for p in [
-                f"신규 {_safe_pct(newv)}" if newv is not None else None,
-                f"재방문 {_safe_pct(reuv)}" if reuv is not None else None,
-            ]
-            if p
-        ]
-    ).strip(" ·")
-    lines = [line1, line2, line3]
-    return "\n".join(lines)
-
-
 def _pick_best_chunk(
     chunks: list[dict] | None, metas: list[dict] | None
 ) -> Tuple[Any, Any]:
@@ -640,30 +587,6 @@ def _collect_overview_row(agent1_json: dict) -> tuple[pd.DataFrame, dict]:
         "객단가 구간": spend_band if spend_band else "—",
     }
     return pd.DataFrame([data]), data
-
-
-def _build_diagnosis(agent1_json: dict) -> List[str]:
-    """Return exactly three diagnosis lines with safe fallbacks."""
-
-    try:
-        lines = _three_line_diagnosis(agent1_json or {})
-    except Exception:
-        lines = ["요약 생성 오류", "데이터 확인 필요", "—"]
-
-    sanitized: List[str] = []
-    for line in lines:
-        if isinstance(line, str):
-            text = line.strip()
-            sanitized.append(text if text else "—")
-        else:
-            sanitized.append("—")
-
-    while len(sanitized) < 3:
-        sanitized.append("—")
-
-    return sanitized[:3]
-
-
 def _build_goal_lines(agent1_json: dict) -> tuple[str, list[str]]:
     period = (agent1_json or {}).get("period", {})
     months = period.get("months")
@@ -764,29 +687,21 @@ def render_summary_view(
         st.subheader("현황 표")
         st.table(overview_df)
 
-    st.subheader("한 줄 진단")
-    diagnosis_lines = _build_diagnosis(agent1_json)
-    if not diagnosis_lines:
-        diagnosis_lines = ["요약 정보 없음", "—", "—"]
-    if retrieval_payload and retrieval_payload.get("chunks"):
-        best_chunk = retrieval_payload["chunks"][0]
-        evidence_meta = None
-        for item in retrieval_payload.get("evidence", []):
-            if (
-                item.get("doc_id") == best_chunk.get("doc_id")
-                and item.get("chunk_id") == best_chunk.get("chunk_id")
-            ):
-                evidence_meta = item
-                break
-        cols = st.columns([12, 1])
-        with cols[0]:
-            for line in diagnosis_lines:
-                st.markdown(f"- {line}")
-        with cols[1]:
-            _render_evidence_badge(best_chunk, evidence_meta)
-    else:
-        for line in diagnosis_lines:
-            st.markdown(f"- {line}")
+    st.subheader("분석가 요약")
+    merchant_mask_value = (
+        context.get("merchant_masked_name")
+        or context.get("masked_name")
+        or context.get("merchant_mask")
+        or merchant_title
+    )
+    summary_text = build_analyst_summary_text(
+        agent1_json or {},
+        merchant_mask=merchant_mask_value,
+        use_llm=bool(st.session_state.get("use_llm_analyst", True)),
+        llm_max_tokens=int(st.session_state.get("llm_out_max", 900)),
+    )
+    summary_text = " ".join(str(summary_text).split())
+    st.markdown(summary_text)
 
     if not is_public_mode:
         period_text, goal_lines = _build_goal_lines(agent1_json)
@@ -1458,6 +1373,11 @@ def main() -> None:
         step=256,
         value=int(st.session_state.get("llm_out_max", 2048)),
         key="llm_out_max",
+    )
+    st.sidebar.toggle(
+        "LLM Analyst Summary 사용",
+        value=bool(st.session_state.get("use_llm_analyst", True)),
+        key="use_llm_analyst",
     )
     length_options = ["short", "balanced", "long"]
     current_policy = st.session_state.get("llm_length_policy", "balanced")
