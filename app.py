@@ -2,7 +2,33 @@ from __future__ import annotations
 
 # --- minimal safe import block (panel_extract) ---
 import sys, os, traceback
-from app_core.import_utils import ensure_repo_on_sys_path, import_or_raise
+
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+if not sys.path or sys.path[0] != APP_ROOT:
+    if APP_ROOT in sys.path:
+        sys.path.remove(APP_ROOT)
+    sys.path.insert(0, APP_ROOT)
+
+try:  # pragma: no cover - defensive bootstrap
+    from app_core.import_utils import ensure_repo_on_sys_path, import_or_raise
+except Exception as import_utils_error:  # pragma: no cover - fallback path
+    print(
+        f"[import-utils-fallback] using inline helpers due to: {import_utils_error!r}"
+    )
+
+    def ensure_repo_on_sys_path(anchor_file: str) -> str:
+        repo_root = os.path.dirname(os.path.abspath(anchor_file))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        return repo_root
+
+    def import_or_raise(mod_name: str):
+        try:
+            return __import__(mod_name, fromlist=["*"])
+        except Exception:
+            print("[import-utils-fallback] cwd=", os.getcwd())
+            print("[import-utils-fallback] sys.path[:5]=", sys.path[:5])
+            raise
 
 ensure_repo_on_sys_path(__file__)
 
