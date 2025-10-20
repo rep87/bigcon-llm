@@ -12,7 +12,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # ruff: noqa: E402
+import pandas as pd
+
 from app_core.formatters import merge_age_buckets, three_line_diagnosis
+from app_core.panel_extract import NEEDED, subset_needed
+from app_core.summary_blocks import pick_latest_baseline_trend_yoy
 import bigcon_2agent_mvp_v3 as agent2
 
 
@@ -55,6 +59,44 @@ def check_age_merge() -> None:
     _print("Three-line diagnosis", lines)
 
 
+def check_summary_blocks() -> None:
+    raw = {
+        "ENCODED_MCT": ["m1", "m1", "m1", "m1", "m1"],
+        "TA_YM": ["202205", "202302", "202303", "202304", "202305"],
+        "M12_MAL_1020_RAT": [10, 10, 10, 10, 10],
+        "M12_MAL_30_RAT": [15, 15, 15, 15, 15],
+        "M12_MAL_40_RAT": [10, 10, 10, 10, 10],
+        "M12_MAL_50_RAT": [5, 5, 5, 5, 5],
+        "M12_MAL_60_RAT": [10, 10, 10, 10, 10],
+        "M12_FME_1020_RAT": [15, 15, 15, 15, 15],
+        "M12_FME_30_RAT": [10, 10, 10, 10, 10],
+        "M12_FME_40_RAT": [10, 10, 10, 10, 10],
+        "M12_FME_50_RAT": [10, 10, 10, 10, 10],
+        "M12_FME_60_RAT": [5, 5, 5, 5, 5],
+        "MCT_UE_CLN_REU_RAT": [82, 86, 85, 84, 83],
+        "MCT_UE_CLN_NEW_RAT": [18, 14, 15, 16, 17],
+        "RC_M1_SHC_RSD_UE_CLN_RAT": [30, 30, 30, 30, 30],
+        "RC_M1_SHC_WP_UE_CLN_RAT": [40, 40, 40, 40, 40],
+        "RC_M1_SHC_FLP_UE_CLN_RAT": [30, 30, 30, 30, 30],
+        "EXTRA": [1, 2, 3, 4, 5],
+    }
+    df = pd.DataFrame(raw)
+
+    subset = subset_needed(df)
+    assert list(subset.columns) == NEEDED
+
+    summary = pick_latest_baseline_trend_yoy(subset, "m1")
+    required_keys = {"latest_ym", "age_top3", "flow", "kpi", "trend"}
+    assert required_keys.issubset(summary)
+    assert len(summary.get("age_top3") or []) <= 3
+    age_codes = [item.get("code") for item in summary.get("age_all") or []]
+    assert len(age_codes) == len(set(age_codes))
+    assert summary.get("flow", {}).keys() >= {"유동", "직장", "거주"}
+    assert summary.get("yoy") is not None
+
+    _print("Panel summary", summary)
+
+
 def check_prompt_with_rag_block() -> None:
     agent1_stub = {"debug": {"snapshot": {"sanitized": {}}}}
     rag_context = {
@@ -85,6 +127,7 @@ def check_prompt_with_rag_block() -> None:
 
 def main() -> None:
     check_age_merge()
+    check_summary_blocks()
     check_prompt_with_rag_block()
     compileall.compile_dir(str(PROJECT_ROOT), quiet=1)
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import traceback
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -21,6 +21,8 @@ from app_core.formatters import (
     merge_age_buckets,
     to_float_pct,
 )
+from app_core.panel_extract import NEEDED, subset_needed
+from app_core.summary_blocks import pick_latest_baseline_trend_yoy
 
 import pandas as pd
 import streamlit as st
@@ -95,7 +97,7 @@ def _render_main_views(
     st.session_state['_latest_failsoft'] = fail_soft_payload
 
     try:
-        overview_cached = st.session_state.get('_latest_overview', (None, None))
+        overview_cached = st.session_state.get('_latest_overview', (None, None, None))
         if isinstance(agent2_payload, dict):
             if retrieval_payload:
                 agent2_payload.setdefault("evidence", retrieval_payload.get("evidence", []))
@@ -111,6 +113,7 @@ def _render_main_views(
             agent2_payload or {},
             overview_df=overview_cached[0],
             table_dict=overview_cached[1],
+            panel_summary=overview_cached[2],
             retrieval_payload=retrieval_payload,
         )
     except Exception:
@@ -489,6 +492,49 @@ def _format_percent(value) -> str:
     return f"{num:.1f}%"
 
 
+def _format_pp_delta(value: Any) -> str:
+    try:
+        if value is None:
+            return "—"
+        num = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not (num == num):  # NaN guard
+        return "—"
+    return f"{num:+.1f}"
+
+
+def _resolve_panel_path() -> Path:
+    override = get_setting("PANEL_CSV_PATH", None)
+    if override:
+        return Path(str(override)).expanduser()
+
+    data_root = get_setting("DATA_DIR", None)
+    base = Path(str(data_root)).expanduser() if data_root else Path("data")
+    return (base / "shinhan" / "big_data_set3_f.csv").expanduser()
+
+
+@lru_cache(maxsize=1)
+def _load_panel_csv_cached(path_str: str) -> pd.DataFrame:
+    try:
+        frame = pd.read_csv(path_str, usecols=NEEDED)
+    except ValueError:
+        frame = pd.read_csv(path_str)
+    frame = subset_needed(frame)
+    frame["ENCODED_MCT"] = frame["ENCODED_MCT"].astype(str)
+    return frame
+
+
+def _get_panel_dataframe() -> pd.DataFrame | None:
+    path = _resolve_panel_path()
+    if not path.exists():
+        return None
+    try:
+        return _load_panel_csv_cached(path.as_posix())
+    except Exception:
+        return None
+
+
 def _collect_major_customers(agent1_json: dict) -> str:
     buckets = merge_age_buckets(agent1_json or {})
     if not buckets:
@@ -528,10 +574,13 @@ def _format_customer_mix(detail: dict | None) -> str:
     return ", ".join(parts[:3]) if parts else "—"
 
 
-def _collect_overview_row(agent1_json: dict) -> tuple[pd.DataFrame, dict]:
-    context = (agent1_json or {}).get("context", {})
-    parsed = context.get("parsed", {})
-    merchant = context.get("merchant", {})
+def _collect_overview_row(
+    agent1_json: dict,
+) -> tuple[pd.DataFrame, dict, dict | None]:
+    context = (agent1_json or {}).get("context", {}) or {}
+    parsed = context.get("parsed", {}) or {}
+    merchant = context.get("merchant", {}) or {}
+
     industry_candidate = (
         merchant.get("category")
         or parsed.get("merchant_industry_label")
@@ -543,6 +592,7 @@ def _collect_overview_row(agent1_json: dict) -> tuple[pd.DataFrame, dict]:
         "retail": "소매",
     }
     industry = industry_labels.get(industry_candidate, industry_candidate or "—")
+
     addr = (
         merchant.get("address")
         or context.get("address_masked")
@@ -553,40 +603,121 @@ def _collect_overview_row(agent1_json: dict) -> tuple[pd.DataFrame, dict]:
         addr = " / ".join(str(v) for v in addr if v)
     address = addr if addr else "—"
 
-    debug_snapshot = _get_debug_snapshot(agent1_json)
-    kpis = (agent1_json or {}).get("kpis", {})
-    new_rate = debug_snapshot.get("new_pct", kpis.get("new_rate_avg"))
-    revisit_rate = debug_snapshot.get("revisit_pct", kpis.get("revisit_rate_avg"))
-    new_text = _format_percent(new_rate)
-    revisit_text = _format_percent(revisit_rate)
-    new_revisit = (
-        "—" if new_text == "—" and revisit_text == "—" else f"신규 {new_text} / 재방문 {revisit_text}"
-    )
+    merchant_id = merchant.get("encoded_mct") or merchant.get("ENCODED_MCT")
+    if merchant_id is None:
+        debug_section = _get_debug_section(agent1_json)
+        resolve_block = debug_section.get("resolve") if isinstance(debug_section, dict) else None
+        if isinstance(resolve_block, dict):
+            merchant_id = resolve_block.get("resolved_merchant_id")
+    merchant_id = str(merchant_id) if merchant_id is not None else None
 
-    customer_mix_detail = debug_snapshot.get("customer_mix_detail") or kpis.get(
-        "customer_mix_detail"
-    )
-    customer_type = _format_customer_mix(customer_mix_detail)
-    spend_band = (
-        debug_snapshot.get("avg_ticket_band_label")
-        or kpis.get("avg_ticket_band_label")
-        or context.get("avg_ticket_band")
-        or "—"
-    )
-    if isinstance(spend_band, str):
-        spend_band = re.sub(r"(상위)(\d)", r"\1 \2", spend_band.strip())
-    elif spend_band is None:
-        spend_band = "—"
+    panel_summary: dict | None = None
+    panel_df = _get_panel_dataframe()
+    if merchant_id and isinstance(panel_df, pd.DataFrame):
+        try:
+            subset = panel_df[panel_df["ENCODED_MCT"] == merchant_id]
+            if not subset.empty:
+                panel_summary = pick_latest_baseline_trend_yoy(subset, merchant_id)
+        except Exception:
+            panel_summary = None
 
-    data = {
+    def _fmt_age_text(summary: dict | None) -> str:
+        if not summary:
+            return "—"
+        age_top3 = summary.get("age_top3") or []
+        parts: list[str] = []
+        for bucket in age_top3:
+            label = bucket.get("label") or bucket.get("code") or "—"
+            pct = _format_percent(bucket.get("value"))
+            parts.append(f"{label} {pct}")
+        if not parts:
+            return "—"
+        hidden = max(0, len(summary.get("age_all") or []) - len(age_top3))
+        if hidden:
+            parts.append(f"+ {hidden}개 더")
+        return ", ".join(parts)
+
+    def _fmt_flow_text(summary: dict | None) -> str:
+        if not summary:
+            return "—"
+        flow = summary.get("flow") or {}
+        order = ["유동", "직장", "거주"]
+        parts = []
+        valid = False
+        for key in order:
+            pct = _format_percent(flow.get(key))
+            if pct != "—":
+                valid = True
+            parts.append(f"{key} {pct}")
+        return ", ".join(parts) if valid else "—"
+
+    def _fmt_kpi_text(summary: dict | None) -> str:
+        if not summary:
+            return "—"
+        kpi = summary.get("kpi") or {}
+        new_pct = _format_percent(kpi.get("new_rate"))
+        revisit_pct = _format_percent(kpi.get("revisit_rate"))
+        if new_pct == "—" and revisit_pct == "—":
+            return "—"
+        return f"신규 {new_pct} / 재방문 {revisit_pct}"
+
+    def _fmt_trend_text(summary: dict | None) -> str:
+        if not summary:
+            return "—"
+        trend = summary.get("trend") or {}
+        if "revisit_pp_vs_2m" in trend or "new_pp_vs_2m" in trend:
+            revisit = _format_pp_delta(trend.get("revisit_pp_vs_2m"))
+            new = _format_pp_delta(trend.get("new_pp_vs_2m"))
+            if revisit == "—" and new == "—":
+                return "—"
+            return f"최근 3개월: 재방문 {revisit}pp / 신규 {new}pp"
+        if "revisit_pp_vs_1m" in trend or "new_pp_vs_1m" in trend:
+            revisit = _format_pp_delta(trend.get("revisit_pp_vs_1m"))
+            new = _format_pp_delta(trend.get("new_pp_vs_1m"))
+            if revisit == "—" and new == "—":
+                return "—"
+            return f"최근 2개월: 재방문 {revisit}pp / 신규 {new}pp"
+        return "—"
+
+    def _fmt_yoy_text(summary: dict | None) -> str:
+        if not summary:
+            return "—"
+        yoy = summary.get("yoy")
+        if not yoy:
+            return "—"
+        revisit = _format_pp_delta(yoy.get("revisit_pp_yoy"))
+        new = _format_pp_delta(yoy.get("new_pp_yoy"))
+        if revisit == "—" and new == "—":
+            return "전년동월: —"
+        return f"전년동월: 재방문 {revisit}pp / 신규 {new}pp"
+
+    def _fmt_latest_month(summary: dict | None) -> str:
+        if not summary:
+            return "—"
+        latest = summary.get("latest_ym")
+        if not latest:
+            return "—"
+        ym = str(latest)
+        if len(ym) < 6:
+            return "—"
+        year = ym[:4]
+        month = ym[4:6]
+        if not month.isdigit():
+            return "—"
+        return f"{year}.{month}"
+
+    table_payload = {
         "업종": industry,
         "주소": address,
-        "주요 고객층": _collect_major_customers(agent1_json),
-        "고객 유형": customer_type if customer_type else "—",
-        "신규/재방문": new_revisit,
-        "객단가 구간": spend_band if spend_band else "—",
+        "대표월": _fmt_latest_month(panel_summary),
+        "주요 고객층": _fmt_age_text(panel_summary),
+        "유입유형": _fmt_flow_text(panel_summary),
+        "KPI": _fmt_kpi_text(panel_summary),
+        "추세": _fmt_trend_text(panel_summary),
+        "YoY": _fmt_yoy_text(panel_summary),
     }
-    return pd.DataFrame([data]), data
+
+    return pd.DataFrame([table_payload]), table_payload, panel_summary
 def _build_goal_lines(agent1_json: dict) -> tuple[str, list[str]]:
     period = (agent1_json or {}).get("period", {})
     months = period.get("months")
@@ -638,11 +769,48 @@ def _format_list(values) -> str:
     return str(values)
 
 
+def _render_status_summary(
+    table_dict: dict | None,
+    panel_summary: dict | None,
+    *,
+    debug_mode: bool,
+) -> None:
+    if not table_dict:
+        st.info("요약 정보가 없습니다.")
+        return
+
+    rows = [
+        ("업종", table_dict.get("업종", "—")),
+        ("주소", table_dict.get("주소", "—")),
+        ("대표월", table_dict.get("대표월", "—")),
+        ("주요 고객층", table_dict.get("주요 고객층", "—")),
+        ("유입유형", table_dict.get("유입유형", "—")),
+        ("KPI", table_dict.get("KPI", "—")),
+        ("추세", table_dict.get("추세", "—")),
+        ("YoY", table_dict.get("YoY", "—")),
+    ]
+    summary_df = pd.DataFrame(rows, columns=["항목", "값"])
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    if panel_summary and len(panel_summary.get("age_all") or []) > 3:
+        details = []
+        for bucket in panel_summary.get("age_all", []):
+            label = bucket.get("label") or bucket.get("code") or "—"
+            pct = _format_percent(bucket.get("value"))
+            details.append(f"{label} {pct}")
+        with st.expander("전체 연령 비중 보기", expanded=False):
+            st.markdown(", ".join(details) if details else "—")
+
+    if debug_mode and panel_summary and panel_summary.get("guard_fallback"):
+        st.caption("[guard fallback] used latest available month; sums outside 100±0.5")
+
+
 def render_summary_view(
     agent1_json: dict,
     agent2_json: dict,
     overview_df: pd.DataFrame | None = None,
     table_dict: dict | None = None,
+    panel_summary: dict | None = None,
     retrieval_payload: dict | None = None,
 ) -> None:
     merchant_title = _extract_merchant_name(agent1_json)
@@ -657,11 +825,15 @@ def render_summary_view(
         render_info = debug_info.get("render") if isinstance(debug_info, dict) else None
         if isinstance(render_info, dict) and isinstance(render_info.get("table_dict"), dict):
             table_dict = render_info.get("table_dict")
-            overview_df = pd.DataFrame([table_dict])
+            panel_summary = render_info.get("panel_summary")
+            if overview_df is None:
+                overview_df = pd.DataFrame([table_dict])
         else:
-            overview_df, table_dict = _collect_overview_row(agent1_json)
+            overview_df, table_dict, panel_summary = _collect_overview_row(agent1_json)
             if isinstance(debug_info, dict):
-                debug_info.setdefault("render", {})["table_dict"] = table_dict
+                cache_block = debug_info.setdefault("render", {})
+                cache_block["table_dict"] = table_dict
+                cache_block["panel_summary"] = panel_summary
     if overview_df is None:
         if table_dict:
             overview_df = pd.DataFrame([table_dict])
@@ -678,11 +850,7 @@ def render_summary_view(
 
     if is_public_mode:
         st.subheader("현황 요약")
-        if table_dict:
-            summary_df = pd.DataFrame(list(table_dict.items()), columns=["항목", "값"]).head(3)
-            st.table(summary_df)
-        else:
-            st.info("요약 정보가 없습니다.")
+        _render_status_summary(table_dict, panel_summary, debug_mode=debug_mode)
     else:
         st.subheader("현황 표")
         st.table(overview_df)
@@ -1570,14 +1738,16 @@ def main() -> None:
                 try:
                     a1 = agent1_pipeline(question, SHINHAN_DIR, EXTERNAL_DIR)
                     try:
-                        overview_df, table_dict = _collect_overview_row(a1)
+                        overview_df, table_dict, panel_summary = _collect_overview_row(a1)
                     except Exception:
-                        overview_df, table_dict = pd.DataFrame(), {}
+                        overview_df, table_dict, panel_summary = pd.DataFrame(), {}, None
                     if isinstance(a1, dict):
                         dbg = _get_debug_section(a1)
-                        dbg.setdefault('render', {})['table_dict'] = table_dict
+                        render_cache = dbg.setdefault('render', {})
+                        render_cache['table_dict'] = table_dict
+                        render_cache['panel_summary'] = panel_summary
                         a1['debug'] = dbg
-                    st.session_state['_latest_overview'] = (overview_df, table_dict)
+                    st.session_state['_latest_overview'] = (overview_df, table_dict, panel_summary)
                     st.session_state['_latest_agent1'] = a1
                     st.session_state['_latest_question'] = question
                     st.success("Agent-1 JSON 생성 완료")
