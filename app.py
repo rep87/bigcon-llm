@@ -72,9 +72,33 @@ except Exception as import_error:
         f"{hint_text}"
     ) from import_error
 
+AVAILABLE = sorted(n for n in dir(panel_extract) if not n.startswith("_"))
 
-NEEDED = panel_extract.NEEDED
-subset_needed = panel_extract.subset_needed
+_subset = (
+    getattr(panel_extract, "subset_needed", None)
+    or getattr(panel_extract, "select_needed", None)
+    or getattr(panel_extract, "get_required_subset", None)
+)
+if _subset is None:
+    raise ImportError(
+        "[panel_extract] Expected function not found. "
+        "Looked for subset_needed/select_needed/get_required_subset. "
+        f"Available: {AVAILABLE}"
+    )
+subset_needed = _subset
+
+_NEEDED = (
+    getattr(panel_extract, "NEEDED", None)
+    or getattr(panel_extract, "REQUIRED_COLS", None)
+    or getattr(panel_extract, "NEEDED_COLS", None)
+)
+if _NEEDED is None:
+    raise ImportError(
+        "[panel_extract] NEEDED (whitelist) missing. "
+        "Looked for NEEDED/REQUIRED_COLS/NEEDED_COLS. "
+        f"Available: {AVAILABLE}"
+    )
+NEEDED = _NEEDED
 
 import app_core.config as app_config
 import app_core.diagnostics as diagnostics

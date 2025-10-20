@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 import pandas as pd
 
 # Explicit whitelist of columns that may be accessed from the panel CSV.
-SAFE_COLS: Dict[str, List[str]] = {
+SAFE_COLS: dict[str, list[str]] = {
     "id": ["ENCODED_MCT"],
     "period": ["TA_YM"],
     "age_gender": [
@@ -32,7 +33,7 @@ SAFE_COLS: Dict[str, List[str]] = {
 }
 
 # Flattened whitelist to enforce exact column access.
-NEEDED: List[str] = (
+NEEDED: list[str] = (
     SAFE_COLS["id"]
     + SAFE_COLS["period"]
     + SAFE_COLS["age_gender"]
@@ -54,6 +55,13 @@ def subset_needed(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise KeyError(f"[panel_extract] Missing required columns: {sorted(missing)}")
     return df[NEEDED].copy()
+
+
+# Backward compatibility aliases
+select_needed = subset_needed
+get_required_subset = subset_needed
+NEEDED_COLS = NEEDED
+REQUIRED_COLS = NEEDED
 
 
 def _num(value: Any) -> float | None:
@@ -80,7 +88,7 @@ def _age_bucket_sum(row: pd.Series, columns: Iterable[str]) -> float:
     return float(sum(values)) if values else 0.0
 
 
-def latest_valid_row(df: pd.DataFrame, mct_id: str, eps: float = 0.5) -> Tuple[pd.Series, int]:
+def latest_valid_row(df: pd.DataFrame, mct_id: str, eps: float = 0.5) -> tuple[pd.Series, int]:
     """Return the most recent row that passes guard checks.
 
     If no row satisfies the guard conditions the latest available row is
@@ -152,7 +160,7 @@ def latest_valid_row(df: pd.DataFrame, mct_id: str, eps: float = 0.5) -> Tuple[p
     return fallback, int(fallback["__TA_YM_INT__"])
 
 
-def _age_buckets(row: pd.Series) -> List[Dict[str, Any]]:
+def _age_buckets(row: pd.Series) -> list[dict[str, Any]]:
     specs = [
         ("1020", "10–20대", "M12_MAL_1020_RAT", "M12_FME_1020_RAT"),
         ("30", "30대", "M12_MAL_30_RAT", "M12_FME_30_RAT"),
@@ -160,7 +168,7 @@ def _age_buckets(row: pd.Series) -> List[Dict[str, Any]]:
         ("50", "50대", "M12_MAL_50_RAT", "M12_FME_50_RAT"),
         ("60", "60대+", "M12_MAL_60_RAT", "M12_FME_60_RAT"),
     ]
-    buckets: List[Dict[str, Any]] = []
+    buckets: list[dict[str, Any]] = []
     for code, label, male_col, female_col in specs:
         male = _pct(row.get(male_col)) or 0.0
         female = _pct(row.get(female_col)) or 0.0
@@ -170,7 +178,7 @@ def _age_buckets(row: pd.Series) -> List[Dict[str, Any]]:
     return buckets
 
 
-def _flow_breakdown(row: pd.Series) -> Dict[str, float | None]:
+def _flow_breakdown(row: pd.Series) -> dict[str, float | None]:
     return {
         "residential": _pct(row.get("RC_M1_SHC_RSD_UE_CLN_RAT")),
         "workplace": _pct(row.get("RC_M1_SHC_WP_UE_CLN_RAT")),
@@ -178,7 +186,7 @@ def _flow_breakdown(row: pd.Series) -> Dict[str, float | None]:
     }
 
 
-def _gender_share(row: pd.Series) -> Dict[str, float]:
+def _gender_share(row: pd.Series) -> dict[str, float]:
     female = _age_bucket_sum(
         row,
         [
@@ -202,7 +210,7 @@ def _gender_share(row: pd.Series) -> Dict[str, float]:
     return {"female": round(female, 1), "male": round(male, 1)}
 
 
-def build_panel_dict(row: pd.Series, latest_ym: int) -> Dict[str, Any]:
+def build_panel_dict(row: pd.Series, latest_ym: int) -> dict[str, Any]:
     buckets = _age_buckets(row)
     kpis = {
         "revisit_rate": _pct(row.get("MCT_UE_CLN_REU_RAT")),
@@ -211,7 +219,7 @@ def build_panel_dict(row: pd.Series, latest_ym: int) -> Dict[str, Any]:
     flow = _flow_breakdown(row)
     gender = _gender_share(row)
 
-    warnings: List[str] = []
+    warnings: list[str] = []
     if row.attrs.get("guard_fallback"):
         warnings.append("[guard fallback] used latest available month; sums outside 100±0.5")
 
@@ -226,7 +234,7 @@ def build_panel_dict(row: pd.Series, latest_ym: int) -> Dict[str, Any]:
     }
 
 
-def extract_panel_for(df: pd.DataFrame, mct_id: str, *, allow_alias: bool = False) -> Dict[str, Any]:
+def extract_panel_for(df: pd.DataFrame, mct_id: str, *, allow_alias: bool = False) -> dict[str, Any]:
     """Extract sanitized panel metrics for a single merchant.
 
     Parameters
@@ -251,10 +259,10 @@ __all__ = [
     "SAFE_COLS",
     "NEEDED",
     "subset_needed",
-    "latest_valid_row",
-    "build_panel_dict",
-    "extract_panel_for",
-    "_pct",
+    "select_needed",
+    "get_required_subset",
+    "NEEDED_COLS",
+    "REQUIRED_COLS",
 ]
 
 
