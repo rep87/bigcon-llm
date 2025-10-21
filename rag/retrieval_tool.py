@@ -35,8 +35,6 @@ import pandas as pd
 
 from sentence_transformers import SentenceTransformer
 
-from rag.fallback_encoder import BowFallbackEncoder
-
 import app_core.config as app_config
 import app_core.embeddings as embeddings
 
@@ -56,38 +54,29 @@ class QueryEncoder:
             dv = "cpu"
         self._device = dv
         self._name = model_name
-        self._backend = "e5"
-        self._model: SentenceTransformer | None = None
-        self._ok = False
-        self._err: str | None = None
+        self._model = SentenceTransformer(model_name, device=dv)
         try:
-            model = SentenceTransformer(model_name, device=dv)
-            model.encode(
+            _ = self._model.encode(
                 "ping",
                 normalize_embeddings=True,
                 convert_to_numpy=True,
                 show_progress_bar=False,
             )
-            self._model = model
             self._ok = True
+            self._err: str | None = None
         except Exception as exc:  # pragma: no cover - defensive guard
-            self._model = None
             self._ok = False
             self._err = repr(exc)
 
     def encode(self, text: str, *, normalize_embeddings: bool = True) -> np.ndarray:
-        if not self._ok or self._model is None:
+        if not self._ok:
             raise RuntimeError(f"query embedding failed: {self._err}")
-        vec = self._model.encode(
+        return self._model.encode(
             text,
             normalize_embeddings=normalize_embeddings,
             convert_to_numpy=True,
             show_progress_bar=False,
         )
-        arr = np.asarray(vec, dtype=np.float32)
-        if arr.ndim > 1:
-            arr = arr[0]
-        return arr.astype(np.float32, copy=False)
 
     def encode_query(
         self,
@@ -109,9 +98,6 @@ class QueryEncoder:
     def model_id(self) -> str:
         return self._name
 
-    def backend(self) -> str:
-        return self._backend
-
     def healthy(self) -> bool:
         return bool(self._ok)
 
@@ -120,12 +106,10 @@ class QueryEncoder:
 
     def info(self) -> dict:
         return {
-            "backend": self._backend,
+            "backend": "e5",
             "model": self._name,
             "device": str(getattr(self._model, "device", self._device)),
             "normalize_embeddings": True,
-            "healthy": bool(self._ok),
-            "error": self._err,
         }
 
 
@@ -201,6 +185,8 @@ class RetrievalTool:
             model_name=E5_MODEL,
             device=os.getenv("RAG_DEVICE"),
         )
+        self._encoder_ok = self.encoder.healthy()
+        self._encoder_err: str | None = self.encoder.last_error()
         self.autoswitch = app_config.get_flag("RAG_AUTOSWITCH", True)
         self._encoder_cache: dict[
             Tuple[str, str, str, str, bool], object
@@ -432,6 +418,25 @@ class RetrievalTool:
         active_settings: embeddings.EmbedSettings = decision["settings"]
         warnings.extend(decision["warnings"])
 
+        if active_settings.backend != "hbw" and not getattr(self, "_encoder_ok", False):
+            error_detail = self._encoder_err or "encoder unavailable"
+            error_msg = f"query embedding failed: {error_detail}"
+            warnings.append(error_msg)
+            payload["error"] = error_msg
+            payload["warnings"] = list(dict.fromkeys(warnings))
+            payload["doc_specs"] = doc_specs
+            payload["selected_doc_ids"] = sorted(set(used_doc_ids) or selected_default)
+            payload["encoder_info"] = self._build_encoder_info(
+                doc_specs,
+                self.encoder,
+                active_settings,
+                warnings=warnings,
+                mode=decision["mode"],
+                skipped=skipped_docs,
+                consistent=decision["consistent"],
+            )
+            return payload
+
         try:
             encoder = self._get_encoder(active_settings)
         except Exception as exc:  # pragma: no cover - defensive guard
@@ -452,8 +457,6 @@ class RetrievalTool:
             )
             return payload
 
-        runtime_encoder: Any = encoder
-        fallback_warning: str | None = None
         try:
             if active_settings.backend == "hbw":
                 query_vec = encoder.encode_query(query_text, target_dim=dim)
@@ -466,51 +469,22 @@ class RetrievalTool:
                     normalize=normalize,
                 )
         except Exception as exc:  # pragma: no cover - defensive guard
-            if active_settings.backend == "hbw":
-                error_msg = f"query embedding failed: {exc}"
-                warnings.append(error_msg)
-                payload["error"] = error_msg
-                payload["warnings"] = warnings
-                payload["doc_specs"] = doc_specs
-                payload["selected_doc_ids"] = sorted(set(used_doc_ids) or selected_default)
-                payload["encoder_info"] = self._build_encoder_info(
-                    doc_specs,
-                    encoder,
-                    active_settings,
-                    warnings=warnings,
-                    mode=decision["mode"],
-                    skipped=skipped_docs,
-                    consistent=decision["consistent"],
-                )
-                return payload
-
-            fallback_warning = f"E5 failed: {exc}"
-            warnings.append(fallback_warning)
-            fallback_dim = int(dim or 2048)
-            runtime_encoder = BowFallbackEncoder(dim=fallback_dim)
-            try:
-                query_vec = runtime_encoder.encode_query(
-                    query_text,
-                    prefix="",
-                    normalize=True,
-                    target_dim=fallback_dim,
-                )
-            except Exception as fb_exc:  # pragma: no cover - defensive guard
-                error_msg = f"query embedding failed: {fb_exc}"
-                payload["error"] = error_msg
-                payload["warnings"] = warnings
-                payload["doc_specs"] = doc_specs
-                payload["selected_doc_ids"] = sorted(set(used_doc_ids) or selected_default)
-                payload["encoder_info"] = self._build_encoder_info(
-                    doc_specs,
-                    runtime_encoder,
-                    active_settings,
-                    warnings=warnings,
-                    mode=decision["mode"],
-                    skipped=skipped_docs,
-                    consistent=decision["consistent"],
-                )
-                return payload
+            error_msg = f"query embedding failed: {exc}"
+            warnings.append(error_msg)
+            payload["error"] = error_msg
+            payload["warnings"] = warnings
+            payload["doc_specs"] = doc_specs
+            payload["selected_doc_ids"] = sorted(set(used_doc_ids) or selected_default)
+            payload["encoder_info"] = self._build_encoder_info(
+                doc_specs,
+                encoder,
+                active_settings,
+                warnings=warnings,
+                mode=decision["mode"],
+                skipped=skipped_docs,
+                consistent=decision["consistent"],
+            )
+            return payload
 
         if query_vec.shape[0] != dim:
             error_msg = f"쿼리 임베딩 차원 {query_vec.shape[0]} != {dim}"
@@ -521,7 +495,7 @@ class RetrievalTool:
             payload["selected_doc_ids"] = sorted(set(used_doc_ids) or selected_default)
             payload["encoder_info"] = self._build_encoder_info(
                 doc_specs,
-                runtime_encoder,
+                encoder,
                 active_settings,
                 warnings=warnings,
                 mode=decision["mode"],
@@ -636,7 +610,7 @@ class RetrievalTool:
                 "warnings": list(dict.fromkeys(warnings)),
                 "encoder_info": self._build_encoder_info(
                     doc_specs,
-                    runtime_encoder,
+                    encoder,
                     active_settings,
                     warnings=warnings,
                     mode=decision["mode"],
@@ -913,18 +887,10 @@ class RetrievalTool:
             encoder_state = encoder.info()
         else:
             encoder_state = None
-        runtime_info = None
-        if isinstance(encoder_state, dict):
-            runtime_info = {
-                "backend": encoder_state.get("backend"),
-                "model": encoder_state.get("model"),
-                "details": encoder_state,
-            }
         return {
             "configured": self._settings_to_dict(self.encoder_settings),
             "active": self._settings_to_dict(active_settings),
             "encoder_state": encoder_state,
-            "runtime": runtime_info,
             "mode": mode,
             "consistent": bool(consistent),
             "doc_specs": list(doc_specs),
