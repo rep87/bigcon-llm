@@ -16,6 +16,11 @@ class RagHit:
 def _extract_model_name(payload: dict, retriever) -> str:
     encoder_info = payload.get("encoder_info") if isinstance(payload, dict) else None
     if isinstance(encoder_info, dict):
+        runtime = encoder_info.get("runtime")
+        if isinstance(runtime, dict):
+            model = runtime.get("model")
+            if model:
+                return str(model)
         active = encoder_info.get("active") or {}
         model = active.get("model") or active.get("model_name")
         if model:
