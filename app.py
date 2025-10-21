@@ -1,5 +1,24 @@
 from __future__ import annotations
 
+import os as _os
+
+_os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+_os.environ.setdefault("TRANSFORMERS_NO_ACCELERATE", "1")
+_os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+_os.environ.setdefault("OMP_NUM_THREADS", "2")
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+
+import sys, torch, platform
+
+print(
+    "[BOOT]",
+    {
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "platform": platform.platform(),
+    },
+)
+
 # --- minimal safe import block (panel_extract) ---
 import sys, os, traceback
 
