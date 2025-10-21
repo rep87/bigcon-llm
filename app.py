@@ -273,9 +273,28 @@ def render_rag_preview(
 
     with st.expander("🔍 RAG 유사도 미리보기", expanded=False):
         selected_display = payload.get("selected_docs") or "ALL"
-        st.caption(
-            f"Query encoder: **{model_name}** · threshold: {payload.get('threshold')} · selected: {selected_display}"
-        )
+        encoder_info = payload.get("encoder_info") or {}
+        runtime_info = encoder_info.get("runtime") if isinstance(encoder_info, dict) else {}
+        runtime_backend = ""
+        runtime_model = model_name
+        if isinstance(runtime_info, dict):
+            runtime_model = runtime_info.get("model") or runtime_model
+            runtime_backend = runtime_info.get("backend") or ""
+        label = f"Query encoder: **{runtime_model}**"
+        if runtime_backend:
+            backend_note = runtime_backend.lower()
+            if backend_note == "bow":
+                label += " (fallback: bow)"
+            else:
+                label += f" ({runtime_backend})"
+        label += f" · threshold: {payload.get('threshold')} · selected: {selected_display}"
+        st.caption(label)
+        warnings_list = [str(w) for w in payload.get("warnings") or [] if w]
+        if runtime_backend and runtime_backend.lower() == "bow" and warnings_list:
+            st.warning("\n".join(warnings_list))
+        elif warnings_list:
+            for warn in warnings_list:
+                st.caption(f"⚠️ {warn}")
         if reason != "ok":
             reason_text = f"Reason: `{reason}`"
             if error_text:
