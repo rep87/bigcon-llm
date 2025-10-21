@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 from sentence_transformers import SentenceTransformer
+import torch
 
 import app_core.config as app_config
 import app_core.embeddings as embeddings
@@ -67,6 +68,18 @@ class QueryEncoder:
         except Exception as exc:  # pragma: no cover - defensive guard
             self._ok = False
             self._err = repr(exc)
+
+        dev = "unknown"
+        try:
+            first_module = getattr(self._model, "_first_module", None)
+            if callable(first_module):
+                module = first_module()
+                for param in module.parameters():
+                    dev = str(torch.device(param.device))
+                    break
+        except Exception:
+            pass
+        print(f"[RAG] encoder={self._name} device={dev}")
 
     def encode(self, text: str, *, normalize_embeddings: bool = True) -> np.ndarray:
         if not self._ok:

@@ -163,6 +163,16 @@ import app_core.summary_blocks as summary_blocks
 import pandas as pd
 import streamlit as st
 
+
+def safe_analyze(run_fn, *args, **kwargs):
+    try:
+        with st.spinner("분석 중..."):
+            return run_fn(*args, **kwargs)
+    except Exception as e:
+        st.error("분석 중 오류가 발생했습니다. 아래 세부 로그를 확인하세요.")
+        st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+        st.stop()
+
 from rag.preview import rag_preview_search
 
 
@@ -278,11 +288,27 @@ def _render_main_views(
 def render_rag_preview(
     query_text: str, selected_doc_ids: list[str] | None, threshold: float
 ) -> None:
+    retriever = RETRIEVAL_TOOL if RETRIEVAL_TOOL is not None else None
+    if retriever is not None:
+        try:
+            print(
+                "[RAG] preview encoder id:",
+                retriever.model_name(),
+                id(retriever.encoder),
+            )
+        except Exception:
+            print(
+                "[RAG] preview encoder id:",
+                "unknown",
+                id(getattr(retriever, "encoder", retriever)),
+            )
+
     payload = rag_preview_search(
         query_text,
         k=8,
         threshold=threshold,
         selected_docs=selected_doc_ids,
+        retriever=retriever,
     )
     hits = payload.get("items", []) or []
     model_name = payload.get("model_name", "unknown")
@@ -1253,8 +1279,9 @@ def _get_debug_section(agent1_json: dict | None) -> dict:
 def _ensure_session_defaults() -> None:
     if "_app_mode" not in st.session_state:
         st.session_state["_app_mode"] = _DEFAULT_APP_MODE
-    if "seeded_default_question" not in st.session_state:
+    if "user_query_text" not in st.session_state:
         st.session_state["user_query_text"] = DEFAULT_QUESTION
+    if "seeded_default_question" not in st.session_state:
         st.session_state["seeded_default_question"] = True
     if "_data_flags" not in st.session_state:
         st.session_state["_data_flags"] = {
@@ -1930,10 +1957,12 @@ def main() -> None:
     analysis_tab, sources_tab = st.tabs(["📈 분석", "📚 Embedded Sources"])
 
     with analysis_tab:
+        if "user_query_text" not in st.session_state:
+            st.session_state["user_query_text"] = DEFAULT_QUESTION
+
         question = st.text_area(
             "질문을 입력하세요",
             key="user_query_text",
-            value=st.session_state.get("user_query_text", DEFAULT_QUESTION),
             placeholder=DEFAULT_QUESTION,
             height=120,
         )
@@ -1950,66 +1979,80 @@ def main() -> None:
                 infer_question_type,
             )
 
-            with st.spinner("Agent-1: 데이터 집계/요약 중..."):
+            def _run_agent1_step():
+                agent1_payload = agent1_pipeline(question, SHINHAN_DIR, EXTERNAL_DIR)
                 try:
-                    a1 = agent1_pipeline(question, SHINHAN_DIR, EXTERNAL_DIR)
-                    try:
-                        overview_df, table_dict, panel_summary = _collect_overview_row(a1)
-                    except Exception:
-                        overview_df, table_dict, panel_summary = pd.DataFrame(), {}, None
-                    if isinstance(a1, dict):
-                        dbg = _get_debug_section(a1)
-                        render_cache = dbg.setdefault('render', {})
-                        render_cache['table_dict'] = table_dict
-                        render_cache['panel_summary'] = panel_summary
-                        a1['debug'] = dbg
-                    st.session_state['_latest_overview'] = (overview_df, table_dict, panel_summary)
-                    st.session_state['_latest_agent1'] = a1
-                    st.session_state['_latest_question'] = question
-                    st.success("Agent-1 JSON 생성 완료")
+                    overview_df, table_dict, panel_summary = _collect_overview_row(agent1_payload)
                 except Exception:
-                    st.error("Agent-1 실행 오류")
-                    st.code(traceback.format_exc())
-                    st.stop()
+                    overview_df, table_dict, panel_summary = pd.DataFrame(), {}, None
+                if isinstance(agent1_payload, dict):
+                    dbg = _get_debug_section(agent1_payload)
+                    render_cache = dbg.setdefault("render", {})
+                    render_cache["table_dict"] = table_dict
+                    render_cache["panel_summary"] = panel_summary
+                    agent1_payload["debug"] = dbg
+                st.session_state["_latest_overview"] = (
+                    overview_df,
+                    table_dict,
+                    panel_summary,
+                )
+                st.session_state["_latest_agent1"] = agent1_payload
+                st.session_state["_latest_question"] = question
+                st.success("Agent-1 JSON 생성 완료")
+                return agent1_payload
 
-            flags_snapshot = st.session_state.get("_data_flags", {}).copy()
-            rag_info_for_prompt = _compute_rag_info(question, flags_snapshot)
-            rag_prompt_context = _prepare_rag_prompt_context(rag_info_for_prompt)
-            st.session_state['_latest_rag_info'] = rag_info_for_prompt
-            question_type = infer_question_type(question)
-            st.session_state['_latest_question_type'] = question_type
-            st.session_state['_latest_rag_prompt_context'] = rag_prompt_context
+            a1 = safe_analyze(_run_agent1_step)
 
-            with st.spinner("Agent-2: 카드 생성 중..."):
-                try:
-                    os.environ["GEMINI_API_KEY"] = API_KEY
-                    prompt_text = build_agent2_prompt(
-                        a1,
-                        question_text=question,
-                        question_type=question_type,
-                        rag_context=rag_prompt_context,
-                    )
-                    if isinstance(AGENT2_PROMPT_TRACE, dict):
-                        st.session_state["_latest_prompt_trace"] = dict(AGENT2_PROMPT_TRACE)
-                    else:
-                        st.session_state["_latest_prompt_trace"] = {}
-                    result = call_gemini_agent2(
-                        prompt_text,
-                        question_type=question_type,
-                        agent1_json=a1,
-                    )
-                    st.success("Agent-2 카드 생성 완료")
-                    st.session_state['_latest_agent2'] = result
-                    if isinstance(AGENT2_RESPONSE_TRACE, dict):
-                        st.session_state['_latest_response_trace'] = dict(AGENT2_RESPONSE_TRACE)
-                    else:
-                        st.session_state['_latest_response_trace'] = {}
-                except Exception:
-                    st.error("Agent-2 실행 오류")
-                    st.code(traceback.format_exc())
-                    st.stop()
+            def _prepare_rag_assets():
+                flags_snapshot = st.session_state.get("_data_flags", {}).copy()
+                rag_info_payload = _compute_rag_info(question, flags_snapshot)
+                rag_prompt_context = _prepare_rag_prompt_context(rag_info_payload)
+                question_type_value = infer_question_type(question)
+                st.session_state["_latest_rag_info"] = rag_info_payload
+                st.session_state["_latest_question_type"] = question_type_value
+                st.session_state["_latest_rag_prompt_context"] = rag_prompt_context
+                return flags_snapshot, rag_info_payload, rag_prompt_context, question_type_value
 
-            _render_main_views(question, a1, result, rag_info_override=rag_info_for_prompt)
+            (
+                flags_snapshot,
+                rag_info_for_prompt,
+                rag_prompt_context,
+                question_type,
+            ) = safe_analyze(_prepare_rag_assets)
+
+            def _run_agent2_step():
+                os.environ["GEMINI_API_KEY"] = API_KEY
+                prompt_text = build_agent2_prompt(
+                    a1,
+                    question_text=question,
+                    question_type=question_type,
+                    rag_context=rag_prompt_context,
+                )
+                if isinstance(AGENT2_PROMPT_TRACE, dict):
+                    st.session_state["_latest_prompt_trace"] = dict(AGENT2_PROMPT_TRACE)
+                else:
+                    st.session_state["_latest_prompt_trace"] = {}
+                agent2_payload = call_gemini_agent2(
+                    prompt_text,
+                    question_type=question_type,
+                    agent1_json=a1,
+                )
+                st.success("Agent-2 카드 생성 완료")
+                st.session_state["_latest_agent2"] = agent2_payload
+                if isinstance(AGENT2_RESPONSE_TRACE, dict):
+                    st.session_state["_latest_response_trace"] = dict(AGENT2_RESPONSE_TRACE)
+                else:
+                    st.session_state["_latest_response_trace"] = {}
+                return agent2_payload
+
+            result = safe_analyze(_run_agent2_step)
+
+            _render_main_views(
+                question,
+                a1,
+                result,
+                rag_info_override=rag_info_for_prompt,
+            )
 
         elif st.session_state.get('_latest_agent1') and st.session_state.get('_latest_agent2'):
             latest_agent1 = st.session_state.get('_latest_agent1')
