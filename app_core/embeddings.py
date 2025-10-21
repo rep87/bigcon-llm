@@ -48,7 +48,7 @@ class QueryEncoder:
                     "sentence-transformers/transformers 설치가 필요합니다."
                 ) from exc
 
-            model = SentenceTransformer(self.s.model_name)
+            model = SentenceTransformer(self.s.model_name, device="cpu")
             tokenizer = AutoTokenizer.from_pretrained(self.s.model_name, use_fast=True)
             self._model = model
             self._tokenizer = tokenizer
