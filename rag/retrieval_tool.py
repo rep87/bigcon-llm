@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -24,11 +25,67 @@ from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from sentence_transformers import SentenceTransformer
+
 import app_core.config as app_config
 import app_core.embeddings as embeddings
 
 
 _TOKEN_REGEX = re.compile(r"\w+", re.UNICODE)
+
+
+class QueryEncoder:
+    """CPU-pinned SentenceTransformer encoder for queries."""
+
+    def __init__(
+        self,
+        model_name: str = "intfloat/multilingual-e5-base",
+        device: str | None = None,
+    ) -> None:
+        self.model_name = model_name
+        env_device = device or os.getenv("RAG_DEVICE", "cpu")
+        if env_device != "cuda":
+            env_device = "cpu"
+        self.device = env_device
+        self.model = SentenceTransformer(self.model_name, device=self.device)
+        self._encode_kwargs = dict(
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            batch_size=32,
+            show_progress_bar=False,
+        )
+
+    def encode(self, text_or_list: Any, **kwargs: Any) -> np.ndarray:
+        options = dict(self._encode_kwargs)
+        if "normalize_embeddings" in kwargs:
+            options["normalize_embeddings"] = kwargs.pop("normalize_embeddings")
+        options.update(kwargs)
+        return self.model.encode(text_or_list, **options)
+
+    def encode_query(
+        self,
+        text: str,
+        *,
+        prefix: str | None = None,
+        normalize: bool = True,
+    ) -> np.ndarray:
+        prepared = f"{prefix or ''}{text or ''}"
+        vec = self.encode(prepared, normalize_embeddings=normalize)
+        arr = np.asarray(vec, dtype=np.float32)
+        if arr.ndim > 1:
+            arr = arr[0]
+        return arr
+
+    def model_id(self) -> str:
+        return self.model_name
+
+    def info(self) -> dict:
+        return {
+            "backend": "e5",
+            "model": self.model_name,
+            "device": str(getattr(self.model, "device", self.device)),
+            "normalize_embeddings": bool(self._encode_kwargs.get("normalize_embeddings", False)),
+        }
 
 
 @dataclass
@@ -99,14 +156,34 @@ class RetrievalTool:
             prefix_passage=prefix_passage,
             normalize=bool(normalize_flag),
         )
+        self.encoder = QueryEncoder(
+            model_name="intfloat/multilingual-e5-base",
+            device=os.getenv("RAG_DEVICE"),
+        )
+        self._encoder_ok = False
+        self._encoder_err: str | None = None
+        try:
+            _ = self.encoder.encode("ping")
+        except Exception as exc:
+            self._encoder_ok = False
+            self._encoder_err = repr(exc)
+        else:
+            self._encoder_ok = True
+            self._encoder_err = None
         self.autoswitch = app_config.get_flag("RAG_AUTOSWITCH", True)
         self._encoder_cache: dict[
-            Tuple[str, str, str, str, bool], embeddings.QueryEncoder
+            Tuple[str, str, str, str, bool], object
         ] = {}
 
     # ------------------------------------------------------------------
     # catalog helpers
     # ------------------------------------------------------------------
+    def model_name(self) -> str:
+        try:
+            return str(self.encoder.model_id())
+        except Exception:
+            return str(self.encoder_settings.model_name)
+
     def load_catalog(self) -> list[_DocumentEntry]:
         """Load manifest metadata for all indexed documents."""
         if self._catalog is not None:
@@ -324,6 +401,25 @@ class RetrievalTool:
         active_settings: embeddings.EmbedSettings = decision["settings"]
         warnings.extend(decision["warnings"])
 
+        if active_settings.backend != "hbw" and not getattr(self, "_encoder_ok", False):
+            error_detail = self._encoder_err or "encoder unavailable"
+            error_msg = f"query embedding failed: {error_detail}"
+            warnings.append(error_msg)
+            payload["error"] = error_msg
+            payload["warnings"] = list(dict.fromkeys(warnings))
+            payload["doc_specs"] = doc_specs
+            payload["selected_doc_ids"] = sorted(set(used_doc_ids) or selected_default)
+            payload["encoder_info"] = self._build_encoder_info(
+                doc_specs,
+                self.encoder,
+                active_settings,
+                warnings=warnings,
+                mode=decision["mode"],
+                skipped=skipped_docs,
+                consistent=decision["consistent"],
+            )
+            return payload
+
         try:
             encoder = self._get_encoder(active_settings)
         except Exception as exc:  # pragma: no cover - defensive guard
@@ -348,7 +444,13 @@ class RetrievalTool:
             if active_settings.backend == "hbw":
                 query_vec = encoder.encode_query(query_text, target_dim=dim)
             else:
-                query_vec = encoder.encode_query(query_text)
+                prefix = active_settings.prefix_query or ""
+                normalize = bool(active_settings.normalize)
+                query_vec = encoder.encode_query(
+                    query_text,
+                    prefix=prefix,
+                    normalize=normalize,
+                )
         except Exception as exc:  # pragma: no cover - defensive guard
             error_msg = f"쿼리 임베딩 실패: {exc}"
             warnings.append(error_msg)
@@ -633,17 +735,35 @@ class RetrievalTool:
             "manifest_path": str(entry.manifest_path),
         }
 
-    def _get_encoder(self, settings: embeddings.EmbedSettings) -> embeddings.QueryEncoder:
+    def _get_encoder(self, settings: embeddings.EmbedSettings) -> Any:
+        if settings.backend == "hbw":
+            key = (
+                settings.backend,
+                settings.model_name,
+                settings.prefix_query,
+                settings.prefix_passage,
+                bool(settings.normalize),
+            )
+            encoder = self._encoder_cache.get(key)
+            if not isinstance(encoder, embeddings.QueryEncoder):
+                encoder = embeddings.QueryEncoder(settings)
+                self._encoder_cache[key] = encoder
+            return encoder
+
+        model_name = settings.model_name or self.encoder.model_id()
+        if model_name == self.encoder.model_id():
+            return self.encoder
+
         key = (
             settings.backend,
-            settings.model_name,
+            model_name,
             settings.prefix_query,
             settings.prefix_passage,
             bool(settings.normalize),
         )
         encoder = self._encoder_cache.get(key)
-        if encoder is None:
-            encoder = embeddings.QueryEncoder(settings)
+        if not isinstance(encoder, QueryEncoder):
+            encoder = QueryEncoder(model_name=model_name, device=os.getenv("RAG_DEVICE"))
             self._encoder_cache[key] = encoder
         return encoder
 
@@ -738,7 +858,7 @@ class RetrievalTool:
     def _build_encoder_info(
         self,
         doc_specs: Sequence[dict],
-        encoder: embeddings.QueryEncoder | None,
+        encoder: Any,
         active_settings: embeddings.EmbedSettings,
         *,
         warnings: Sequence[str],
@@ -746,7 +866,10 @@ class RetrievalTool:
         skipped: Sequence[str],
         consistent: bool,
     ) -> dict:
-        encoder_state = encoder.info() if encoder is not None else None
+        if encoder is not None and hasattr(encoder, "info"):
+            encoder_state = encoder.info()
+        else:
+            encoder_state = None
         return {
             "configured": self._settings_to_dict(self.encoder_settings),
             "active": self._settings_to_dict(active_settings),
