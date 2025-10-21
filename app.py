@@ -8,13 +8,12 @@ _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 _os.environ.setdefault("OMP_NUM_THREADS", "2")
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 
-import sys, torch, platform
+import sys, platform
 
 print(
     "[BOOT]",
     {
         "python": sys.version.split()[0],
-        "torch": torch.__version__,
         "platform": platform.platform(),
     },
 )
