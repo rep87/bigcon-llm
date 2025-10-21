@@ -25,66 +25,62 @@ import json
 import math
 import os
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 from sentence_transformers import SentenceTransformer
-import torch
 
 import app_core.config as app_config
 import app_core.embeddings as embeddings
-
-
 _TOKEN_REGEX = re.compile(r"\w+", re.UNICODE)
 
 
-E5_MODEL = "intfloat/multilingual-e5-base"
+E5_MODEL = os.getenv("RAG_EMBED_MODEL", "intfloat/multilingual-e5-base")
+
+
+def _mem_mb() -> int:
+    try:
+        import psutil
+
+        return int(psutil.Process().memory_info().rss / (1024 * 1024))
+    except Exception:
+        return -1
+
+
+def build_query_encoder(device: str | None = None, model_name: str | None = None):
+    t0 = time.time()
+    target_model = model_name or E5_MODEL
+    dv = (device or os.getenv("RAG_DEVICE") or "cpu").lower()
+    if dv != "cuda":
+        dv = "cpu"
+    print(
+        f"[RAG] build encoder start model={target_model} device={dv} mem={_mem_mb()}MB"
+    )
+    model = SentenceTransformer(target_model, device=dv)
+    _ = model.encode(
+        "ping",
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    print(f"[RAG] build encoder done dt={time.time()-t0:.2f}s mem={_mem_mb()}MB")
+    return model
 
 
 class QueryEncoder:
-    """CPU-only SentenceTransformers E5 encoder. No meta/device_map/accelerate."""
-
-    def __init__(self, model_name: str = E5_MODEL, device: str | None = None) -> None:
-        dv = (device or os.getenv("RAG_DEVICE") or "cpu").lower()
-        if dv != "cuda":
-            dv = "cpu"
-        self._device = dv
-        self._name = model_name
-        self._model = SentenceTransformer(model_name, device=dv)
-        try:
-            _ = self._model.encode(
-                "ping",
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-            )
-            self._ok = True
-            self._err: str | None = None
-        except Exception as exc:  # pragma: no cover - defensive guard
-            self._ok = False
-            self._err = repr(exc)
-
-        dev = "unknown"
-        try:
-            first_module = getattr(self._model, "_first_module", None)
-            if callable(first_module):
-                module = first_module()
-                for param in module.parameters():
-                    dev = str(torch.device(param.device))
-                    break
-        except Exception:
-            pass
-        print(f"[RAG] encoder={self._name} device={dev}")
+    def __init__(self, model, name: str | None = None) -> None:
+        self._m = model
+        inferred = getattr(model, "name_or_path", None)
+        self._name = name or (inferred if isinstance(inferred, str) and inferred else E5_MODEL)
 
     def encode(self, text: str, *, normalize_embeddings: bool = True) -> np.ndarray:
-        if not self._ok:
-            raise RuntimeError(f"query embedding failed: {self._err}")
-        return self._model.encode(
+        return self._m.encode(
             text,
             normalize_embeddings=normalize_embeddings,
             convert_to_numpy=True,
@@ -112,16 +108,15 @@ class QueryEncoder:
         return self._name
 
     def healthy(self) -> bool:
-        return bool(self._ok)
+        return True
 
     def last_error(self) -> str | None:
-        return self._err
+        return None
 
     def info(self) -> dict:
         return {
             "backend": "e5",
             "model": self._name,
-            "device": str(getattr(self._model, "device", self._device)),
             "normalize_embeddings": True,
         }
 
@@ -194,12 +189,8 @@ class RetrievalTool:
             prefix_passage=prefix_passage,
             normalize=bool(normalize_flag),
         )
-        self.encoder = QueryEncoder(
-            model_name=E5_MODEL,
-            device=os.getenv("RAG_DEVICE"),
-        )
-        self._encoder_ok = self.encoder.healthy()
-        self._encoder_err: str | None = self.encoder.last_error()
+        self._encoder: QueryEncoder | None = None
+        self._encoder_factory: Callable[[], QueryEncoder] | None = None
         self.autoswitch = app_config.get_flag("RAG_AUTOSWITCH", True)
         self._encoder_cache: dict[
             Tuple[str, str, str, str, bool], object
@@ -209,10 +200,19 @@ class RetrievalTool:
     # catalog helpers
     # ------------------------------------------------------------------
     def model_name(self) -> str:
-        try:
-            return str(self.encoder.model_id())
-        except Exception:
-            return str(self.encoder_settings.model_name)
+        if self._encoder is not None:
+            try:
+                return str(self._encoder.model_id())
+            except Exception:
+                pass
+        return str(self.encoder_settings.model_name)
+
+    def set_query_encoder(self, encoder: QueryEncoder | None) -> None:
+        self._encoder = encoder
+
+    def set_query_encoder_factory(self, factory: Callable[[], QueryEncoder]) -> None:
+        self._encoder_factory = factory
+        self._encoder = None
 
     def load_catalog(self) -> list[_DocumentEntry]:
         """Load manifest metadata for all indexed documents."""
@@ -431,25 +431,10 @@ class RetrievalTool:
         active_settings: embeddings.EmbedSettings = decision["settings"]
         warnings.extend(decision["warnings"])
 
-        if active_settings.backend != "hbw" and not getattr(self, "_encoder_ok", False):
-            error_detail = self._encoder_err or "encoder unavailable"
-            error_msg = f"query embedding failed: {error_detail}"
-            warnings.append(error_msg)
-            payload["error"] = error_msg
-            payload["warnings"] = list(dict.fromkeys(warnings))
-            payload["doc_specs"] = doc_specs
-            payload["selected_doc_ids"] = sorted(set(used_doc_ids) or selected_default)
-            payload["encoder_info"] = self._build_encoder_info(
-                doc_specs,
-                self.encoder,
-                active_settings,
-                warnings=warnings,
-                mode=decision["mode"],
-                skipped=skipped_docs,
-                consistent=decision["consistent"],
-            )
-            return payload
-
+        step_t0 = time.time()
+        print(
+            f"[STEP] Retrieval start mem={_mem_mb()}MB docs={len(meta_rows)} backend={active_settings.backend}"
+        )
         try:
             encoder = self._get_encoder(active_settings)
         except Exception as exc:  # pragma: no cover - defensive guard
@@ -632,6 +617,9 @@ class RetrievalTool:
                 ),
             }
         )
+        print(
+            f"[STEP] Retrieval done  mem={_mem_mb()}MB dt={time.time()-step_t0:.2f}s hits={len(chunks_for_return)}"
+        )
         return payload
 
     # ------------------------------------------------------------------
@@ -780,9 +768,10 @@ class RetrievalTool:
                 self._encoder_cache[key] = encoder
             return encoder
 
-        model_name = settings.model_name or self.encoder.model_id()
-        if model_name == self.encoder.model_id():
-            return self.encoder
+        default_encoder = self._resolve_default_encoder()
+        model_name = settings.model_name or default_encoder.model_id()
+        if model_name == default_encoder.model_id():
+            return default_encoder
 
         key = (
             settings.backend,
@@ -793,8 +782,23 @@ class RetrievalTool:
         )
         encoder = self._encoder_cache.get(key)
         if not isinstance(encoder, QueryEncoder):
-            encoder = QueryEncoder(model_name=model_name, device=os.getenv("RAG_DEVICE"))
+            model = build_query_encoder(device=os.getenv("RAG_DEVICE"), model_name=model_name)
+            encoder = QueryEncoder(model, name=model_name)
             self._encoder_cache[key] = encoder
+        return encoder
+
+    def _resolve_default_encoder(self) -> QueryEncoder:
+        if self._encoder is not None:
+            return self._encoder
+        if self._encoder_factory is not None:
+            encoder = self._encoder_factory()
+            if not isinstance(encoder, QueryEncoder):
+                raise TypeError("encoder_factory must return QueryEncoder")
+            self._encoder = encoder
+            return encoder
+        model = build_query_encoder(device=os.getenv("RAG_DEVICE"))
+        encoder = QueryEncoder(model, name=E5_MODEL)
+        self._encoder = encoder
         return encoder
 
     def _decide_active_settings(self, doc_specs: Sequence[dict]) -> dict:

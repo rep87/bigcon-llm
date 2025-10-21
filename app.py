@@ -7,6 +7,8 @@ _os.environ.setdefault("TRANSFORMERS_NO_ACCELERATE", "1")
 _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 _os.environ.setdefault("OMP_NUM_THREADS", "2")
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+_os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+_os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import sys, platform
 
@@ -151,6 +153,7 @@ except Exception as e:
 # --- end minimal safe import block ---
 
 import json
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -164,16 +167,49 @@ import pandas as pd
 import streamlit as st
 
 
-def safe_analyze(run_fn, *args, **kwargs):
+def _mem_mb() -> int:
     try:
-        with st.spinner("분석 중..."):
-            return run_fn(*args, **kwargs)
+        import psutil
+
+        return int(psutil.Process().memory_info().rss / (1024 * 1024))
+    except Exception:
+        return -1
+
+
+def safe_step(label: str, fn, *args, **kwargs):
+    try:
+        with st.spinner(f"{label} 실행 중..."):
+            return fn(*args, **kwargs)
     except Exception as e:
-        st.error("분석 중 오류가 발생했습니다. 아래 세부 로그를 확인하세요.")
+        st.error(f"{label} 중 오류가 발생했습니다.")
         st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
         st.stop()
 
+
 from rag.preview import rag_preview_search
+from rag.retrieval_tool import build_query_encoder, QueryEncoder
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_encoder() -> QueryEncoder:
+    model = build_query_encoder(device="cpu")
+    return QueryEncoder(model)
+
+
+def _ensure_retriever_encoder(enabled: bool) -> QueryEncoder | None:
+    if not enabled:
+        return None
+    if RETRIEVAL_TOOL is None or RETRIEVAL_INIT_ERROR is not None:
+        return None
+    encoder = get_cached_encoder()
+    try:
+        if hasattr(RETRIEVAL_TOOL, "set_query_encoder_factory"):
+            RETRIEVAL_TOOL.set_query_encoder_factory(get_cached_encoder)  # type: ignore[arg-type]
+        if hasattr(RETRIEVAL_TOOL, "set_query_encoder"):
+            RETRIEVAL_TOOL.set_query_encoder(encoder)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return encoder
 
 
 def _pick_best_chunk(
@@ -285,30 +321,77 @@ def _render_main_views(
     render_rag_preview(preview_query, selected_doc_ids, threshold_value)
 
 
-def render_rag_preview(
-    query_text: str, selected_doc_ids: list[str] | None, threshold: float
-) -> None:
-    retriever = RETRIEVAL_TOOL if RETRIEVAL_TOOL is not None else None
-    if retriever is not None:
-        try:
-            print(
-                "[RAG] preview encoder id:",
-                retriever.model_name(),
-                id(retriever.encoder),
-            )
-        except Exception:
-            print(
-                "[RAG] preview encoder id:",
-                "unknown",
-                id(getattr(retriever, "encoder", retriever)),
-            )
+def run_retrieval_preview(
+    query_text: str,
+    selected_docs: list[str] | None,
+    threshold: float,
+    *,
+    rag_requested: bool | None = None,
+) -> dict:
+    cleaned_docs = [str(doc_id) for doc_id in (selected_docs or []) if str(doc_id)]
+    if rag_requested is None:
+        rag_requested = bool(st.session_state.get("_data_flags", {}).get("use_rag", False))
+    query_text = (query_text or "").strip()
+    base_payload = {
+        "query": query_text,
+        "model_name": "unknown",
+        "k": 8,
+        "threshold": threshold,
+        "selected_docs": cleaned_docs if cleaned_docs else None,
+        "items": [],
+        "reason": "rag_disabled" if not rag_requested else "no_docs",
+        "error": None,
+    }
+    if not rag_requested:
+        return base_payload
+    if RETRIEVAL_TOOL is None or RETRIEVAL_INIT_ERROR is not None:
+        payload = dict(base_payload)
+        payload.update(
+            {
+                "reason": "unavailable",
+                "error": RETRIEVAL_INIT_ERROR or "RetrievalTool unavailable",
+            }
+        )
+        return payload
+    if not cleaned_docs:
+        return base_payload
 
+    _ensure_retriever_encoder(True)
+    start_ts = time.time()
+    print(
+        f"[STEP] RAG preview start mem={_mem_mb()}MB docs={len(cleaned_docs)} query_len={len(query_text)}"
+    )
     payload = rag_preview_search(
         query_text,
         k=8,
         threshold=threshold,
-        selected_docs=selected_doc_ids,
-        retriever=retriever,
+        selected_docs=cleaned_docs,
+        retriever=RETRIEVAL_TOOL,
+    )
+    hits = payload.get("items", []) if isinstance(payload, dict) else []
+    print(
+        f"[STEP] RAG preview done mem={_mem_mb()}MB dt={time.time()-start_ts:.2f}s hits={len(hits)}"
+    )
+    if isinstance(payload, dict):
+        payload.setdefault("selected_docs", cleaned_docs)
+        payload.setdefault("query", query_text)
+        payload.setdefault("threshold", threshold)
+        payload.setdefault("k", 8)
+        payload.setdefault("reason", "ok")
+        payload.setdefault("error", None)
+        return payload
+    return base_payload
+
+
+def render_rag_preview(
+    query_text: str, selected_doc_ids: list[str] | None, threshold: float
+) -> None:
+    rag_requested = bool(st.session_state.get("_data_flags", {}).get("use_rag", False))
+    payload = run_retrieval_preview(
+        query_text,
+        selected_doc_ids,
+        threshold,
+        rag_requested=rag_requested,
     )
     hits = payload.get("items", []) or []
     model_name = payload.get("model_name", "unknown")
@@ -1336,10 +1419,12 @@ def _compute_rag_info(question_text: str, flags_snapshot: Dict[str, Any]) -> Dic
     rag_mode = str(flags_snapshot.get("rag_mode", "auto"))
     rag_threshold = float(flags_snapshot.get("rag_threshold", 0.35))
     rag_top_k = int(flags_snapshot.get("rag_top_k", 5))
+    rag_enabled = rag_requested and bool(selected_docs)
+    _ensure_retriever_encoder(rag_enabled)
     return failsoft.rag_adapter(
         question_text,
         RETRIEVAL_TOOL,
-        enabled=rag_requested and bool(selected_docs),
+        enabled=rag_enabled,
         top_k=rag_top_k,
         threshold=rag_threshold,
         mode=rag_mode,
@@ -1980,6 +2065,8 @@ def main() -> None:
             )
 
             def _run_agent1_step():
+                step_t0 = time.time()
+                print(f"[STEP] Agent-1 start mem={_mem_mb()}MB")
                 agent1_payload = agent1_pipeline(question, SHINHAN_DIR, EXTERNAL_DIR)
                 try:
                     overview_df, table_dict, panel_summary = _collect_overview_row(agent1_payload)
@@ -1999,9 +2086,12 @@ def main() -> None:
                 st.session_state["_latest_agent1"] = agent1_payload
                 st.session_state["_latest_question"] = question
                 st.success("Agent-1 JSON 생성 완료")
+                print(
+                    f"[STEP] Agent-1 done  mem={_mem_mb()}MB dt={time.time()-step_t0:.2f}s"
+                )
                 return agent1_payload
 
-            a1 = safe_analyze(_run_agent1_step)
+            a1 = safe_step("Agent-1", _run_agent1_step)
 
             def _prepare_rag_assets():
                 flags_snapshot = st.session_state.get("_data_flags", {}).copy()
@@ -2018,15 +2108,32 @@ def main() -> None:
                 rag_info_for_prompt,
                 rag_prompt_context,
                 question_type,
-            ) = safe_analyze(_prepare_rag_assets)
+            ) = safe_step("RAG 구성", _prepare_rag_assets)
 
-            def _run_agent2_step():
+            selected_for_preview = flags_snapshot.get("rag_selected_ids")
+            threshold_for_preview = float(flags_snapshot.get("rag_threshold", 0.35))
+            rag_preview_payload = safe_step(
+                "RAG 미리보기",
+                run_retrieval_preview,
+                question,
+                selected_for_preview,
+                threshold_for_preview,
+                rag_requested=flags_snapshot.get("use_rag", False),
+            )
+            st.session_state["_latest_rag_preview"] = rag_preview_payload
+
+            def _run_agent2_step(
+                agent1_json: dict | None,
+                question_text: str,
+                question_type_value: str | None,
+                rag_context: Dict[str, Any] | None,
+            ):
                 os.environ["GEMINI_API_KEY"] = API_KEY
                 prompt_text = build_agent2_prompt(
-                    a1,
-                    question_text=question,
-                    question_type=question_type,
-                    rag_context=rag_prompt_context,
+                    agent1_json,
+                    question_text=question_text,
+                    question_type=question_type_value,
+                    rag_context=rag_context,
                 )
                 if isinstance(AGENT2_PROMPT_TRACE, dict):
                     st.session_state["_latest_prompt_trace"] = dict(AGENT2_PROMPT_TRACE)
@@ -2034,8 +2141,8 @@ def main() -> None:
                     st.session_state["_latest_prompt_trace"] = {}
                 agent2_payload = call_gemini_agent2(
                     prompt_text,
-                    question_type=question_type,
-                    agent1_json=a1,
+                    question_type=question_type_value,
+                    agent1_json=agent1_json,
                 )
                 st.success("Agent-2 카드 생성 완료")
                 st.session_state["_latest_agent2"] = agent2_payload
@@ -2045,7 +2152,14 @@ def main() -> None:
                     st.session_state["_latest_response_trace"] = {}
                 return agent2_payload
 
-            result = safe_analyze(_run_agent2_step)
+            result = safe_step(
+                "Agent-2",
+                _run_agent2_step,
+                a1,
+                question,
+                question_type,
+                rag_prompt_context,
+            )
 
             _render_main_views(
                 question,
