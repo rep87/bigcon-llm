@@ -292,6 +292,40 @@ def _render_main_views(
             if debug_mode:
                 agent2_payload.setdefault("caveats", fail_soft_payload.get("caveats"))
 
+        cards = []
+        if isinstance(agent2_payload, dict):
+            raw_cards = (
+                agent2_payload.get("answers")
+                or agent2_payload.get("recommendations")
+                or []
+            )
+            if isinstance(raw_cards, list):
+                cards = raw_cards
+
+        if cards and isinstance(cards[0], dict) and retrieval_payload:
+            include_evidence = retrieval_payload.get("include_evidence")
+            if include_evidence:
+                top_chunks = (
+                    retrieval_payload.get("chunks", [])[: retrieval_payload.get("used_k", 0)]
+                )
+                rag_evi: list[dict[str, Any]] = []
+                for chunk in top_chunks:
+                    rag_evi.append(
+                        {
+                            "source": "RAG",
+                            "doc_id": chunk.get("doc_id"),
+                            "chunk_id": chunk.get("chunk_id"),
+                            "score": round(float(chunk.get("score", 0.0)), 3),
+                            "preview": (chunk.get("text") or "")[:180],
+                        }
+                    )
+                if rag_evi:
+                    existing = cards[0].get("evidence")
+                    if isinstance(existing, list):
+                        cards[0]["evidence"] = existing + rag_evi
+                    else:
+                        cards[0]["evidence"] = rag_evi
+
         if debug_mode and show_debug_panel:
             render_fail_soft_answer(fail_soft_payload, rag_info=rag_info)
         render_summary_view(
@@ -1204,6 +1238,13 @@ def render_summary_view(
     if not isinstance(answers, list):
         answers = []
 
+    data_flags = st.session_state.get("_data_flags", {})
+    if not isinstance(data_flags, dict):
+        data_flags = {}
+    use_structured = bool(data_flags.get("use_structured", True))
+    use_weather = bool(data_flags.get("use_weather", False))
+    use_external = bool(data_flags.get("use_external", False))
+
     st.subheader("아이디어 제안")
     if not answers:
         st.info("아이디어 제안이 제공되지 않았습니다.")
@@ -1237,12 +1278,26 @@ def render_summary_view(
                                     disabled=True,
                                     tooltip="RAG 근거 매칭 실패",
                                 )
-                        elif source in {"STRUCTURED", "WEATHER", "EXTERNAL"}:
+                        elif source == "STRUCTURED":
                             _render_evidence_badge(
                                 None,
                                 None,
-                                disabled=True,
-                                tooltip=f"{source} 근거",
+                                disabled=not use_structured,
+                                tooltip="STRUCTURED 근거",
+                            )
+                        elif source == "WEATHER":
+                            _render_evidence_badge(
+                                None,
+                                None,
+                                disabled=not use_weather,
+                                tooltip="WEATHER 근거",
+                            )
+                        elif source == "EXTERNAL":
+                            _render_evidence_badge(
+                                None,
+                                None,
+                                disabled=not use_external,
+                                tooltip="EXTERNAL 근거",
                             )
                         else:
                             tooltip = "근거 없음" if source in {"NONE", ""} else source
