@@ -13,6 +13,14 @@ Streamlit app can import and query it without additional services.
 
 from __future__ import annotations
 
+# --- RAG encoder hardening (CPU-only, no meta/accelerate) ---
+import os as _os
+
+_os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+_os.environ.setdefault("TRANSFORMERS_NO_ACCELERATE", "1")
+_os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+# ------------------------------------------------------------
+
 import json
 import math
 import os
@@ -34,33 +42,41 @@ import app_core.embeddings as embeddings
 _TOKEN_REGEX = re.compile(r"\w+", re.UNICODE)
 
 
-class QueryEncoder:
-    """CPU-pinned SentenceTransformer encoder for queries."""
+E5_MODEL = "intfloat/multilingual-e5-base"
 
-    def __init__(
-        self,
-        model_name: str = "intfloat/multilingual-e5-base",
-        device: str | None = None,
-    ) -> None:
-        self.model_name = model_name
-        env_device = device or os.getenv("RAG_DEVICE", "cpu")
-        if env_device != "cuda":
-            env_device = "cpu"
-        self.device = env_device
-        self.model = SentenceTransformer(self.model_name, device=self.device)
-        self._encode_kwargs = dict(
-            normalize_embeddings=True,
+
+class QueryEncoder:
+    """CPU-only SentenceTransformers E5 encoder. No meta/device_map/accelerate."""
+
+    def __init__(self, model_name: str = E5_MODEL, device: str | None = None) -> None:
+        dv = (device or os.getenv("RAG_DEVICE") or "cpu").lower()
+        if dv != "cuda":
+            dv = "cpu"
+        self._device = dv
+        self._name = model_name
+        self._model = SentenceTransformer(model_name, device=dv)
+        try:
+            _ = self._model.encode(
+                "ping",
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            self._ok = True
+            self._err: str | None = None
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self._ok = False
+            self._err = repr(exc)
+
+    def encode(self, text: str, *, normalize_embeddings: bool = True) -> np.ndarray:
+        if not self._ok:
+            raise RuntimeError(f"query embedding failed: {self._err}")
+        return self._model.encode(
+            text,
+            normalize_embeddings=normalize_embeddings,
             convert_to_numpy=True,
-            batch_size=32,
             show_progress_bar=False,
         )
-
-    def encode(self, text_or_list: Any, **kwargs: Any) -> np.ndarray:
-        options = dict(self._encode_kwargs)
-        if "normalize_embeddings" in kwargs:
-            options["normalize_embeddings"] = kwargs.pop("normalize_embeddings")
-        options.update(kwargs)
-        return self.model.encode(text_or_list, **options)
 
     def encode_query(
         self,
@@ -76,15 +92,24 @@ class QueryEncoder:
             arr = arr[0]
         return arr
 
+    def model_name(self) -> str:
+        return self._name
+
     def model_id(self) -> str:
-        return self.model_name
+        return self._name
+
+    def healthy(self) -> bool:
+        return bool(self._ok)
+
+    def last_error(self) -> str | None:
+        return self._err
 
     def info(self) -> dict:
         return {
             "backend": "e5",
-            "model": self.model_name,
-            "device": str(getattr(self.model, "device", self.device)),
-            "normalize_embeddings": bool(self._encode_kwargs.get("normalize_embeddings", False)),
+            "model": self._name,
+            "device": str(getattr(self._model, "device", self._device)),
+            "normalize_embeddings": True,
         }
 
 
@@ -157,19 +182,11 @@ class RetrievalTool:
             normalize=bool(normalize_flag),
         )
         self.encoder = QueryEncoder(
-            model_name="intfloat/multilingual-e5-base",
+            model_name=E5_MODEL,
             device=os.getenv("RAG_DEVICE"),
         )
-        self._encoder_ok = False
-        self._encoder_err: str | None = None
-        try:
-            _ = self.encoder.encode("ping")
-        except Exception as exc:
-            self._encoder_ok = False
-            self._encoder_err = repr(exc)
-        else:
-            self._encoder_ok = True
-            self._encoder_err = None
+        self._encoder_ok = self.encoder.healthy()
+        self._encoder_err: str | None = self.encoder.last_error()
         self.autoswitch = app_config.get_flag("RAG_AUTOSWITCH", True)
         self._encoder_cache: dict[
             Tuple[str, str, str, str, bool], object
@@ -452,7 +469,7 @@ class RetrievalTool:
                     normalize=normalize,
                 )
         except Exception as exc:  # pragma: no cover - defensive guard
-            error_msg = f"쿼리 임베딩 실패: {exc}"
+            error_msg = f"query embedding failed: {exc}"
             warnings.append(error_msg)
             payload["error"] = error_msg
             payload["warnings"] = warnings
