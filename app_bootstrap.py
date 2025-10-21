@@ -31,6 +31,11 @@ def main() -> None:
 
     import app  # noqa: WPS433  # pylint: disable=import-outside-toplevel,unused-import
 
+    if hasattr(app, "main"):
+        app.main()
+    else:  # pragma: no cover - defensive guard to surface misconfiguration
+        raise AttributeError("app module does not expose a main() callable")
+
 
 if __name__ == "__main__":
     main()
