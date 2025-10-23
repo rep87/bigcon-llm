@@ -159,7 +159,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import app_core.config as app_config
-import app_core.diagnostics as diagnostics
 import app_core.failsoft as failsoft
 import app_core.formatters as formatters
 import app_core.summary_blocks as summary_blocks
@@ -188,6 +187,9 @@ def safe_step(label: str, fn, *args, **kwargs):
 
 from rag.preview import rag_preview_search
 from rag.retrieval_tool import build_query_encoder, QueryEncoder
+
+
+RAG_THRESHOLD_DEFAULT = 0.35
 
 
 @st.cache_resource(show_spinner=False)
@@ -251,8 +253,6 @@ def _render_main_views(
     *,
     rag_info_override: Dict[str, Any] | None = None,
 ) -> None:
-    debug_mode = _is_debug_mode()
-    show_debug_panel = _is_debug_panel_visible()
     flags_snapshot = st.session_state.get("_data_flags", {}).copy()
     structured_payload = failsoft.structured_adapter(agent1_payload)
     weather_payload = failsoft.weather_adapter(question_text, enabled=flags_snapshot.get("use_weather", False))
@@ -289,8 +289,6 @@ def _render_main_views(
                 agent2_payload.setdefault("evidence", retrieval_payload.get("evidence", []))
                 agent2_payload.setdefault("retrieval_chunks", retrieval_payload.get("chunks", []))
             agent2_payload.setdefault("used_data", fail_soft_payload.get("used_data"))
-            if debug_mode:
-                agent2_payload.setdefault("caveats", fail_soft_payload.get("caveats"))
 
         cards = []
         if isinstance(agent2_payload, dict):
@@ -326,8 +324,6 @@ def _render_main_views(
                     else:
                         cards[0]["evidence"] = rag_evi
 
-        if debug_mode and show_debug_panel:
-            render_fail_soft_answer(fail_soft_payload, rag_info=rag_info)
         render_summary_view(
             agent1_payload,
             agent2_payload or {},
@@ -351,26 +347,24 @@ def _render_main_views(
         selected_doc_ids = (
             st.session_state.get("_data_flags", {}).get("rag_selected_ids")
         )
-    threshold_value = float(st.session_state.get("_data_flags", {}).get("rag_threshold", 0.35))
-    render_rag_preview(preview_query, selected_doc_ids, threshold_value)
+    rag_mode_value = str(st.session_state.get("_data_flags", {}).get("rag_mode", "auto"))
+    render_rag_preview(preview_query, selected_doc_ids, rag_mode_value)
 
 
 def run_retrieval_preview(
     query_text: str,
     selected_docs: list[str] | None,
-    threshold: float,
     *,
-    rag_requested: bool | None = None,
+    rag_mode: str,
 ) -> dict:
     cleaned_docs = [str(doc_id) for doc_id in (selected_docs or []) if str(doc_id)]
-    if rag_requested is None:
-        rag_requested = bool(st.session_state.get("_data_flags", {}).get("use_rag", False))
+    rag_requested = rag_mode != "off"
     query_text = (query_text or "").strip()
     base_payload = {
         "query": query_text,
         "model_name": "unknown",
         "k": 8,
-        "threshold": threshold,
+        "threshold": RAG_THRESHOLD_DEFAULT,
         "selected_docs": cleaned_docs if cleaned_docs else None,
         "items": [],
         "reason": "rag_disabled" if not rag_requested else "no_docs",
@@ -398,7 +392,7 @@ def run_retrieval_preview(
     payload = rag_preview_search(
         query_text,
         k=8,
-        threshold=threshold,
+        threshold=RAG_THRESHOLD_DEFAULT,
         selected_docs=cleaned_docs,
         retriever=RETRIEVAL_TOOL,
     )
@@ -409,7 +403,7 @@ def run_retrieval_preview(
     if isinstance(payload, dict):
         payload.setdefault("selected_docs", cleaned_docs)
         payload.setdefault("query", query_text)
-        payload.setdefault("threshold", threshold)
+        payload.setdefault("threshold", RAG_THRESHOLD_DEFAULT)
         payload.setdefault("k", 8)
         payload.setdefault("reason", "ok")
         payload.setdefault("error", None)
@@ -418,14 +412,12 @@ def run_retrieval_preview(
 
 
 def render_rag_preview(
-    query_text: str, selected_doc_ids: list[str] | None, threshold: float
+    query_text: str, selected_doc_ids: list[str] | None, rag_mode: str
 ) -> None:
-    rag_requested = bool(st.session_state.get("_data_flags", {}).get("use_rag", False))
     payload = run_retrieval_preview(
         query_text,
         selected_doc_ids,
-        threshold,
-        rag_requested=rag_requested,
+        rag_mode=rag_mode,
     )
     hits = payload.get("items", []) or []
     model_name = payload.get("model_name", "unknown")
@@ -469,336 +461,6 @@ def render_rag_preview(
                 }
             )
         st.dataframe(rows, use_container_width=True, hide_index=True)
-
-def render_debug_view(agent1_json: dict | None, show_raw: bool | None = None) -> None:
-    if show_raw is None:
-        show_raw = DEBUG_SHOW_RAW
-    debug = _get_debug_section(agent1_json)
-    if not debug:
-        st.info("디버그 정보가 없습니다.")
-        return
-
-    question_type = st.session_state.get("_latest_question_type")
-    rag_info_state = st.session_state.get("_latest_rag_info")
-    rag_prompt_state = st.session_state.get("_latest_rag_prompt_context")
-    prompt_trace = st.session_state.get("_latest_prompt_trace")
-    response_trace = st.session_state.get("_latest_response_trace")
-    report_markdown = _build_debug_report_markdown(
-        agent1_json,
-        question_type=question_type,
-        rag_info=rag_info_state,
-        rag_prompt_context=rag_prompt_state,
-        prompt_trace=prompt_trace,
-        response_trace=response_trace,
-    )
-    if report_markdown:
-        st.markdown(report_markdown)
-
-    def _flatten_rows(obj: dict) -> pd.DataFrame:
-        rows = []
-        for key, value in (obj or {}).items():
-            if isinstance(value, (dict, list)):
-                try:
-                    text = json.dumps(value, ensure_ascii=False)
-                except TypeError:
-                    text = str(value)
-                rows.append({"항목": key, "값": text})
-            else:
-                rows.append({"항목": key, "값": value})
-        return pd.DataFrame(rows)
-
-    def _numeric_values(data):
-        if isinstance(data, dict):
-            for val in data.values():
-                yield from _numeric_values(val)
-        elif isinstance(data, (list, tuple)):
-            for item in data:
-                yield from _numeric_values(item)
-        elif isinstance(data, (int, float)):
-            yield data
-
-    errors = debug.get("errors", [])
-    resolve_info = debug.get("resolve", {}) or {}
-    panel_info = debug.get("panel", {}) or {}
-    snapshot_info = (debug.get("snapshot", {}) or {})
-    sanitized_snapshot = snapshot_info.get("sanitized") or {}
-    agent1_llm = debug.get("agent1_llm", {}) or {}
-
-    warnings = []
-    if resolve_info.get("resolved_merchant_id") is None:
-        warnings.append("가맹점 미확정: 전표본 요약으로 떨어질 위험")
-    rows_after = panel_info.get("rows_after")
-    if rows_after is not None and rows_after != 1:
-        warnings.append("단일 상점 패널 아님")
-    for num in _numeric_values(sanitized_snapshot):
-        try:
-            val = float(num)
-        except (TypeError, ValueError):
-            continue
-        if val < 0 or val > 100:
-            warnings.append("정규화 실패 의심")
-            break
-    if agent1_llm.get("safety_blocked"):
-        warnings.append("LLM 안전성 차단")
-
-    for err in errors:
-        stage = err.get('stage', 'unknown')
-        msg = err.get('msg', '')
-        st.error(f"[{stage}] {msg}")
-    for warn in warnings:
-        st.error(warn)
-
-    input_info = debug.get("input", {}) or {}
-    st.markdown("#### 입력/플래그")
-    st.write("원문:", input_info.get("original") or "—")
-    flags = input_info.get("flags") or {}
-    if flags:
-        st.write({k: flags.get(k) for k in sorted(flags)})
-
-    parse_info = debug.get("parse", {}) or {}
-    st.markdown("#### 파싱 결과")
-    st.write({
-        "merchant_mask": parse_info.get("merchant_mask"),
-        "mask_prefix": parse_info.get("mask_prefix"),
-        "sigungu": parse_info.get("sigungu"),
-        "pattern_used": parse_info.get("pattern_used"),
-        "elapsed_ms": parse_info.get("elapsed_ms"),
-    })
-
-    st.markdown("#### 가맹점 매칭")
-    st.write({
-        "path": resolve_info.get("path"),
-        "resolved_merchant_id": resolve_info.get("resolved_merchant_id"),
-        "elapsed_ms": resolve_info.get("elapsed_ms"),
-    })
-    candidates = resolve_info.get("candidates_top3") or []
-    if candidates:
-        st.table(pd.DataFrame(candidates))
-    else:
-        st.write("후보 없음")
-
-    st.markdown("#### 패널 필터")
-    st.write({
-        "rows_before": panel_info.get("rows_before"),
-        "rows_after": panel_info.get("rows_after"),
-        "latest_ta_ym": panel_info.get("latest_ta_ym"),
-        "elapsed_ms": panel_info.get("elapsed_ms"),
-    })
-
-    st.markdown("#### 스냅샷")
-    if show_raw:
-        raw_df = _flatten_rows(snapshot_info.get("raw") or {})
-        if not raw_df.empty:
-            st.caption("원본(raw)")
-            st.table(raw_df)
-    sanitized_df = _flatten_rows(sanitized_snapshot)
-    if not sanitized_df.empty:
-        st.caption("정규화(sanitized)")
-        st.table(sanitized_df)
-    age_details = formatters.get_age_bucket_details(agent1_json or {})
-    if age_details:
-        st.caption("연령 분포 결정")
-        st.table(pd.DataFrame(age_details))
-
-    render_info = debug.get("render", {}) or {}
-    table_dict = render_info.get("table_dict")
-    if isinstance(table_dict, dict) and table_dict:
-        st.markdown("#### 렌더 테이블")
-        st.table(pd.DataFrame([table_dict]))
-
-    rag_info_state = st.session_state.get("_latest_rag_info")
-    rag_prompt_state = st.session_state.get("_latest_rag_prompt_context") or {}
-    st.markdown("#### RAG 상태")
-    if isinstance(rag_info_state, dict):
-        summary = {
-            "requested": rag_info_state.get("requested"),
-            "enabled": rag_info_state.get("enabled"),
-            "selected_doc_ids": rag_info_state.get("selected_doc_ids"),
-            "threshold": rag_info_state.get("threshold"),
-            "max_score": rag_info_state.get("max_score"),
-            "mode": rag_info_state.get("mode"),
-            "error": rag_info_state.get("error"),
-        }
-        st.write(summary)
-        payload = rag_info_state.get("payload") or {}
-        chunk_rows = []
-        for chunk in (payload.get("chunks") or [])[:5]:
-            chunk_rows.append(
-                {
-                    "doc_id": chunk.get("doc_id"),
-                    "chunk_id": chunk.get("chunk_id"),
-                    "score": chunk.get("score"),
-                }
-            )
-        if chunk_rows:
-            st.table(pd.DataFrame(chunk_rows))
-        else:
-            st.write("근거 없음 또는 임계값 미달")
-        prompt_note = rag_prompt_state.get("prompt_note")
-        if prompt_note:
-            st.caption(_shorten_snippet(prompt_note, limit=200))
-    else:
-        st.write("RAG 정보가 없습니다.")
-
-    st.markdown("#### Agent-1 LLM")
-    st.write({
-        "used": agent1_llm.get("used"),
-        "model": agent1_llm.get("model"),
-        "resp_bytes": agent1_llm.get("resp_bytes"),
-        "safety_blocked": agent1_llm.get("safety_blocked"),
-        "elapsed_ms": agent1_llm.get("elapsed_ms"),
-    })
-    preview = agent1_llm.get("prompt_preview")
-    if preview:
-        st.caption("프롬프트 프리뷰")
-        st.code(preview)
-
-
-def _render_sources_footer(used_data: Dict[str, Any]) -> None:
-    if not used_data:
-        return
-
-    st.caption("Sources Used")
-    cols = st.columns(4)
-    structured_text = "✅ Structured" if used_data.get("structured") else "⚪️ Structured"
-    weather_text = "✅ Weather" if used_data.get("weather") else "⚪️ Weather"
-    external_text = "✅ External" if used_data.get("external") else "⚪️ External"
-    rag_info = used_data.get("rag") or {}
-    rag_enabled = bool(rag_info.get("enabled"))
-    rag_hits = rag_info.get("hits") or 0
-    rag_label = "✅ RAG" if rag_enabled and rag_hits else ("⚪️ RAG" if rag_enabled else "🚫 RAG")
-    rag_details = []
-    if rag_hits:
-        rag_details.append(f"hits={rag_hits}")
-    max_score = rag_info.get("max_score")
-    if isinstance(max_score, (int, float)):
-        rag_details.append(f"max={max_score:.2f}")
-    threshold = rag_info.get("threshold")
-    if isinstance(threshold, (int, float)):
-        rag_details.append(f"θ={threshold:.2f}")
-    mode = rag_info.get("mode")
-    if mode:
-        rag_details.append(str(mode))
-    selected_docs = rag_info.get("selected_docs") or []
-    if selected_docs:
-        rag_details.append(f"docs={len(selected_docs)}")
-    elif rag_info.get("requested") and not rag_enabled:
-        rag_details.append("docs=0")
-    rag_text = rag_label + (" (" + ", ".join(rag_details) + ")" if rag_details else "")
-
-    cols[0].markdown(structured_text)
-    cols[1].markdown(weather_text)
-    cols[2].markdown(external_text)
-    cols[3].markdown(rag_text)
-
-
-def render_fail_soft_answer(
-    payload: Optional[Dict[str, Any]],
-    *,
-    rag_info: Optional[Dict[str, Any]] = None,
-) -> None:
-    st.subheader("Fail-soft 응답")
-    if not payload:
-        st.info("응답이 생성되지 않았습니다.")
-        return
-
-    segments = payload.get("segments") or []
-    if not segments:
-        st.info("응답이 생성되지 않았습니다.")
-    rag_error = (rag_info or {}).get("error") if rag_info else None
-
-    for segment in segments:
-        cols = st.columns([12, 1])
-        with cols[0]:
-            st.markdown(f"- {segment.get('text')}")
-        with cols[1]:
-            evidence_chunk = segment.get("evidence")
-            evidence_meta = segment.get("evidence_meta")
-            source = segment.get("source")
-            if evidence_chunk:
-                _render_evidence_badge(evidence_chunk, evidence_meta)
-            elif source == "rag":
-                rag_enabled = bool((rag_info or {}).get("enabled"))
-                if rag_enabled:
-                    _render_evidence_badge(None, None, tooltip="관련 근거 없음")
-                elif rag_error:
-                    _render_evidence_badge(None, None, tooltip=f"RAG 오류: {rag_error}")
-                else:
-                    _render_evidence_badge(None, None, disabled=True, tooltip="RAG 비활성화")
-
-    caveats = payload.get("caveats") or []
-    if caveats:
-        unique_caveats = []
-        for item in caveats:
-            if item and item not in unique_caveats:
-                unique_caveats.append(item)
-        if unique_caveats:
-            st.caption("주의 사항")
-            for item in unique_caveats:
-                st.markdown(f"- {item}")
-
-    if rag_error and all("RAG 오류" not in item for item in caveats):
-        st.error(f"RAG 오류: {rag_error}")
-
-    _render_sources_footer(payload.get("used_data") or {})
-
-def _render_evidence_badge(
-    chunk: dict | None,
-    evidence_meta: dict | None,
-    *,
-    disabled: bool = False,
-    tooltip: str | None = None,
-) -> None:
-    if disabled:
-        label = "📎 (OFF)"
-        if tooltip:
-            label += f" — {tooltip}"
-        st.caption(label)
-        return
-
-    if not chunk:
-        if tooltip:
-            st.caption(f"📎 {tooltip}")
-        else:
-            st.write("")
-        return
-
-    popover_fn = getattr(st, "popover", None)
-    score = chunk.get("score")
-    score_text = f"{float(score):.3f}" if score is not None else "—"
-    doc_id = chunk.get("doc_id") or "—"
-    chunk_id = chunk.get("chunk_id") or "—"
-    title = evidence_meta.get("title") if isinstance(evidence_meta, dict) else None
-    uri = evidence_meta.get("uri") if isinstance(evidence_meta, dict) else None
-
-    def _short_label(value: str) -> str:
-        text = str(value or "")
-        if len(text) <= 8:
-            return text
-        return text[:5] + "…"
-
-    display_token = chunk.get("chunk_id") or chunk.get("doc_id") or "근거"
-    badge_label = f"📎 {_short_label(display_token)}·{score_text}"
-
-    body_lines = [f"**문서 제목:** {title or doc_id}"]
-    body_lines.append(f"**문서 ID:** {doc_id}")
-    body_lines.append(f"**Chunk ID:** {chunk_id}")
-    body_lines.append(f"**유사도:** {score_text}")
-    text = chunk.get("text") or "—"
-    body_lines.append("\n**내용 발췌**\n")
-    body_lines.append(text)
-    if uri:
-        body_lines.append(f"\n[원본 열기]({uri})")
-
-    if callable(popover_fn):
-        with popover_fn(badge_label):
-            for line in body_lines:
-                st.markdown(line)
-    else:  # pragma: no cover - fallback for older Streamlit
-        with st.expander(badge_label, expanded=False):
-            for line in body_lines:
-                st.markdown(line)
-
 
 def _mask_name(raw: str) -> str:
     if not raw:
@@ -1194,7 +856,7 @@ def render_summary_view(
             overview_df = pd.DataFrame([table_dict])
         else:
             overview_df = pd.DataFrame()
-    is_public_mode = _get_app_mode() == "public"
+    is_public_mode = True
     try:
         print(
             "📊 overview_table:",
@@ -1209,22 +871,6 @@ def render_summary_view(
     else:
         st.subheader("현황 표")
         st.table(overview_df)
-
-    st.subheader("분석가 요약")
-    merchant_mask_value = (
-        context.get("merchant_masked_name")
-        or context.get("masked_name")
-        or context.get("merchant_mask")
-        or merchant_title
-    )
-    summary_text = diagnostics.build_analyst_summary_text(
-        agent1_json or {},
-        merchant_mask=merchant_mask_value,
-        use_llm=bool(st.session_state.get("use_llm_analyst", True)),
-        llm_max_tokens=int(st.session_state.get("llm_out_max", 900)),
-    )
-    summary_text = " ".join(str(summary_text).split())
-    st.markdown(summary_text)
 
     if not is_public_mode:
         period_text, goal_lines = _build_goal_lines(agent1_json)
@@ -1353,16 +999,9 @@ def render_summary_view(
                     st.markdown(f"{idx}. {preview}")
                 with cols[1]:
                     _render_evidence_badge(chunk, meta)
-DEFAULT_DEBUG_SHOW_RAW = app_config.get_flag("DEBUG_SHOW_RAW", True)
-DEBUG_SHOW_RAW = DEFAULT_DEBUG_SHOW_RAW
-
-
 DEFAULT_RAG_ROOT = "data/rag"
 RAG_ROOT = str(app_config.get_setting("RAG_ROOT", DEFAULT_RAG_ROOT))
 RAG_EMBED_VERSION = str(app_config.get_setting("RAG_EMBED_VERSION", "embed_v1"))
-_DEFAULT_APP_MODE = str(app_config.get_setting("APP_MODE", "public")).lower()
-if _DEFAULT_APP_MODE not in {"public", "debug"}:
-    _DEFAULT_APP_MODE = "public"
 DEFAULT_QUESTION = "{페로**********} 카페의 주요 방문 고객 특성에 따른 마케팅 채널 추천 및 홍보안을 작성"
 RAG_ROOT_PATH = Path(RAG_ROOT).expanduser()
 RETRIEVAL_INIT_ERROR: str | None = None
@@ -1415,8 +1054,6 @@ def _get_debug_section(agent1_json: dict | None) -> dict:
 
 
 def _ensure_session_defaults() -> None:
-    if "_app_mode" not in st.session_state:
-        st.session_state["_app_mode"] = _DEFAULT_APP_MODE
     if "user_query_text" not in st.session_state:
         st.session_state["user_query_text"] = DEFAULT_QUESTION
     if "seeded_default_question" not in st.session_state:
@@ -1425,8 +1062,6 @@ def _ensure_session_defaults() -> None:
         st.session_state["_data_flags"] = {
             "use_weather": False,
             "use_external": False,
-            "use_rag": True,
-            "rag_threshold": 0.35,
             "rag_top_k": 5,
             "rag_mode": "auto",
             "rag_filter": "",
@@ -1434,25 +1069,6 @@ def _ensure_session_defaults() -> None:
         }
 
 
-def _get_app_mode() -> str:
-    mode = st.session_state.get("_app_mode", _DEFAULT_APP_MODE)
-    if mode not in {"public", "debug"}:
-        mode = _DEFAULT_APP_MODE
-    return mode
-
-
-def _is_debug_mode() -> bool:
-    return _get_app_mode() == "debug"
-
-
-def _get_show_debug_default() -> bool:
-    return bool(st.session_state.get("show_debug_checkbox", True))
-
-
-def _is_debug_panel_visible() -> bool:
-    if not _is_debug_mode():
-        return False
-    return bool(st.session_state.get("show_debug_checkbox", False))
 def _get_debug_snapshot(agent1_json: dict | None) -> dict:
     debug = _get_debug_section(agent1_json)
     snap = debug.get("snapshot")
@@ -1470,9 +1086,8 @@ def _compute_rag_info(question_text: str, flags_snapshot: Dict[str, Any]) -> Dic
         for doc_id in (flags_snapshot.get("rag_selected_ids") or [])
         if str(doc_id)
     ]
-    rag_requested = bool(flags_snapshot.get("use_rag", False))
     rag_mode = str(flags_snapshot.get("rag_mode", "auto"))
-    rag_threshold = float(flags_snapshot.get("rag_threshold", 0.35))
+    rag_requested = rag_mode != "off"
     rag_top_k = int(flags_snapshot.get("rag_top_k", 5))
     rag_enabled = rag_requested and bool(selected_docs)
     _ensure_retriever_encoder(rag_enabled)
@@ -1481,7 +1096,7 @@ def _compute_rag_info(question_text: str, flags_snapshot: Dict[str, Any]) -> Dic
         RETRIEVAL_TOOL,
         enabled=rag_enabled,
         top_k=rag_top_k,
-        threshold=rag_threshold,
+        threshold=RAG_THRESHOLD_DEFAULT,
         mode=rag_mode,
         requested=rag_requested,
         doc_ids=selected_docs,
@@ -1541,296 +1156,6 @@ def _format_evidence_line(entry: Dict[str, Any]) -> str:
     return f"- {line}"
 
 
-def _iter_debug_distribution(data: Any) -> List[Tuple[str, Any]]:
-    entries: List[Tuple[str, Any]] = []
-    if isinstance(data, dict):
-        for key, value in data.items():
-            entries.append((str(key), value))
-    elif isinstance(data, Sequence):
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            code = item.get("code") or item.get("key") or item.get("id") or item.get("label")
-            if code is None:
-                continue
-            value = item.get("value")
-            if value is None:
-                for alt in ("percent", "ratio", "pct", "share"):
-                    if alt in item:
-                        value = item[alt]
-                        break
-            entries.append((str(code), value))
-    return entries
-
-
-_DEBUG_F_KEYS = ["F", "f", "FME", "female", "여", "여성"]
-_DEBUG_M_KEYS = ["M", "m", "MAL", "male", "남", "남성"]
-
-
-def _format_debug_pct(value: Any) -> str:
-    pct, hint = formatters.to_float_pct(value)
-    if pct is None:
-        return f"{value!r} ({hint})"
-    return f"{pct:.1f}% ({hint})"
-
-
-def _lookup_gender_value(mapping: Dict[str, Any], aliases: Sequence[str]) -> Any:
-    for alias in aliases:
-        if alias in mapping:
-            return mapping.get(alias)
-    return None
-
-
-def _build_debug_report_markdown(
-    agent1_json: dict | None,
-    *,
-    question_type: str | None,
-    rag_info: Dict[str, Any] | None,
-    rag_prompt_context: Dict[str, Any] | None,
-    prompt_trace: Dict[str, Any] | None,
-    response_trace: Dict[str, Any] | None,
-) -> str:
-    if not isinstance(agent1_json, dict):
-        return ""
-
-    kpis = (agent1_json.get("kpis") or {}) if isinstance(agent1_json, dict) else {}
-    sanitized_snapshot = _get_debug_snapshot(agent1_json)
-    debug_section = _get_debug_section(agent1_json)
-    raw_snapshot = ((debug_section.get("snapshot") or {}).get("raw") or {}) if isinstance(debug_section, dict) else {}
-
-    lines: List[str] = ["### Debug Report"]
-    lines.append("**Agent-1 Snapshot**")
-
-    if isinstance(debug_section, dict):
-        panel_meta = debug_section.get("panel") or {}
-        if isinstance(panel_meta, dict):
-            warnings = panel_meta.get("warnings")
-            if warnings:
-                lines.append("- panel warnings:")
-                for warn in warnings:
-                    lines.append(f"    - {warn}")
-            if panel_meta.get("error"):
-                lines.append(f"- panel error: {panel_meta.get('error')}")
-
-    age_entries = _iter_debug_distribution(
-        sanitized_snapshot.get("age_distribution") or kpis.get("age_distribution")
-    )
-    if age_entries:
-        lines.append("- age_distribution:")
-        for key, raw_value in age_entries:
-            lines.append(f"    - {key}: {_format_debug_pct(raw_value)}")
-    else:
-        lines.append("- age_distribution: 없음")
-
-    gender_data = (
-        sanitized_snapshot.get("age_by_gender")
-        or sanitized_snapshot.get("age_gender")
-        or kpis.get("age_by_gender")
-        or kpis.get("age_gender")
-        or {}
-    )
-    if isinstance(gender_data, dict) and gender_data:
-        lines.append("- age_by_gender:")
-        for bucket, mapping in gender_data.items():
-            if not isinstance(mapping, dict):
-                continue
-            female_raw = _lookup_gender_value(mapping, _DEBUG_F_KEYS)
-            male_raw = _lookup_gender_value(mapping, _DEBUG_M_KEYS)
-            lines.append(
-                "    - "
-                + f"{bucket}: F {_format_debug_pct(female_raw)}, M {_format_debug_pct(male_raw)}"
-            )
-    elif raw_snapshot:
-        raw_keys = [key for key in raw_snapshot.keys() if "M12_" in str(key)]
-        if raw_keys:
-            lines.append(f"- raw age keys detected: {', '.join(raw_keys[:6])}")
-
-    mix_detail = sanitized_snapshot.get("customer_mix_detail") or kpis.get("customer_mix_detail")
-    if isinstance(mix_detail, dict) and mix_detail:
-        lines.append("- customer_mix_detail:")
-        for key, value in mix_detail.items():
-            lines.append(f"    - {key}: {_format_debug_pct(value)}")
-
-    new_raw = sanitized_snapshot.get("new_pct") or kpis.get("new_rate_avg")
-    revisit_raw = sanitized_snapshot.get("revisit_pct") or kpis.get("revisit_rate_avg")
-    lines.append(f"- 신규 비중: {_format_debug_pct(new_raw)}")
-    lines.append(f"- 재방문 비중: {_format_debug_pct(revisit_raw)}")
-
-    normalization_notes = [
-        f"{key}={value}"
-        for key, value in sanitized_snapshot.items()
-        if isinstance(key, str) and "normalize" in key.lower()
-    ]
-    if normalization_notes:
-        lines.append("- normalization flags:")
-        for note in normalization_notes:
-            lines.append(f"    - {note}")
-
-    lines.append("\n**Age Merge Decision**")
-    age_details = formatters.get_age_bucket_details(agent1_json or {})
-    if age_details:
-        for item in age_details:
-            final_val = item.get("final_value")
-            final_text = f"{final_val:.1f}%" if isinstance(final_val, (int, float)) else "—"
-            status = "included" if item.get("included") else "skipped"
-            lines.append(
-                f"- {item.get('label')} ({item.get('key')}): {final_text} ← {item.get('source')} ({status})"
-            )
-            if item.get("notes"):
-                lines.append(f"    - {item['notes']}")
-    else:
-        lines.append("- no age buckets detected")
-
-    encoder_info = None
-    if isinstance(rag_prompt_context, dict):
-        encoder_info = rag_prompt_context.get("encoder_info")
-    if not encoder_info and isinstance(rag_info, dict):
-        encoder_info = (rag_info.get("payload") or {}).get("encoder_info")
-    if isinstance(encoder_info, dict) and encoder_info:
-        lines.append("\n**RAG Embedding**")
-        configured = encoder_info.get("configured") or {}
-        active = encoder_info.get("active") or {}
-        state = encoder_info.get("encoder_state") or {}
-        lines.append(
-            "- configured: "
-            + f"backend={configured.get('backend')} model={configured.get('model')} normalize={configured.get('normalize')}"
-        )
-        lines.append(
-            "- active: "
-            + f"backend={active.get('backend')} model={active.get('model')} normalize={active.get('normalize')}"
-        )
-        if encoder_info.get("mode"):
-            lines.append(f"- encoder mode: {encoder_info.get('mode')}")
-        if state:
-            lines.append(
-                "- encoder_state: "
-                + f"backend={state.get('backend')} model={state.get('model')} dim={state.get('dim')}"
-            )
-        doc_specs = encoder_info.get("doc_specs") or []
-        if doc_specs:
-            sample = doc_specs[0]
-            lines.append(
-                "- doc_spec sample: "
-                + f"doc_id={sample.get('doc_id')} model={sample.get('embedding_model')} dim={sample.get('vector_dim')}"
-            )
-        if encoder_info.get("warnings"):
-            lines.append("- encoder warnings:")
-            for warn in encoder_info.get("warnings"):
-                lines.append(f"    - {warn}")
-        skipped = encoder_info.get("skipped_doc_ids") or []
-        if skipped:
-            lines.append("- skipped doc ids: " + ", ".join(map(str, skipped)))
-
-    prompt_trace = prompt_trace or {}
-    lines.append("\n**Agent-2 Prompt**")
-    lines.append(f"- question_type: {question_type or prompt_trace.get('question_type')}")
-    lines.append(f"- organizer_mode: {prompt_trace.get('organizer_mode')}")
-    lines.append(f"- schema_keys: {prompt_trace.get('schema_keys')}")
-    lines.append(
-        f"- rag_context_included: {prompt_trace.get('rag_included')}"
-        + (f" (reason: {prompt_trace.get('rag_reason')})" if prompt_trace.get("rag_reason") else "")
-    )
-    if prompt_trace.get("rag_context_doc_ids"):
-        lines.append(f"- rag doc_ids: {prompt_trace.get('rag_context_doc_ids')}")
-    lines.append(f"- length_policy: {prompt_trace.get('length_policy')}")
-    token_limit = prompt_trace.get("prompt_token_limit")
-    token_est = prompt_trace.get("prompt_tokens_est")
-    if token_est is not None:
-        limit_text = f" / limit={token_limit}" if token_limit else ""
-        max_out = prompt_trace.get("max_output_tokens")
-        max_out_text = f" max_out={max_out}" if max_out is not None else ""
-        lines.append(f"- prompt_tokens_est: {token_est}{limit_text}{max_out_text}")
-    notes = prompt_trace.get("truncation_notes")
-    if notes:
-        if isinstance(notes, (list, tuple)):
-            note_text = ", ".join(str(n) for n in notes)
-        else:
-            note_text = str(notes)
-        lines.append(f"- truncation_notes: {note_text}")
-
-    response_trace = response_trace or {}
-    lines.append("\n**Agent-2 Response Trace**")
-    if not response_trace:
-        lines.append("- response trace unavailable")
-    else:
-        status = response_trace.get("status")
-        lines.append(f"- status: {status}")
-        if response_trace.get("generation_config"):
-            lines.append(f"- generation_config: {response_trace.get('generation_config')}")
-        if response_trace.get("prompt_length") is not None:
-            lines.append(f"- prompt_length: {response_trace.get('prompt_length')}")
-        if response_trace.get("chosen_model"):
-            lines.append(f"- chosen_model: {response_trace.get('chosen_model')}")
-        if response_trace.get("last_error"):
-            lines.append(f"- last_error: {response_trace.get('last_error')}")
-        if response_trace.get("fallback_answers") is not None:
-            lines.append(f"- fallback_answers: {response_trace.get('fallback_answers')}")
-        attempts = response_trace.get("attempts") or []
-        if attempts:
-            lines.append("- attempts:")
-            for attempt in attempts:
-                label = f"attempt {attempt.get('attempt')} / {attempt.get('model')}"
-                lines.append(f"    - {label}: {attempt.get('status')}")
-                parse_logs = attempt.get("parse_logs") or []
-                excerpt = ""
-                for entry in parse_logs:
-                    if not entry.get("success") and entry.get("excerpt"):
-                        excerpt = entry["excerpt"].replace('\n', ' ')[:160]
-                        break
-                if excerpt:
-                    lines.append(f"        · excerpt: {excerpt}")
-                if attempt.get("raw_preview"):
-                    preview = attempt.get("raw_preview").replace('\n', ' ')
-                    lines.append(f"        · raw_preview: {preview[:160]}")
-                if attempt.get("repair_logs"):
-                    rep_logs = attempt["repair_logs"]
-                    for entry in rep_logs:
-                        if not entry.get("success") and entry.get("excerpt"):
-                            snippet = entry["excerpt"].replace('\n', ' ')[:160]
-                            lines.append(f"        · repair excerpt: {snippet}")
-                            break
-
-    rag_info = rag_info or {}
-    lines.append("\n**RAG Retrieval**")
-    if not rag_info:
-        lines.append("- RAG info unavailable")
-    else:
-        lines.append(
-            f"- requested={rag_info.get('requested')} enabled={rag_info.get('enabled')} selection_missing={rag_info.get('selection_missing')}"
-        )
-        lines.append(
-            f"- selected_doc_ids: {rag_info.get('selected_doc_ids')} catalog_size={rag_info.get('catalog_size')}"
-        )
-        lines.append(
-            f"- mode={rag_info.get('mode')} threshold={rag_info.get('threshold')} top_k={rag_info.get('top_k')}"
-        )
-        lines.append(
-            f"- max_score={rag_info.get('max_score')} include_evidence={rag_info.get('include_evidence')} error={rag_info.get('error')}"
-        )
-        payload = rag_info.get("payload") or {}
-        top_scores = rag_prompt_context.get("top_scores") if isinstance(rag_prompt_context, dict) else []
-        if not top_scores:
-            top_scores = payload.get("top_scores") or []
-        if top_scores:
-            rounded = [round(float(score), 3) for score in top_scores[:5]]
-            lines.append(f"- top_scores: {rounded}")
-        if not rag_info.get("include_evidence"):
-            reason = ""
-            max_score = rag_info.get("max_score")
-            threshold = rag_info.get("threshold")
-            if rag_info.get("error"):
-                reason = rag_info.get("error")
-            elif max_score is None:
-                reason = "no hits"
-            elif threshold is not None and max_score < threshold:
-                reason = f"max_score {max_score:.3f} < threshold {threshold:.2f}"
-            else:
-                reason = "evidence suppressed"
-            lines.append(f"- evidence omitted reason: {reason}")
-
-    return "\n".join(lines)
-
-
 def _match_evidence_chunk(
     entry: Dict[str, Any],
     retrieval_payload: Dict[str, Any] | None,
@@ -1884,16 +1209,6 @@ def _get_debug_raw_snapshot(agent1_json: dict | None) -> dict:
 
 def main() -> None:
     _ensure_session_defaults()
-    app_mode = _get_app_mode()
-    if app_mode == "debug":
-        show_debug = st.checkbox(
-            "🔍 디버그 보기",
-            value=_get_show_debug_default(),
-            key="show_debug_checkbox",
-        )
-    else:
-        show_debug = False
-        st.session_state["show_debug_checkbox"] = False
 
     # ===== 경로 & 키 =====
     DATA_DIR = Path("data")
@@ -1906,39 +1221,12 @@ def main() -> None:
 
     st.sidebar.header("⚙️ 설정")
     st.sidebar.slider(
-        "LLM 입력 토큰 한도",
-        min_value=512,
-        max_value=64000,
-        step=512,
-        value=int(st.session_state.get("llm_in_ctx", 8192)),
-        key="llm_in_ctx",
-    )
-    st.sidebar.slider(
         "LLM 출력 토큰 한도",
         min_value=256,
         max_value=8192,
         step=256,
         value=int(st.session_state.get("llm_out_max", 2048)),
         key="llm_out_max",
-    )
-    st.sidebar.toggle(
-        "LLM Analyst Summary 사용",
-        value=bool(st.session_state.get("use_llm_analyst", True)),
-        key="use_llm_analyst",
-    )
-    length_options = ["short", "balanced", "long"]
-    current_policy = st.session_state.get("llm_length_policy", "balanced")
-    policy_index = length_options.index(current_policy) if current_policy in length_options else 1
-    st.sidebar.selectbox(
-        "LLM 길이 정책",
-        options=length_options,
-        index=policy_index,
-        key="llm_length_policy",
-    )
-    st.sidebar.toggle(
-        "영문화 매핑 허용",
-        value=bool(st.session_state.get("panel_allow_alias", False)),
-        key="panel_allow_alias",
     )
 
     # ===== 사이드바: 데이터 상태 =====
@@ -1948,20 +1236,6 @@ def main() -> None:
 
     data_flags = st.session_state.get("_data_flags", {}).copy()
     st.sidebar.header("Data Sources")
-    mode_options = ["public", "debug"]
-    mode_labels = {"public": "Public", "debug": "Debug"}
-    mode_index = mode_options.index(app_mode) if app_mode in mode_options else 0
-    selected_mode = st.sidebar.selectbox(
-        "App Mode",
-        mode_options,
-        index=mode_index,
-        format_func=lambda val: mode_labels.get(val, val),
-    )
-    if selected_mode != app_mode:
-        st.session_state["_app_mode"] = selected_mode
-        if selected_mode != "debug":
-            st.session_state["show_debug_checkbox"] = False
-        st.experimental_rerun()
 
     data_flags["use_weather"] = st.sidebar.toggle(
         "Use Weather Data",
@@ -1981,37 +1255,11 @@ def main() -> None:
     if RAG_CATALOG_ERROR:
         st.sidebar.warning(RAG_CATALOG_ERROR)
 
-    rag_toggle_disabled = (
+    rag_disabled = (
         RETRIEVAL_TOOL is None
         or RETRIEVAL_INIT_ERROR is not None
         or not rag_root_exists
         or RAG_CATALOG_ERROR is not None
-    )
-    if rag_toggle_disabled:
-        data_flags["use_rag"] = False
-        st.sidebar.toggle(
-            "Use RAG (Embedded Docs)",
-            value=False,
-            disabled=True,
-            help="RetrievalTool이 준비되지 않아 비활성화되었습니다.",
-        )
-        data_flags["rag_selected_ids"] = []
-    else:
-        data_flags["use_rag"] = st.sidebar.toggle(
-            "Use RAG (Embedded Docs)",
-            value=bool(data_flags.get("use_rag", True)),
-        )
-
-    rag_threshold_default = float(data_flags.get("rag_threshold", 0.35))
-    data_flags["rag_threshold"] = float(
-        st.sidebar.slider(
-            "RAG Threshold",
-            min_value=0.2,
-            max_value=0.6,
-            value=rag_threshold_default,
-            step=0.05,
-            disabled=rag_toggle_disabled,
-        )
     )
     data_flags["rag_top_k"] = int(
         st.sidebar.slider(
@@ -2020,21 +1268,26 @@ def main() -> None:
             max_value=10,
             value=int(data_flags.get("rag_top_k", 5)),
             step=1,
-            disabled=rag_toggle_disabled,
+            disabled=rag_disabled,
         )
     )
-    rag_modes = ["auto", "always", "off"]
+    rag_modes = ["off", "auto", "always"]
     rag_mode_value = data_flags.get("rag_mode", "auto")
     if rag_mode_value not in rag_modes:
         rag_mode_value = "auto"
+    if rag_disabled:
+        rag_mode_value = "off"
     data_flags["rag_mode"] = st.sidebar.selectbox(
         "RAG Mode",
         options=rag_modes,
         index=rag_modes.index(rag_mode_value),
-        disabled=rag_toggle_disabled,
+        disabled=rag_disabled,
     )
 
-    if not rag_toggle_disabled and data_flags.get("use_rag"):
+    if rag_disabled:
+        data_flags["rag_selected_ids"] = []
+        st.session_state["rag_selected_docs"] = []
+    elif data_flags.get("rag_mode") != "off":
         current_filter = data_flags.get("rag_filter", "")
         current_filter = st.sidebar.text_input(
             "RAG Search Filter (optional)",
@@ -2082,9 +1335,9 @@ def main() -> None:
         data_flags["rag_selected_ids"] = selected_ids
         st.session_state["rag_selected_docs"] = selected_ids
 
-        if data_flags.get("use_rag") and not selected_ids:
+        if data_flags.get("rag_mode") != "off" and not selected_ids:
             st.sidebar.info("선택된 RAG 문서가 없어 이번 실행에서는 RAG를 사용하지 않습니다.")
-    elif not rag_toggle_disabled:
+    elif not rag_disabled:
         # Toggle가 꺼져 있으면 기존 선택을 유지하되 필터 입력만 초기화하지 않습니다.
         data_flags.setdefault("rag_selected_ids", data_flags.get("rag_selected_ids", []))
         st.session_state.setdefault(
@@ -2166,14 +1419,13 @@ def main() -> None:
             ) = safe_step("RAG 구성", _prepare_rag_assets)
 
             selected_for_preview = flags_snapshot.get("rag_selected_ids")
-            threshold_for_preview = float(flags_snapshot.get("rag_threshold", 0.35))
+            rag_mode_for_preview = str(flags_snapshot.get("rag_mode", "auto"))
             rag_preview_payload = safe_step(
                 "RAG 미리보기",
                 run_retrieval_preview,
                 question,
                 selected_for_preview,
-                threshold_for_preview,
-                rag_requested=flags_snapshot.get("use_rag", False),
+                rag_mode=rag_mode_for_preview,
             )
             st.session_state["_latest_rag_preview"] = rag_preview_payload
 
@@ -2241,23 +1493,6 @@ def main() -> None:
         if isinstance(latest_agent1, dict):
             with st.expander("🔎 Agent-1 출력(JSON) 보기", expanded=False):
                 st.json(latest_agent1)
-
-        rag_flags = st.session_state.get("_data_flags", {})
-        if RETRIEVAL_TOOL is not None and RETRIEVAL_INIT_ERROR is None:
-            col_lo, col_hi = st.columns(2)
-            if col_lo.button("임계값 낮추기 (-0.05)"):
-                new_threshold = max(0.2, float(rag_flags.get("rag_threshold", 0.35)) - 0.05)
-                st.session_state["_data_flags"]["rag_threshold"] = round(new_threshold, 2)
-                st.experimental_rerun()
-            if col_hi.button("임계값 높이기 (+0.05)"):
-                new_threshold = min(0.6, float(rag_flags.get("rag_threshold", 0.35)) + 0.05)
-                st.session_state["_data_flags"]["rag_threshold"] = round(new_threshold, 2)
-                st.experimental_rerun()
-
-        if show_debug:
-            latest_agent1 = st.session_state.get('_latest_agent1')
-            with st.expander("🔍 디버그 상세", expanded=True):
-                render_debug_view(latest_agent1, show_raw=DEBUG_SHOW_RAW)
 
         if not st.session_state.get("_intro_shown"):
             st.info("✅ 업로드 성공! 이제 질문 입력 후 [분석 실행]을 눌러 카드 결과를 확인해보세요.")
