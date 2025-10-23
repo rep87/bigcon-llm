@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 from data.loader import profile_columns
 
@@ -163,7 +163,189 @@ def _write_telemetry(payload: Dict[str, Any], merchant_id: str) -> None:
         json.dump(payload, fp, ensure_ascii=False, indent=2)
 
 
-def diagnose_and_select(question: str, merchant_id: str) -> Dict[str, Any]:
+def _normalize_percent_value(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (num == num):
+        return None
+    if num < 0:
+        num = 0.0
+    if num <= 1:
+        return num * 100
+    if num <= 100:
+        return num
+    return num / 100
+
+
+def _entries_by_tag(
+    profiles: List[Dict[str, Any]], selected: List[Dict[str, Any]], tag: str
+) -> List[Dict[str, Any]]:
+    matches = [
+        entry
+        for entry in selected
+        if tag in (entry.get("meta", {}).get("role_tags") or [])
+    ]
+    if matches:
+        return matches
+    return [
+        entry
+        for entry in profiles
+        if tag in (entry.get("meta", {}).get("role_tags") or [])
+    ]
+
+
+def _pick_percent(entry: Dict[str, Any]) -> Tuple[float | None, str]:
+    unit = entry.get("unit") or entry.get("meta", {}).get("unit")
+    value = entry.get("value_recent")
+    if unit == "ratio" or unit is None:
+        percent = _normalize_percent_value(value)
+        return percent, "%"
+    try:
+        return float(value), entry.get("unit", "")
+    except (TypeError, ValueError):
+        return None, entry.get("unit", "")
+
+
+def _generate_eda_derivatives(
+    profiles: List[Dict[str, Any]], selected: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    derived_entries: List[Dict[str, Any]] = []
+    extra_reasons: List[Dict[str, Any]] = []
+
+    revisit_entries = _entries_by_tag(profiles, selected, "revisit")
+    acquisition_entries = _entries_by_tag(profiles, selected, "acquisition")
+    if revisit_entries and acquisition_entries:
+        revisit = revisit_entries[0]
+        acquisition = acquisition_entries[0]
+        revisit_pct, _ = _pick_percent(revisit)
+        acquisition_pct, _ = _pick_percent(acquisition)
+        if revisit_pct is not None and acquisition_pct is not None:
+            gap = revisit_pct - acquisition_pct
+            reason = (
+                f"재방문율 {revisit_pct:.2f}%와 신규 방문율 {acquisition_pct:.2f}% 격차 {gap:+.2f}%을 분석해 고객 유지·확장 균형을 진단합니다."
+            )
+            derived_entries.append(
+                {
+                    "source": "Derived (EDA)",
+                    "column": "eda.revisit_vs_new",
+                    "label": "재방문·신규 고객 조합",
+                    "value_recent": gap,
+                    "value_prev": None,
+                    "coverage": 1.0,
+                    "recency": revisit.get("recency") or acquisition.get("recency") or "최근 조합",
+                    "time_span": "최근 3개월 조합",
+                    "sufficiency": "High",
+                    "warning": None,
+                    "unit": "ratio",
+                    "meta": {
+                        "role_tags": ["eda", "revisit", "acquisition"],
+                        "question_roles": list(
+                            set(revisit.get("meta", {}).get("question_roles") or [])
+                            | set(acquisition.get("meta", {}).get("question_roles") or [])
+                        ),
+                        "unit": "ratio",
+                        "derived": True,
+                        "label": "재방문·신규 고객 조합",
+                    },
+                    "custom_reason": reason,
+                }
+            )
+
+    workplace_entries = _entries_by_tag(profiles, selected, "workplace")
+    residence_entries = _entries_by_tag(profiles, selected, "residence")
+    if workplace_entries and residence_entries:
+        workplace = workplace_entries[0]
+        residence = residence_entries[0]
+        workplace_pct, _ = _pick_percent(workplace)
+        residence_pct, _ = _pick_percent(residence)
+        if workplace_pct is not None and residence_pct is not None:
+            balance = workplace_pct / max(residence_pct, 0.01)
+            reason = (
+                f"직장권 {workplace_pct:.2f}% / 주거권 {residence_pct:.2f}% 구성으로 상권 집중도를 확인하고 채널 포지셔닝을 설정합니다."
+            )
+            derived_entries.append(
+                {
+                    "source": "Derived (EDA)",
+                    "column": "eda.work_res_balance",
+                    "label": "직장·주거 생활권 균형",
+                    "value_recent": balance,
+                    "value_prev": None,
+                    "coverage": 1.0,
+                    "recency": workplace.get("recency") or residence.get("recency") or "최근 조합",
+                    "time_span": "최근 3개월 조합",
+                    "sufficiency": "High",
+                    "warning": None,
+                    "unit": None,
+                    "meta": {
+                        "role_tags": ["eda", "workplace", "residence"],
+                        "question_roles": list(
+                            set(workplace.get("meta", {}).get("question_roles") or [])
+                            | set(residence.get("meta", {}).get("question_roles") or [])
+                        ),
+                        "derived": True,
+                        "label": "직장·주거 생활권 균형",
+                    },
+                    "custom_reason": reason,
+                }
+            )
+
+    age_entries = _entries_by_tag(profiles, selected, "age")
+    if len(age_entries) >= 2:
+        ranked = [
+            (
+                entry,
+                _pick_percent(entry)[0],
+            )
+            for entry in age_entries
+        ]
+        ranked = [item for item in ranked if item[1] is not None]
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        if len(ranked) >= 2:
+            top_entry, top_pct = ranked[0]
+            second_entry, second_pct = ranked[1]
+            reason = (
+                f"핵심 연령층은 {top_entry.get('label', top_entry.get('column'))} {top_pct:.2f}%, 다음은 {second_entry.get('label', second_entry.get('column'))} {second_pct:.2f}%로 타깃 세그먼트를 확장합니다."
+            )
+            derived_entries.append(
+                {
+                    "source": "Derived (EDA)",
+                    "column": "eda.age_focus",
+                    "label": "핵심 연령대 집중도",
+                    "value_recent": top_pct,
+                    "value_prev": second_pct,
+                    "coverage": 1.0,
+                    "recency": top_entry.get("recency") or "최근 조합",
+                    "time_span": "최근 3개월 조합",
+                    "sufficiency": "High",
+                    "warning": None,
+                    "unit": "ratio",
+                    "meta": {
+                        "role_tags": ["eda", "age"],
+                        "question_roles": list(top_entry.get("meta", {}).get("question_roles") or []),
+                        "unit": "ratio",
+                        "derived": True,
+                        "label": "핵심 연령대 집중도",
+                    },
+                    "custom_reason": reason,
+                }
+            )
+
+    if not derived_entries and selected:
+        top_selected = selected[0]
+        label = top_selected.get("label") or top_selected.get("column") or "핵심 지표"
+        reason = f"{label} 지표를 중심으로 EDA를 반복해 보조 지표를 발굴했습니다."
+        extra_reasons.append({"column": top_selected.get("column"), "reason": reason})
+
+    return derived_entries, extra_reasons
+
+
+def diagnose_and_select(
+    question: str, merchant_id: str, analysis_mode: str = "기본 데이터 접근"
+) -> Dict[str, Any]:
     context = _infer_question_types(question)
     profiles = profile_columns(merchant_id)
 
@@ -205,6 +387,16 @@ def diagnose_and_select(question: str, merchant_id: str) -> Dict[str, Any]:
             selected.append(candidates[0])
             selected_tags.update(candidates[0].get("meta", {}).get("role_tags") or [])
 
+    is_advanced_mode = str(analysis_mode or "").startswith("고급")
+    derived_entries: List[Dict[str, Any]] = []
+    extra_reason_entries: List[Dict[str, Any]] = []
+    if is_advanced_mode:
+        derived_entries, extra_reason_entries = _generate_eda_derivatives(
+            profiles, selected
+        )
+        selected.extend(derived_entries)
+        profiles.extend(derived_entries)
+
     selection_reasons: List[Dict[str, Any]] = []
     selected_features: List[Dict[str, Any]] = []
     sufficiency_low = 0
@@ -215,26 +407,35 @@ def diagnose_and_select(question: str, merchant_id: str) -> Dict[str, Any]:
         entry.pop("_passes", None)
         if entry.get("selected"):
             meta = entry.get("meta") or {}
-            tag = _pick_reason_tag(entry, context)
-            reason = _build_reason(meta.get("label", entry.get("column", "")), tag, question)
+            if entry.get("custom_reason"):
+                reason = entry["custom_reason"]
+            else:
+                tag = _pick_reason_tag(entry, context)
+                reason = _build_reason(
+                    meta.get("label", entry.get("column", "")), tag, question
+                )
             entry["reason"] = reason
             selection_reasons.append({"column": entry.get("column"), "reason": reason})
-            selected_features.append(
-                {
-                    "id": meta.get("feature_id"),
-                    "column": entry.get("column"),
-                    "label": meta.get("label", entry.get("column")),
-                    "source": entry.get("source"),
-                    "period": meta.get("default_period", "recent_3m"),
-                    "value": entry.get("value_recent"),
-                    "latest_period": entry.get("recency"),
-                    "time_span": entry.get("time_span"),
-                }
-            )
-            if entry.get("sufficiency") == "Low":
-                sufficiency_low += 1
+            if not meta.get("derived"):
+                selected_features.append(
+                    {
+                        "id": meta.get("feature_id"),
+                        "column": entry.get("column"),
+                        "label": meta.get("label", entry.get("column")),
+                        "source": entry.get("source"),
+                        "period": meta.get("default_period", "recent_3m"),
+                        "value": entry.get("value_recent"),
+                        "latest_period": entry.get("recency"),
+                        "time_span": entry.get("time_span"),
+                    }
+                )
+                if entry.get("sufficiency") == "Low":
+                    sufficiency_low += 1
         else:
             entry["reason"] = None
+
+    if extra_reason_entries:
+        selection_reasons.extend(extra_reason_entries)
 
     sufficiency_summary = "데이터 충분"
     if selected_features and sufficiency_low / max(len(selected_features), 1) >= 0.4:
@@ -255,6 +456,7 @@ def diagnose_and_select(question: str, merchant_id: str) -> Dict[str, Any]:
         "selected_features": selected_features,
         "selection_reasons": selection_reasons,
         "sufficiency_summary": sufficiency_summary,
+        "analysis_mode": analysis_mode,
     }
 
     from datetime import datetime
@@ -273,4 +475,5 @@ def diagnose_and_select(question: str, merchant_id: str) -> Dict[str, Any]:
         "selected_features": selected_features,
         "selection_reasons": selection_reasons,
         "sufficiency_summary": sufficiency_summary,
+        "analysis_mode": analysis_mode,
     }
