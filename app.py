@@ -170,6 +170,81 @@ import pandas as pd
 import streamlit as st
 
 
+def _render_evidence_badge(
+    metric: dict | str | None = None,
+    meta: dict | None = None,
+    *,
+    metric_id: str | None = None,
+    label: str | None = None,
+    value: Any | None = None,
+    period: str | None = None,
+    comment: str | None = None,
+    disabled: bool = False,
+    tooltip: str | None = None,
+) -> None:
+    """Render a compact evidence badge with graceful fallbacks."""
+
+    metric_dict = metric if isinstance(metric, dict) else {}
+    meta_dict = meta if isinstance(meta, dict) else {}
+
+    metric_key = metric_id or meta_dict.get("metric_id") or metric_dict.get("id")
+    base_label = (
+        label
+        or meta_dict.get("label")
+        or meta_dict.get("title")
+        or metric_dict.get("label")
+        or metric_dict.get("title")
+        or metric_key
+        or "근거"
+    )
+
+    if value is not None:
+        base_value = value
+    elif meta_dict.get("value") is not None:
+        base_value = meta_dict.get("value")
+    else:
+        base_value = metric_dict.get("value")
+
+    base_period = (
+        period
+        or meta_dict.get("period")
+        or meta_dict.get("latest_period")
+        or meta_dict.get("year")
+        or metric_dict.get("period")
+        or "—"
+    )
+
+    base_comment = (
+        comment
+        or meta_dict.get("comment")
+        or metric_dict.get("comment")
+        or tooltip
+        or "근거 확인"
+    )
+
+    percent_value = _normalize_ratio_to_percent(base_value)
+    if percent_value is not None:
+        value_text = f"{percent_value:.2f}%"
+    elif base_value is None:
+        value_text = "—"
+    else:
+        value_text = str(base_value)
+
+    border_color = "#cccccc" if disabled else "#2f8bfd"
+    bg_color = "#f6f6f6" if disabled else "#f0f6ff"
+    tooltip_attr = f" title=\"{html.escape(str(tooltip))}\"" if tooltip else ""
+    badge_html = (
+        f"<div style='border:1px solid {border_color};"
+        f"border-radius:6px;padding:6px;margin-bottom:4px;"
+        f"background-color:{bg_color};font-size:0.85rem;'"
+        f"{tooltip_attr}>"
+        f"<b>{html.escape(str(base_label))}</b>: {html.escape(value_text)}"
+        f" ({html.escape(str(base_period))}) — {html.escape(str(base_comment))}"
+        "</div>"
+    )
+    st.markdown(badge_html, unsafe_allow_html=True)
+
+
 def _mem_mb() -> int:
     try:
         import psutil
@@ -559,6 +634,9 @@ def _format_metric_value(value: Any, unit: str | None) -> str:
         return f"{num:,.0f}원"
     if unit == "count":
         return f"{num:,.0f}"
+    if unit == "pp":
+        sign = "+" if num > 0 else ""
+        return f"{sign}{num:.2f}pp"
     return f"{num:,.2f}"
 
 
@@ -875,18 +953,88 @@ def _render_status_summary(
         st.caption("최근 월 데이터로 대체된 요약입니다.")
 
 
+MODE_LABELS = {
+    "basic": "기본 데이터 접근",
+    "advanced": "고급 데이터 접근 (EDA/조합 포함)",
+}
+
+
+def render_profile_table(
+    rows: List[Dict[str, Any]], title: str, accent: bool = False
+) -> None:
+    st.subheader(title)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("표시할 데이터가 없습니다.")
+        return
+
+    working = df.copy()
+    working["최근값"] = working.apply(
+        lambda r: _format_metric_value(r.get("value_recent"), r.get("unit", None)),
+        axis=1,
+    )
+    working["직전값"] = working.apply(
+        lambda r: _format_metric_value(r.get("value_prev"), r.get("unit", None)),
+        axis=1,
+    )
+    working["커버리지"] = working.get("coverage", pd.Series([None] * len(working))).apply(
+        _format_ratio_percent
+    )
+    working["선택"] = working.get("selected", pd.Series([False] * len(working))).apply(
+        lambda value: "선택" if bool(value) else ""
+    )
+
+    display_df = pd.DataFrame(
+        {
+            "Source": working.get("source", pd.Series(["—"] * len(working))),
+            "Column": working.get("column", pd.Series(["—"] * len(working))),
+            "Label": working.get("label", pd.Series(["—"] * len(working))),
+            "최근값": working["최근값"],
+            "직전값": working["직전값"],
+            "커버리지": working["커버리지"],
+            "최신월": working.get("recency", pd.Series(["—"] * len(working))),
+            "가용기간": working.get("time_span", pd.Series(["—"] * len(working))),
+            "충분도": working.get("sufficiency", pd.Series(["—"] * len(working))),
+            "선택": working["선택"],
+        }
+    )
+
+    def _style_row(row: pd.Series) -> List[str]:
+        highlight = row.get("선택") == "선택"
+        border_color = "#ff4b4b" if highlight else ("#2f8bfd" if accent else "")
+        style = f"border-top:{border_color}; border-bottom:{border_color};" if border_color else ""
+        return [style] * len(row)
+
+    st.dataframe(
+        display_df.style.apply(_style_row, axis=1),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_selection_reasons(reasons: List[Dict[str, Any]]) -> None:
+    st.markdown("### 🎯 선택 사유 (한 줄 설명)")
+    if not reasons:
+        st.markdown("🧩 선택된 근거가 없습니다.")
+        return
+    for item in reasons:
+        label = item.get("label") or item.get("column") or "지표"
+        reason = item.get("reason") or "사유 없음"
+        st.markdown(f"🧩 **{label}** — {reason}")
+
+
 def _render_data_profile_section(
     question_text: str | None,
     merchant_title: str,
     merchant_id: str | None,
     analysis_mode: str,
-) -> tuple[dict | None, dict[str, str]]:
+) -> dict | None:
     st.caption(
         "신한카드 패널 데이터에서 해당 가맹점의 모든 주요 지표를 수집해 표로 정리했습니다."
     )
     if not merchant_id:
         st.info("가맹점 ID를 확인할 수 없어 데이터 프로파일을 표시할 수 없습니다.")
-        return None, {}
+        return None
 
     cache = st.session_state.setdefault("_data_profile_cache", {})
     cache_key = f"{merchant_id}::{question_text or ''}::{analysis_mode}"
@@ -901,55 +1049,24 @@ def _render_data_profile_section(
             )
         except Exception as exc:  # pragma: no cover - defensive for UI
             st.warning(f"데이터 프로파일 생성에 실패했습니다: {exc}")
-            return None, {}
+            return None
         cache[cache_key] = profile_payload
 
-    profile_table = profile_payload.get("profile_table") or []
+    profile_basic = profile_payload.get("profile_basic") or []
+    profile_advanced = profile_payload.get("profile_advanced") or []
     selected_features = profile_payload.get("selected_features") or []
     selection_reasons = profile_payload.get("selection_reasons") or []
     sufficiency_summary = profile_payload.get("sufficiency_summary") or "데이터 충분"
-    label_map = {
-        entry.get("column"): entry.get("label", entry.get("column")) for entry in profile_table
-    }
 
     st.markdown(f"**{merchant_title}** 가맹점의 최신 데이터 스냅샷입니다.")
 
-    if not profile_table:
+    if not profile_basic:
         st.info("표시할 프로파일 데이터가 없습니다.")
-        return profile_payload, label_map
+    else:
+        render_profile_table(profile_basic, "신한카드 데이터 요약 (원본 컬럼)")
 
-    display_rows: list[dict[str, Any]] = []
-    for entry in profile_table:
-        display_rows.append(
-            {
-                "Source": entry.get("source", "—"),
-                "Column": entry.get("column", "—"),
-                "Label": entry.get("label", "—"),
-                "최근값": _format_metric_value(entry.get("value_recent"), entry.get("unit")),
-                "직전값": _format_metric_value(entry.get("value_prev"), entry.get("unit")),
-                "커버리지": _format_ratio_percent(entry.get("coverage")),
-                "최신월": entry.get("recency") or "—",
-                "가용기간": entry.get("time_span") or "—",
-                "충분도": entry.get("sufficiency") or "—",
-                "선택": "선택" if entry.get("selected") else "—",
-                "경고": entry.get("warning") or "—",
-            }
-        )
-
-    display_df = pd.DataFrame(display_rows)
-
-    def _highlight_selected(row: pd.Series) -> list[str]:
-        selected = row.get("선택") == "선택"
-        border_style = "border: 2px solid #ff4b4b" if selected else ""
-        return [border_style] * len(row)
-
-    def _badge_style(value: Any) -> str:
-        return "color: #ff4b4b; font-weight: 600" if value == "선택" else ""
-
-    styler = display_df.style.apply(_highlight_selected, axis=1)
-    styler = styler.applymap(_badge_style, subset=["선택"])
-
-    st.dataframe(styler, use_container_width=True, hide_index=True)
+    if analysis_mode == "advanced" and profile_advanced:
+        render_profile_table(profile_advanced, "파생(조합) 컬럼 요약", accent=True)
 
     with st.expander("선택 기준 보기(룰 카드)", expanded=False):
         st.markdown(
@@ -964,11 +1081,12 @@ def _render_data_profile_section(
     else:
         st.success("선택된 지표의 커버리지가 충분합니다.")
 
+    mode_label = MODE_LABELS.get(analysis_mode, analysis_mode)
     st.caption(
-        f"현재 모드: {analysis_mode} — 선택된 지표 {len(selected_features)}개, 선택 사유 {len(selection_reasons)}개"
+        f"현재 모드: {mode_label} — 선택된 지표 {len(selected_features)}개, 선택 사유 {len(selection_reasons)}개"
     )
 
-    return profile_payload, label_map
+    return profile_payload
 
 
 def render_summary_view(
@@ -984,102 +1102,24 @@ def render_summary_view(
     merchant_id = _extract_merchant_id(agent1_json)
     st.header(f"📊 {merchant_title} 가맹점 방문 고객 현황 분석")
 
-    mode = st.session_state.get("analysis_mode", "기본 데이터 접근")
-
-    if "_render_evidence_badge" not in globals():
-
-        def _fallback_render_evidence_badge(
-            metric: dict | str | None,
-            meta: dict | None = None,
-            *,
-            metric_id: str | None = None,
-            label: str | None = None,
-            value: Any | None = None,
-            period: str | None = None,
-            comment: str | None = None,
-            disabled: bool = False,
-            tooltip: str | None = None,
-        ) -> None:
-            """Render a compact evidence badge with graceful fallbacks."""
-
-            metric_dict = metric if isinstance(metric, dict) else {}
-            meta_dict = meta if isinstance(meta, dict) else {}
-
-            metric_key = metric_id or meta_dict.get("metric_id") or metric_dict.get("id")
-            base_label = (
-                label
-                or meta_dict.get("label")
-                or meta_dict.get("title")
-                or metric_dict.get("label")
-                or metric_dict.get("title")
-                or metric_key
-                or (tooltip if tooltip else "근거")
-            )
-            base_value = (
-                value
-                if value is not None
-                else meta_dict.get("value")
-                if meta_dict.get("value") is not None
-                else metric_dict.get("value")
-            )
-            base_period = (
-                period
-                or meta_dict.get("period")
-                or meta_dict.get("latest_period")
-                or meta_dict.get("year")
-                or metric_dict.get("period")
-                or "—"
-            )
-            base_comment = (
-                comment
-                or meta_dict.get("comment")
-                or metric_dict.get("comment")
-                or tooltip
-                or "근거 확인"
-            )
-
-            percent_value = None
-            if base_value is not None:
-                percent_value = _normalize_ratio_to_percent(base_value)
-            if percent_value is not None:
-                value_text = f"{percent_value:.2f}%"
-            elif base_value is None:
-                value_text = "—"
-            else:
-                value_text = str(base_value)
-
-            border_color = "#cccccc" if disabled else "#2f8bfd"
-            bg_color = "#f6f6f6" if disabled else "#f0f6ff"
-            tooltip_attr = f" title=\"{html.escape(tooltip)}\"" if tooltip else ""
-            badge_html = (
-                f"<div style='border:1px solid {border_color};"
-                f"border-radius:6px;padding:6px;margin-bottom:4px;"
-                f"background-color:{bg_color};font-size:0.85rem;'"
-                f"{tooltip_attr}>"
-                f"<b>{html.escape(str(base_label))}</b>: {html.escape(value_text)}"
-                f" ({html.escape(str(base_period))}) — {html.escape(str(base_comment))}"
-                "</div>"
-            )
-            st.markdown(badge_html, unsafe_allow_html=True)
-
-    globals()["_render_evidence_badge"] = _fallback_render_evidence_badge
-
     mode_options = [
-        "기본 데이터 접근",
-        "고급 데이터 접근 (EDA/조합 포함)",
+        ("기본 데이터 접근", "basic"),
+        ("고급 데이터 접근 (EDA/조합 포함)", "advanced"),
     ]
-    default_mode = st.session_state.get("analysis_mode", mode_options[0])
+    default_mode = st.session_state.get("analysis_mode", "basic")
+    codes = [code for _, code in mode_options]
     try:
-        default_index = mode_options.index(default_mode)
+        default_index = codes.index(default_mode)
     except ValueError:
         default_index = 0
-    mode = st.radio(
+    selected_label = st.radio(
         "데이터 접근 수준 선택",
-        mode_options,
+        [label for label, _ in mode_options],
         index=default_index,
         horizontal=True,
     )
-    st.session_state["analysis_mode"] = mode
+    analysis_mode = next(code for label, code in mode_options if label == selected_label)
+    st.session_state["analysis_mode"] = analysis_mode
 
     st.markdown(
         "> 💡 **이 화면은 실제 신한카드 데이터를 기반으로 분석한 과정을 시각적으로 보여줍니다.**  "
@@ -1136,8 +1176,8 @@ def render_summary_view(
         st.table(overview_df)
 
     st.markdown("### 📊 신한카드 데이터 요약 (전 컬럼)")
-    profile_payload, label_map = _render_data_profile_section(
-        question_text, merchant_title, merchant_id, mode
+    profile_payload = _render_data_profile_section(
+        question_text, merchant_title, merchant_id, analysis_mode
     )
     st.divider()
 
@@ -1145,15 +1185,7 @@ def render_summary_view(
     if profile_payload:
         selection_reasons = profile_payload.get("selection_reasons") or []
 
-    st.markdown("### 🎯 선택 사유 (한 줄 설명)")
-    if selection_reasons:
-        for item in selection_reasons:
-            column = item.get("column")
-            label = label_map.get(column, column or "지표")
-            reason = item.get("reason") or "사유 없음"
-            st.markdown(f"🧩 **{label}** — {reason}")
-    else:
-        st.markdown("🧩 선택된 근거가 없습니다.")
+    render_selection_reasons(selection_reasons)
     st.divider()
 
     if not is_public_mode:
