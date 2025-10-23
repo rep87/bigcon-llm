@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from data.loader import profile_columns
 
 APP_VERSION = "2024.09-data-provenance"
 TELEMETRY_DIR = Path(__file__).resolve().parent.parent / "telemetry"
+
+AnalysisMode = Literal["basic", "advanced"]
 
 MIN_COVERAGE_BY_QUESTION = {
     "Q1": 0.6,
@@ -53,11 +55,146 @@ REASON_TEMPLATES = {
 }
 
 
+DERIVED_RECIPES = [
+    {
+        "id": "youth_share",
+        "label": "청년(10~20) 비중",
+        "formula": "M12_MAL_1020_RAT + M12_FME_1020_RAT",
+        "source": "set3",
+        "unit": "%",
+    },
+    {
+        "id": "worker_share",
+        "label": "직장권 비중",
+        "formula": "RC_M1_SHC_WP_UE_CLN_RAT",
+        "source": "set3",
+        "unit": "%",
+    },
+    {
+        "id": "loyalty_bias",
+        "label": "유지편향(재방문-신규)",
+        "formula": "MCT_UE_CLN_REU_RAT - MCT_UE_CLN_NEW_RAT",
+        "source": "set3",
+        "unit": "pp",
+    },
+    {
+        "id": "revisit_delta",
+        "label": "재방문율 증감(최근3M-직전3M)",
+        "formula": "DELTA(MCT_UE_CLN_REU_RAT)",
+        "source": "set3",
+        "unit": "pp",
+    },
+    {
+        "id": "ticket_trend",
+        "label": "객단가 추이(최근3M-직전3M)",
+        "formula": "DELTA(RC_M1_AV_NP_AT)",
+        "source": "set2",
+        "unit": "원",
+    },
+    {
+        "id": "traffic_trend",
+        "label": "이용건 추이(최근3M-직전3M)",
+        "formula": "DELTA(RC_M1_TO_UE_CT)",
+        "source": "set2",
+        "unit": "건",
+    },
+    {
+        "id": "unique_rate",
+        "label": "고객/이용건 비율",
+        "formula": "RC_M1_UE_CUS_CN / RC_M1_TO_UE_CT",
+        "source": "set2",
+        "unit": "",
+    },
+    {
+        "id": "delivery_dependency",
+        "label": "배달 의존도",
+        "formula": "DLV_SAA_RAT",
+        "source": "set2",
+        "unit": "%",
+    },
+]
+
+
 @dataclass
 class SelectionContext:
     question_types: Set[str]
     keyword_tags: Set[str]
     must_have_tags: Set[str]
+
+
+SUFFICIENCY_RANK = {"Low": 0, "Medium": 1, "High": 2}
+
+
+def normalize_percent(value: Any) -> Optional[float]:
+    """Normalize ratio-like values to 0~100 scale with guard rails."""
+
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (num == num):
+        return None
+    if num < 0:
+        num = 0.0
+    if 0 <= num <= 1:
+        return round(num * 100, 2)
+    if num > 100:
+        return round(num / 100, 2)
+    return round(num, 2)
+
+
+def _is_percent_column(column: str | None, meta: Dict[str, Any]) -> bool:
+    unit = str(meta.get("unit") or "").lower()
+    if unit in {"ratio", "percent", "%", "pct"}:
+        return True
+    if not column:
+        return False
+    suffixes = ("_rat", "_rate", "_ratio", "_shr", "_share", "_pct")
+    column_lower = column.lower()
+    return column_lower.endswith(suffixes)
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (num == num):
+        return None
+    return float(num)
+
+
+def _normalize_metric_value(column: str, meta: Dict[str, Any], value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if _is_percent_column(column, meta):
+        return normalize_percent(value)
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (num == num):
+        return None
+    return round(num, 2)
+
+
+def _strip_internal_fields(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+    for row in rows:
+        cleaned.append({key: value for key, value in row.items() if not key.startswith("_")})
+    return cleaned
+
+
+def _worst_sufficiency(values: List[Optional[str]]) -> str:
+    rank = min((SUFFICIENCY_RANK.get(val or "Low", 0) for val in values), default=0)
+    for key, score in SUFFICIENCY_RANK.items():
+        if score == rank:
+            return key
+    return "Low"
 
 
 def _infer_question_types(question: str) -> SelectionContext:
@@ -146,6 +283,282 @@ def _build_reason(label: str, tag: str | None, question: str) -> str:
     return f"{label} 지표가 질문에 언급된 핵심 키워드와 연결됩니다."
 
 
+def build_profile_table_basic(
+    raw_profiles: List[Dict[str, Any]], question: str
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for entry in raw_profiles:
+        meta = entry.get("meta") or {}
+        column = entry.get("column") or meta.get("column")
+        unit_value = meta.get("unit") or None
+        if not unit_value and _is_percent_column(column, meta):
+            unit_value = "ratio"
+
+        row: Dict[str, Any] = {
+            "source": entry.get("source"),
+            "column": column,
+            "label": meta.get("label") or entry.get("label") or column,
+            "value_recent": _normalize_metric_value(column, meta, entry.get("value_recent")),
+            "value_prev": _normalize_metric_value(column, meta, entry.get("value_prev")),
+            "coverage": _safe_float(entry.get("coverage")),
+            "recency": entry.get("recency"),
+            "time_span": entry.get("time_span"),
+            "sufficiency": entry.get("sufficiency") or "Low",
+            "selected": False,
+            "unit": unit_value,
+            "warning": entry.get("warning"),
+            "reason": None,
+            "_meta": meta,
+            "_recent_coverage": _safe_float(entry.get("recent_coverage")),
+        }
+        rows.append(row)
+    return rows
+
+
+def _extract_recipe_columns(formula: str) -> List[str]:
+    formula = formula.strip()
+    if formula.upper().startswith("DELTA(") and formula.endswith(")"):
+        inner = formula[6:-1].strip()
+        return [inner]
+    tokens = []
+    current = []
+    for char in formula:
+        if char.isalnum() or char == "_":
+            current.append(char)
+        else:
+            if current:
+                tokens.append("".join(current))
+                current = []
+    if current:
+        tokens.append("".join(current))
+    # filter out numeric literals
+    columns = [token for token in tokens if not token.replace(".", "", 1).isdigit()]
+    return columns
+
+
+def _evaluate_recipe_expression(expr: str, values: Dict[str, Optional[float]]) -> Optional[float]:
+    import ast
+
+    def _eval(node: ast.AST) -> Optional[float]:
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.BinOp):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            if left is None or right is None:
+                return None
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                if abs(right) < 1e-9:
+                    return None
+                return left / right
+            return None
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            operand = _eval(node.operand)
+            if operand is None:
+                return None
+            return operand if isinstance(node.op, ast.UAdd) else -operand
+        if isinstance(node, ast.Constant):
+            try:
+                return float(node.value)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(node, ast.Name):
+            return values.get(node.id)
+        return None
+
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return None
+    return _eval(tree)
+
+
+def _compute_recipe_value(
+    recipe: Dict[str, Any], base_rows: Dict[str, Dict[str, Any]]
+) -> Optional[float]:
+    formula = recipe.get("formula", "").strip()
+    if not formula:
+        return None
+    if formula.upper().startswith("DELTA(") and formula.endswith(")"):
+        column = formula[6:-1].strip()
+        row = base_rows.get(column)
+        if not row:
+            return None
+        recent = row.get("value_recent")
+        prev = row.get("value_prev")
+        if recent is None or prev is None:
+            return None
+        return round(recent - prev, 2)
+
+    column_names = _extract_recipe_columns(formula)
+    value_map: Dict[str, Optional[float]] = {}
+    for name in column_names:
+        row = base_rows.get(name)
+        value_map[name] = None if not row else _safe_float(row.get("value_recent"))
+    if any(value is None for value in value_map.values()):
+        return None
+    evaluated = _evaluate_recipe_expression(formula, value_map)
+    if evaluated is None:
+        return None
+    return round(evaluated, 2)
+
+
+def build_derived_features(profile_basic: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    base_map = {row.get("column"): row for row in profile_basic if row.get("column")}
+    derived_rows: List[Dict[str, Any]] = []
+    for recipe in DERIVED_RECIPES:
+        required_columns = _extract_recipe_columns(recipe.get("formula", ""))
+        base_rows = [base_map.get(col) for col in required_columns if base_map.get(col)]
+        if required_columns and len(base_rows) < len(required_columns):
+            continue
+        value = _compute_recipe_value(recipe, base_map)
+        if value is None:
+            continue
+        coverage_candidates = [row.get("coverage") for row in base_rows if row]
+        suff_candidates = [row.get("sufficiency") for row in base_rows if row]
+        recency_candidates = [row.get("recency") for row in base_rows if row]
+        time_span_candidates = [row.get("time_span") for row in base_rows if row]
+        coverage = min((val for val in coverage_candidates if val is not None), default=None)
+        sufficiency = _worst_sufficiency(suff_candidates or ["Medium"])
+        recency = next((val for val in recency_candidates if val), None)
+        time_span = next((val for val in time_span_candidates if val), None)
+        unit_raw = recipe.get("unit") or ""
+        unit_map = {"%": "ratio", "원": "currency", "건": "count", "pp": "pp"}
+        normalized_unit = unit_map.get(unit_raw, unit_raw or None)
+        derived_rows.append(
+            {
+                "source": recipe.get("source", "derived"),
+                "column": f"derived.{recipe['id']}",
+                "label": recipe.get("label", recipe["id"]),
+                "value_recent": value,
+                "value_prev": None,
+                "coverage": coverage,
+                "recency": recency,
+                "time_span": time_span,
+                "sufficiency": sufficiency,
+                "selected": True,
+                "unit": normalized_unit,
+                "warning": None,
+                "reason": None,
+                "_recipe": recipe,
+            }
+        )
+    return derived_rows
+
+
+def build_profile_table_advanced(derived_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return derived_rows
+
+
+def _format_value_for_reason(value: Any, unit: Optional[str]) -> str:
+    if value is None:
+        return "값 없음"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if unit == "ratio":
+        percent = normalize_percent(num)
+        if percent is None:
+            return "값 없음"
+        return f"{percent:.2f}%"
+    if unit == "currency":
+        return f"{num:,.0f}원"
+    if unit == "count":
+        return f"{num:,.0f}건"
+    if unit == "pp":
+        sign = "+" if num > 0 else ""
+        return f"{sign}{num:.2f}pp"
+    return f"{num:.2f}"
+
+
+def enrich_reasons_with_eda(
+    reasons: List[Dict[str, Any]],
+    profile_basic: List[Dict[str, Any]],
+    profile_advanced: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    enriched = list(reasons)
+    seen = {item.get("column") for item in reasons}
+    for row in profile_advanced:
+        column = row.get("column")
+        if column in seen:
+            continue
+        recipe = row.get("_recipe") or {}
+        recipe_id = recipe.get("id")
+        label = row.get("label", column or "파생 지표")
+        unit = row.get("unit")
+        value = row.get("value_recent")
+        reason_text: str
+        if recipe_id == "revisit_delta":
+            if value is None:
+                reason_text = "재방문율 변화량을 확인했으나 수치가 부족합니다."
+            elif value > 0:
+                reason_text = (
+                    f"최근 3개월 대비 {abs(value):.2f}pp 상승하여 성장 모멘텀을 활용합니다."
+                )
+            elif value < 0:
+                reason_text = (
+                    f"최근 3개월 대비 {abs(value):.2f}pp 하락이 확인되어 재방문 인센티브가 필요합니다."
+                )
+            else:
+                reason_text = "최근 3개월과 직전 3개월의 재방문율 변화가 없어 추세를 유지합니다."
+        elif recipe_id == "ticket_trend":
+            if value is None:
+                reason_text = "객단가 추이를 확인했으나 수치가 부족합니다."
+            elif value > 0:
+                reason_text = (
+                    f"최근 3개월 객단가가 {abs(value):,.0f}원 상승해 고가 전략을 검토합니다."
+                )
+            elif value < 0:
+                reason_text = (
+                    f"최근 3개월 객단가가 {abs(value):,.0f}원 하락해 할인 프로모션을 점검합니다."
+                )
+            else:
+                reason_text = "객단가 변동이 없어 기본 전략을 유지합니다."
+        elif recipe_id == "traffic_trend":
+            if value is None:
+                reason_text = "이용건 추이를 확인했으나 수치가 부족합니다."
+            elif value > 0:
+                reason_text = (
+                    f"최근 이용건이 {abs(value):,.0f}건 증가해 성장 채널을 확대합니다."
+                )
+            elif value < 0:
+                reason_text = (
+                    f"최근 이용건이 {abs(value):,.0f}건 감소해 방문 유입 캠페인이 필요합니다."
+                )
+            else:
+                reason_text = "이용건 변동이 없어 안정적 운영을 유지합니다."
+        elif recipe_id == "loyalty_bias":
+            value_text = _format_value_for_reason(value, "pp")
+            reason_text = (
+                f"재방문율과 신규율의 격차({value_text})를 확인해 유지/확장 균형을 조정합니다."
+            )
+        elif recipe_id == "youth_share":
+            value_text = _format_value_for_reason(value, "ratio")
+            reason_text = f"10~20대 비중 {value_text}를 확인해 젊은 타깃 채널을 선정합니다."
+        elif recipe_id == "worker_share":
+            value_text = _format_value_for_reason(value, "ratio")
+            reason_text = f"직장권 비중 {value_text}로 출퇴근 시간대 집중 캠페인을 제안합니다."
+        elif recipe_id == "unique_rate":
+            value_text = _format_value_for_reason(value, None)
+            reason_text = f"고객·이용건 비율 {value_text}를 참고해 충성 고객 비중을 판단합니다."
+        elif recipe_id == "delivery_dependency":
+            value_text = _format_value_for_reason(value, "ratio")
+            reason_text = f"배달 의존도 {value_text}를 확인해 온/오프 채널 믹스를 조정합니다."
+        else:
+            value_text = _format_value_for_reason(value, unit)
+            reason_text = f"{label} — 파생 분석 값 {value_text}를 근거로 활용합니다."
+        enriched.append({"column": column, "label": label, "reason": reason_text})
+        seen.add(column)
+    return enriched
+
+
 def _ensure_telemetry_dir() -> None:
     TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -163,317 +576,169 @@ def _write_telemetry(payload: Dict[str, Any], merchant_id: str) -> None:
         json.dump(payload, fp, ensure_ascii=False, indent=2)
 
 
-def _normalize_percent_value(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        num = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not (num == num):
-        return None
-    if num < 0:
-        num = 0.0
-    if num <= 1:
-        return num * 100
-    if num <= 100:
-        return num
-    return num / 100
-
-
-def _entries_by_tag(
-    profiles: List[Dict[str, Any]], selected: List[Dict[str, Any]], tag: str
-) -> List[Dict[str, Any]]:
-    matches = [
-        entry
-        for entry in selected
-        if tag in (entry.get("meta", {}).get("role_tags") or [])
-    ]
-    if matches:
-        return matches
-    return [
-        entry
-        for entry in profiles
-        if tag in (entry.get("meta", {}).get("role_tags") or [])
-    ]
-
-
-def _pick_percent(entry: Dict[str, Any]) -> Tuple[float | None, str]:
-    unit = entry.get("unit") or entry.get("meta", {}).get("unit")
-    value = entry.get("value_recent")
-    if unit == "ratio" or unit is None:
-        percent = _normalize_percent_value(value)
-        return percent, "%"
-    try:
-        return float(value), entry.get("unit", "")
-    except (TypeError, ValueError):
-        return None, entry.get("unit", "")
-
-
-def _generate_eda_derivatives(
-    profiles: List[Dict[str, Any]], selected: List[Dict[str, Any]]
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    derived_entries: List[Dict[str, Any]] = []
-    extra_reasons: List[Dict[str, Any]] = []
-
-    revisit_entries = _entries_by_tag(profiles, selected, "revisit")
-    acquisition_entries = _entries_by_tag(profiles, selected, "acquisition")
-    if revisit_entries and acquisition_entries:
-        revisit = revisit_entries[0]
-        acquisition = acquisition_entries[0]
-        revisit_pct, _ = _pick_percent(revisit)
-        acquisition_pct, _ = _pick_percent(acquisition)
-        if revisit_pct is not None and acquisition_pct is not None:
-            gap = revisit_pct - acquisition_pct
-            reason = (
-                f"재방문율 {revisit_pct:.2f}%와 신규 방문율 {acquisition_pct:.2f}% 격차 {gap:+.2f}%을 분석해 고객 유지·확장 균형을 진단합니다."
-            )
-            derived_entries.append(
-                {
-                    "source": "Derived (EDA)",
-                    "column": "eda.revisit_vs_new",
-                    "label": "재방문·신규 고객 조합",
-                    "value_recent": gap,
-                    "value_prev": None,
-                    "coverage": 1.0,
-                    "recency": revisit.get("recency") or acquisition.get("recency") or "최근 조합",
-                    "time_span": "최근 3개월 조합",
-                    "sufficiency": "High",
-                    "warning": None,
-                    "unit": "ratio",
-                    "meta": {
-                        "role_tags": ["eda", "revisit", "acquisition"],
-                        "question_roles": list(
-                            set(revisit.get("meta", {}).get("question_roles") or [])
-                            | set(acquisition.get("meta", {}).get("question_roles") or [])
-                        ),
-                        "unit": "ratio",
-                        "derived": True,
-                        "label": "재방문·신규 고객 조합",
-                    },
-                    "custom_reason": reason,
-                }
-            )
-
-    workplace_entries = _entries_by_tag(profiles, selected, "workplace")
-    residence_entries = _entries_by_tag(profiles, selected, "residence")
-    if workplace_entries and residence_entries:
-        workplace = workplace_entries[0]
-        residence = residence_entries[0]
-        workplace_pct, _ = _pick_percent(workplace)
-        residence_pct, _ = _pick_percent(residence)
-        if workplace_pct is not None and residence_pct is not None:
-            balance = workplace_pct / max(residence_pct, 0.01)
-            reason = (
-                f"직장권 {workplace_pct:.2f}% / 주거권 {residence_pct:.2f}% 구성으로 상권 집중도를 확인하고 채널 포지셔닝을 설정합니다."
-            )
-            derived_entries.append(
-                {
-                    "source": "Derived (EDA)",
-                    "column": "eda.work_res_balance",
-                    "label": "직장·주거 생활권 균형",
-                    "value_recent": balance,
-                    "value_prev": None,
-                    "coverage": 1.0,
-                    "recency": workplace.get("recency") or residence.get("recency") or "최근 조합",
-                    "time_span": "최근 3개월 조합",
-                    "sufficiency": "High",
-                    "warning": None,
-                    "unit": None,
-                    "meta": {
-                        "role_tags": ["eda", "workplace", "residence"],
-                        "question_roles": list(
-                            set(workplace.get("meta", {}).get("question_roles") or [])
-                            | set(residence.get("meta", {}).get("question_roles") or [])
-                        ),
-                        "derived": True,
-                        "label": "직장·주거 생활권 균형",
-                    },
-                    "custom_reason": reason,
-                }
-            )
-
-    age_entries = _entries_by_tag(profiles, selected, "age")
-    if len(age_entries) >= 2:
-        ranked = [
-            (
-                entry,
-                _pick_percent(entry)[0],
-            )
-            for entry in age_entries
-        ]
-        ranked = [item for item in ranked if item[1] is not None]
-        ranked.sort(key=lambda item: item[1], reverse=True)
-        if len(ranked) >= 2:
-            top_entry, top_pct = ranked[0]
-            second_entry, second_pct = ranked[1]
-            reason = (
-                f"핵심 연령층은 {top_entry.get('label', top_entry.get('column'))} {top_pct:.2f}%, 다음은 {second_entry.get('label', second_entry.get('column'))} {second_pct:.2f}%로 타깃 세그먼트를 확장합니다."
-            )
-            derived_entries.append(
-                {
-                    "source": "Derived (EDA)",
-                    "column": "eda.age_focus",
-                    "label": "핵심 연령대 집중도",
-                    "value_recent": top_pct,
-                    "value_prev": second_pct,
-                    "coverage": 1.0,
-                    "recency": top_entry.get("recency") or "최근 조합",
-                    "time_span": "최근 3개월 조합",
-                    "sufficiency": "High",
-                    "warning": None,
-                    "unit": "ratio",
-                    "meta": {
-                        "role_tags": ["eda", "age"],
-                        "question_roles": list(top_entry.get("meta", {}).get("question_roles") or []),
-                        "unit": "ratio",
-                        "derived": True,
-                        "label": "핵심 연령대 집중도",
-                    },
-                    "custom_reason": reason,
-                }
-            )
-
-    if not derived_entries and selected:
-        top_selected = selected[0]
-        label = top_selected.get("label") or top_selected.get("column") or "핵심 지표"
-        reason = f"{label} 지표를 중심으로 EDA를 반복해 보조 지표를 발굴했습니다."
-        extra_reasons.append({"column": top_selected.get("column"), "reason": reason})
-
-    return derived_entries, extra_reasons
-
-
-def diagnose_and_select(
-    question: str, merchant_id: str, analysis_mode: str = "기본 데이터 접근"
-) -> Dict[str, Any]:
-    context = _infer_question_types(question)
-    profiles = profile_columns(merchant_id)
+def select_features(
+    profile_basic: List[Dict[str, Any]],
+    context: SelectionContext,
+    question: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    row_map = {
+        row.get("column"): row
+        for row in profile_basic
+        if row.get("column")
+    }
 
     scored: List[Dict[str, Any]] = []
-    for entry in profiles:
-        entry_meta = entry.get("meta") or {}
-        if entry_meta.get("feature_id") is None:
+    for column, row in row_map.items():
+        meta = row.get("_meta") or {}
+        feature_id = meta.get("feature_id")
+        if not feature_id:
             continue
-        entry["unit"] = entry_meta.get("unit")
-        entry["feature_id"] = entry_meta.get("feature_id")
-        entry_score = _score_profile(entry, context)
-        entry["_score"] = entry_score
+        entry = {
+            "column": column,
+            "source": row.get("source"),
+            "value_recent": row.get("value_recent"),
+            "value_prev": row.get("value_prev"),
+            "coverage": row.get("coverage"),
+            "recent_coverage": row.get("_recent_coverage")
+            if row.get("_recent_coverage") is not None
+            else row.get("coverage"),
+            "sufficiency": row.get("sufficiency"),
+            "recency": row.get("recency"),
+            "time_span": row.get("time_span"),
+            "meta": meta,
+        }
+        entry["_score"] = _score_profile(entry, context)
         entry["_passes"] = _passes_threshold(entry, context)
         scored.append(entry)
 
     scored.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
 
-    selected: List[Dict[str, Any]] = []
+    selected_entries: List[Dict[str, Any]] = []
     selected_tags: Set[str] = set()
     for entry in scored:
         if not entry.get("_passes"):
             continue
-        if len(selected) >= 8:
+        if len(selected_entries) >= 8:
             break
-        selected.append(entry)
+        selected_entries.append(entry)
         meta = entry.get("meta") or {}
         selected_tags.update(meta.get("role_tags") or [])
 
     for must_tag in context.must_have_tags:
         if must_tag in selected_tags:
             continue
-        candidates = [
-            item
-            for item in scored
-            if must_tag in (item.get("meta", {}).get("role_tags") or [])
-            and item not in selected
-        ]
-        if candidates:
-            selected.append(candidates[0])
-            selected_tags.update(candidates[0].get("meta", {}).get("role_tags") or [])
-
-    is_advanced_mode = str(analysis_mode or "").startswith("고급")
-    derived_entries: List[Dict[str, Any]] = []
-    extra_reason_entries: List[Dict[str, Any]] = []
-    if is_advanced_mode:
-        derived_entries, extra_reason_entries = _generate_eda_derivatives(
-            profiles, selected
+        candidate = next(
+            (
+                item
+                for item in scored
+                if must_tag in (item.get("meta", {}).get("role_tags") or [])
+                and item not in selected_entries
+            ),
+            None,
         )
-        selected.extend(derived_entries)
-        profiles.extend(derived_entries)
+        if candidate:
+            selected_entries.append(candidate)
+            selected_tags.update(candidate.get("meta", {}).get("role_tags") or [])
 
     selection_reasons: List[Dict[str, Any]] = []
     selected_features: List[Dict[str, Any]] = []
-    sufficiency_low = 0
 
-    for entry in profiles:
-        entry["selected"] = entry in selected
-        entry.pop("_score", None)
-        entry.pop("_passes", None)
-        if entry.get("selected"):
-            meta = entry.get("meta") or {}
-            if entry.get("custom_reason"):
-                reason = entry["custom_reason"]
-            else:
-                tag = _pick_reason_tag(entry, context)
-                reason = _build_reason(
-                    meta.get("label", entry.get("column", "")), tag, question
-                )
-            entry["reason"] = reason
-            selection_reasons.append({"column": entry.get("column"), "reason": reason})
-            if not meta.get("derived"):
-                selected_features.append(
-                    {
-                        "id": meta.get("feature_id"),
-                        "column": entry.get("column"),
-                        "label": meta.get("label", entry.get("column")),
-                        "source": entry.get("source"),
-                        "period": meta.get("default_period", "recent_3m"),
-                        "value": entry.get("value_recent"),
-                        "latest_period": entry.get("recency"),
-                        "time_span": entry.get("time_span"),
-                    }
-                )
-                if entry.get("sufficiency") == "Low":
-                    sufficiency_low += 1
-        else:
-            entry["reason"] = None
+    for row in profile_basic:
+        row["selected"] = False
+        row["reason"] = None
 
-    if extra_reason_entries:
-        selection_reasons.extend(extra_reason_entries)
+    for entry in selected_entries:
+        column = entry.get("column")
+        row = row_map.get(column)
+        meta = entry.get("meta") or {}
+        label = (row or {}).get("label") or meta.get("label") or column or "지표"
+        tag = _pick_reason_tag(entry, context)
+        reason = _build_reason(label, tag, question)
+        if row:
+            row["selected"] = True
+            row["reason"] = reason
+        selection_reasons.append({"column": column, "label": label, "reason": reason})
+        if not meta.get("derived"):
+            selected_features.append(
+                {
+                    "id": meta.get("feature_id"),
+                    "column": column,
+                    "label": label,
+                    "source": (row or {}).get("source"),
+                    "period": meta.get("default_period", "recent_3m"),
+                    "value": (row or {}).get("value_recent"),
+                    "latest_period": (row or {}).get("recency"),
+                    "time_span": (row or {}).get("time_span"),
+                }
+            )
 
-    sufficiency_summary = "데이터 충분"
-    if selected_features and sufficiency_low / max(len(selected_features), 1) >= 0.4:
-        sufficiency_summary = "데이터 부족"
+    base_entries = [entry for entry in selected_entries if not entry.get("meta", {}).get("derived")]
+    if base_entries:
+        high_mid = sum(
+            1
+            for entry in base_entries
+            if (row_map.get(entry.get("column")) or {}).get("sufficiency")
+            in {"High", "Medium"}
+        )
+        ratio = high_mid / max(len(base_entries), 1)
+    else:
+        ratio = 1.0
+    sufficiency_summary = "데이터 충분" if ratio >= 0.6 else "데이터 부족"
+
+    return selected_features, selection_reasons, sufficiency_summary
+
+
+def diagnose_and_select(
+    question: str,
+    merchant_id: str,
+    analysis_mode: AnalysisMode = "basic",
+    **kwargs,
+) -> Dict[str, Any]:
+    context = _infer_question_types(question)
+    raw_profiles = profile_columns(merchant_id)
+    profile_basic = build_profile_table_basic(raw_profiles, question)
+
+    selected_features, selection_reasons, sufficiency_summary = select_features(
+        profile_basic, context, question
+    )
+
+    derived_rows: List[Dict[str, Any]] = []
+    if analysis_mode == "advanced":
+        derived_rows = build_derived_features(profile_basic)
+        if derived_rows:
+            selection_reasons = enrich_reasons_with_eda(
+                selection_reasons, profile_basic, derived_rows
+            )
+
+    profile_advanced = build_profile_table_advanced(derived_rows) if derived_rows else None
+
+    from datetime import datetime
 
     telemetry_payload = {
         "app_version": APP_VERSION,
         "question": question,
         "merchant_id": merchant_id,
-        "profile_table": [
-            {
-                key: value
-                for key, value in entry.items()
-                if key not in {"meta"}
-            }
-            for entry in profiles
-        ],
+        "analysis_mode": analysis_mode,
+        "profile_basic": _strip_internal_fields(profile_basic),
+        "profile_advanced": _strip_internal_fields(derived_rows)
+        if derived_rows
+        else None,
         "selected_features": selected_features,
         "selection_reasons": selection_reasons,
         "sufficiency_summary": sufficiency_summary,
-        "analysis_mode": analysis_mode,
+        "timestamp": datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"),
+        "filters": {"question_types": sorted(context.question_types)},
+        "time_windows": {"recent_window": 3},
     }
-
-    from datetime import datetime
-
-    telemetry_payload["timestamp"] = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    telemetry_payload["filters"] = {"question_types": sorted(context.question_types)}
-    telemetry_payload["time_windows"] = {"recent_window": 3}
 
     _write_telemetry(telemetry_payload, merchant_id)
 
     return {
-        "profile_table": [
-            {key: value for key, value in entry.items() if key != "meta"}
-            for entry in profiles
-        ],
+        "profile_basic": _strip_internal_fields(profile_basic),
+        "profile_advanced": _strip_internal_fields(profile_advanced)
+        if profile_advanced
+        else None,
         "selected_features": selected_features,
         "selection_reasons": selection_reasons,
         "sufficiency_summary": sufficiency_summary,
-        "analysis_mode": analysis_mode,
     }
