@@ -152,6 +152,7 @@ except Exception as e:
     sys.modules["app_core.panel_extract"] = fallback_module
 # --- end minimal safe import block ---
 
+import html
 import json
 import time
 from functools import lru_cache
@@ -496,16 +497,31 @@ def _extract_merchant_name(agent1_json: dict) -> str:
     return "—"
 
 
-def _format_percent(value) -> str:
+def _normalize_ratio_to_percent(value: Any) -> float | None:
+    """Normalize a ratio or percent-like value into 0-100 scale."""
+
     if value is None:
-        return "—"
+        return None
     try:
         num = float(value)
     except (TypeError, ValueError):
+        return None
+    if not (num == num):  # NaN guard
+        return None
+    if num < 0:
+        num = 0.0
+    if num <= 1:
+        return num * 100
+    if num <= 100:
+        return num
+    return num / 100
+
+
+def _format_percent(value) -> str:
+    percent = _normalize_ratio_to_percent(value)
+    if percent is None:
         return "—"
-    if num < 0 or num > 100:
-        return "—"
-    return f"{num:.1f}%"
+    return f"{percent:.2f}%"
 
 
 def _format_pp_delta(value: Any) -> str:
@@ -521,15 +537,10 @@ def _format_pp_delta(value: Any) -> str:
 
 
 def _format_ratio_percent(value: Any) -> str:
-    try:
-        if value is None:
-            return "—"
-        num = float(value) * 100
-    except (TypeError, ValueError):
+    percent = _normalize_ratio_to_percent(value)
+    if percent is None:
         return "—"
-    if num < 0:
-        num = 0.0
-    return f"{num:.1f}%"
+    return f"{percent:.2f}%"
 
 
 def _format_metric_value(value: Any, unit: str | None) -> str:
@@ -540,7 +551,10 @@ def _format_metric_value(value: Any, unit: str | None) -> str:
     except (TypeError, ValueError):
         return str(value)
     if unit == "ratio":
-        return f"{num * 100:.1f}%"
+        percent = _normalize_ratio_to_percent(num)
+        if percent is None:
+            return "—"
+        return f"{percent:.2f}%"
     if unit == "currency":
         return f"{num:,.0f}원"
     if unit == "count":
@@ -865,37 +879,44 @@ def _render_data_profile_section(
     question_text: str | None,
     merchant_title: str,
     merchant_id: str | None,
-) -> dict | None:
-    st.subheader("데이터 프로파일러 & 근거 뷰")
+    analysis_mode: str,
+) -> tuple[dict | None, dict[str, str]]:
     st.caption(
-        "이 기능은 무엇을 하나요? 상호별 보유 지표를 한눈에 보여주고 질문에 맞는 지표만 골라 근거를 남깁니다."
+        "신한카드 패널 데이터에서 해당 가맹점의 모든 주요 지표를 수집해 표로 정리했습니다."
     )
     if not merchant_id:
         st.info("가맹점 ID를 확인할 수 없어 데이터 프로파일을 표시할 수 없습니다.")
-        return None
+        return None, {}
 
     cache = st.session_state.setdefault("_data_profile_cache", {})
-    cache_key = f"{merchant_id}::{question_text or ''}"
+    cache_key = f"{merchant_id}::{question_text or ''}::{analysis_mode}"
     if cache_key in cache:
         profile_payload = cache[cache_key]
     else:
         try:
-            profile_payload = diagnose_and_select(question_text or "", merchant_id)
+            profile_payload = diagnose_and_select(
+                question_text or "",
+                merchant_id,
+                analysis_mode=analysis_mode,
+            )
         except Exception as exc:  # pragma: no cover - defensive for UI
             st.warning(f"데이터 프로파일 생성에 실패했습니다: {exc}")
-            return None
+            return None, {}
         cache[cache_key] = profile_payload
 
     profile_table = profile_payload.get("profile_table") or []
     selected_features = profile_payload.get("selected_features") or []
     selection_reasons = profile_payload.get("selection_reasons") or []
     sufficiency_summary = profile_payload.get("sufficiency_summary") or "데이터 충분"
+    label_map = {
+        entry.get("column"): entry.get("label", entry.get("column")) for entry in profile_table
+    }
 
-    st.markdown(f"### 신한카드 보유 데이터({merchant_title})")
+    st.markdown(f"**{merchant_title}** 가맹점의 최신 데이터 스냅샷입니다.")
 
     if not profile_table:
         st.info("표시할 프로파일 데이터가 없습니다.")
-        return profile_payload
+        return profile_payload, label_map
 
     display_rows: list[dict[str, Any]] = []
     for entry in profile_table:
@@ -938,27 +959,16 @@ def _render_data_profile_section(
             "- 질문 키워드와 role_tags 매칭으로 선택 사유를 자동 생성합니다."
         )
 
-    st.markdown("**Agent-2로 전달된 지표**")
-    st.caption(f"총 {len(selected_features)}개")
-    if selected_features:
-        st.code(json.dumps(selected_features, ensure_ascii=False, indent=2))
-    else:
-        st.code("[]")
-
-    if selection_reasons:
-        label_map = {entry.get("column"): entry.get("label", entry.get("column")) for entry in profile_table}
-        st.markdown("**선택 사유(한 줄 설명)**")
-        for item in selection_reasons:
-            column = item.get("column")
-            label = label_map.get(column, column or "지표")
-            st.markdown(f"🧩 **{label}** — {item.get('reason', '사유 없음')}")
-
     if sufficiency_summary == "데이터 부족":
         st.warning("선택된 지표의 커버리지가 부족해 보수적인 해석이 필요합니다.")
     else:
         st.success("선택된 지표의 커버리지가 충분합니다.")
 
-    return profile_payload
+    st.caption(
+        f"현재 모드: {analysis_mode} — 선택된 지표 {len(selected_features)}개, 선택 사유 {len(selection_reasons)}개"
+    )
+
+    return profile_payload, label_map
 
 
 def render_summary_view(
@@ -973,6 +983,118 @@ def render_summary_view(
     merchant_title = _extract_merchant_name(agent1_json)
     merchant_id = _extract_merchant_id(agent1_json)
     st.header(f"📊 {merchant_title} 가맹점 방문 고객 현황 분석")
+
+    mode = st.session_state.get("analysis_mode", "기본 데이터 접근")
+
+    if "_render_evidence_badge" not in globals():
+
+        def _fallback_render_evidence_badge(
+            metric: dict | str | None,
+            meta: dict | None = None,
+            *,
+            metric_id: str | None = None,
+            label: str | None = None,
+            value: Any | None = None,
+            period: str | None = None,
+            comment: str | None = None,
+            disabled: bool = False,
+            tooltip: str | None = None,
+        ) -> None:
+            """Render a compact evidence badge with graceful fallbacks."""
+
+            metric_dict = metric if isinstance(metric, dict) else {}
+            meta_dict = meta if isinstance(meta, dict) else {}
+
+            metric_key = metric_id or meta_dict.get("metric_id") or metric_dict.get("id")
+            base_label = (
+                label
+                or meta_dict.get("label")
+                or meta_dict.get("title")
+                or metric_dict.get("label")
+                or metric_dict.get("title")
+                or metric_key
+                or (tooltip if tooltip else "근거")
+            )
+            base_value = (
+                value
+                if value is not None
+                else meta_dict.get("value")
+                if meta_dict.get("value") is not None
+                else metric_dict.get("value")
+            )
+            base_period = (
+                period
+                or meta_dict.get("period")
+                or meta_dict.get("latest_period")
+                or meta_dict.get("year")
+                or metric_dict.get("period")
+                or "—"
+            )
+            base_comment = (
+                comment
+                or meta_dict.get("comment")
+                or metric_dict.get("comment")
+                or tooltip
+                or "근거 확인"
+            )
+
+            percent_value = None
+            if base_value is not None:
+                percent_value = _normalize_ratio_to_percent(base_value)
+            if percent_value is not None:
+                value_text = f"{percent_value:.2f}%"
+            elif base_value is None:
+                value_text = "—"
+            else:
+                value_text = str(base_value)
+
+            border_color = "#cccccc" if disabled else "#2f8bfd"
+            bg_color = "#f6f6f6" if disabled else "#f0f6ff"
+            tooltip_attr = f" title=\"{html.escape(tooltip)}\"" if tooltip else ""
+            badge_html = (
+                f"<div style='border:1px solid {border_color};"
+                f"border-radius:6px;padding:6px;margin-bottom:4px;"
+                f"background-color:{bg_color};font-size:0.85rem;'"
+                f"{tooltip_attr}>"
+                f"<b>{html.escape(str(base_label))}</b>: {html.escape(value_text)}"
+                f" ({html.escape(str(base_period))}) — {html.escape(str(base_comment))}"
+                "</div>"
+            )
+            st.markdown(badge_html, unsafe_allow_html=True)
+
+    globals()["_render_evidence_badge"] = _fallback_render_evidence_badge
+
+    mode_options = [
+        "기본 데이터 접근",
+        "고급 데이터 접근 (EDA/조합 포함)",
+    ]
+    default_mode = st.session_state.get("analysis_mode", mode_options[0])
+    try:
+        default_index = mode_options.index(default_mode)
+    except ValueError:
+        default_index = 0
+    mode = st.radio(
+        "데이터 접근 수준 선택",
+        mode_options,
+        index=default_index,
+        horizontal=True,
+    )
+    st.session_state["analysis_mode"] = mode
+
+    st.markdown(
+        "> 💡 **이 화면은 실제 신한카드 데이터를 기반으로 분석한 과정을 시각적으로 보여줍니다.**  "
+        "<br>- ‘기본 데이터 접근’은 단순 지표 수준,  "
+        "<br>- ‘고급 데이터 접근’은 조합/EDA를 포함한 확장 분석입니다.  "
+        "<br>각 단계별로 어떤 데이터를 근거로 판단했는지를 명확히 드러내,  "
+        "<br>사용자가 ‘데이터를 보고 판단했다’는 신뢰를 전달합니다.",
+        unsafe_allow_html=True,
+    )
+
+    if question_text:
+        st.markdown(f"📍 **질문:** {question_text}")
+    else:
+        st.markdown("📍 **질문:** —")
+    st.divider()
 
     context = (agent1_json or {}).get("context", {})
     if context and not context.get("merchant"):
@@ -1013,7 +1135,26 @@ def render_summary_view(
         st.subheader("현황 표")
         st.table(overview_df)
 
-    profile_payload = _render_data_profile_section(question_text, merchant_title, merchant_id)
+    st.markdown("### 📊 신한카드 데이터 요약 (전 컬럼)")
+    profile_payload, label_map = _render_data_profile_section(
+        question_text, merchant_title, merchant_id, mode
+    )
+    st.divider()
+
+    selection_reasons = []
+    if profile_payload:
+        selection_reasons = profile_payload.get("selection_reasons") or []
+
+    st.markdown("### 🎯 선택 사유 (한 줄 설명)")
+    if selection_reasons:
+        for item in selection_reasons:
+            column = item.get("column")
+            label = label_map.get(column, column or "지표")
+            reason = item.get("reason") or "사유 없음"
+            st.markdown(f"🧩 **{label}** — {reason}")
+    else:
+        st.markdown("🧩 선택된 근거가 없습니다.")
+    st.divider()
 
     if not is_public_mode:
         period_text, goal_lines = _build_goal_lines(agent1_json)
@@ -1043,7 +1184,7 @@ def render_summary_view(
             profile_payload.get("sufficiency_summary", "데이터 충분"),
         )
 
-    st.subheader("아이디어 제안")
+    st.markdown("### 📑 Agent-2의 마케팅 제안")
     if used_metrics_block:
         st.markdown("📑 **사용 지표**")
         lines = used_metrics_block.get("used_metrics_lines") or []
@@ -1163,6 +1304,9 @@ def render_summary_view(
                     st.markdown(f"{idx}. {preview}")
                 with cols[1]:
                     _render_evidence_badge(chunk, meta)
+
+    st.divider()
+    st.markdown(f"📂 접근 수준: **{mode}**")
 DEFAULT_RAG_ROOT = "data/rag"
 RAG_ROOT = str(app_config.get_setting("RAG_ROOT", DEFAULT_RAG_ROOT))
 RAG_EMBED_VERSION = str(app_config.get_setting("RAG_EMBED_VERSION", "embed_v1"))
