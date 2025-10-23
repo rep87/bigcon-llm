@@ -158,6 +158,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from agents.agent1 import diagnose_and_select
+from agents.agent2 import generate_plan
+
 import app_core.config as app_config
 import app_core.failsoft as failsoft
 import app_core.formatters as formatters
@@ -331,6 +334,7 @@ def _render_main_views(
             table_dict=overview_cached[1],
             panel_summary=overview_cached[2],
             retrieval_payload=retrieval_payload,
+            question_text=question_text,
         )
     except Exception:
         st.error("요약 뷰를 렌더링하는 중 오류가 발생했습니다.")
@@ -516,6 +520,34 @@ def _format_pp_delta(value: Any) -> str:
     return f"{num:+.1f}"
 
 
+def _format_ratio_percent(value: Any) -> str:
+    try:
+        if value is None:
+            return "—"
+        num = float(value) * 100
+    except (TypeError, ValueError):
+        return "—"
+    if num < 0:
+        num = 0.0
+    return f"{num:.1f}%"
+
+
+def _format_metric_value(value: Any, unit: str | None) -> str:
+    if value is None:
+        return "—"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if unit == "ratio":
+        return f"{num * 100:.1f}%"
+    if unit == "currency":
+        return f"{num:,.0f}원"
+    if unit == "count":
+        return f"{num:,.0f}"
+    return f"{num:,.2f}"
+
+
 def _resolve_panel_path() -> Path:
     override = app_config.get_setting("PANEL_CSV_PATH", None)
     if override:
@@ -586,6 +618,22 @@ def _format_customer_mix(detail: dict | None) -> str:
     return ", ".join(parts[:3]) if parts else "—"
 
 
+def _extract_merchant_id(agent1_json: dict | None) -> str | None:
+    if not agent1_json:
+        return None
+    context = (agent1_json.get("context") or {}) if isinstance(agent1_json, dict) else {}
+    merchant = context.get("merchant") or {}
+    merchant_id = merchant.get("encoded_mct") or merchant.get("ENCODED_MCT")
+    if merchant_id is None:
+        debug_section = _get_debug_section(agent1_json)
+        resolve_block = debug_section.get("resolve") if isinstance(debug_section, dict) else None
+        if isinstance(resolve_block, dict):
+            merchant_id = resolve_block.get("resolved_merchant_id")
+    if merchant_id is None:
+        return None
+    return str(merchant_id)
+
+
 def _collect_overview_row(
     agent1_json: dict,
 ) -> tuple[pd.DataFrame, dict, dict | None]:
@@ -615,13 +663,7 @@ def _collect_overview_row(
         addr = " / ".join(str(v) for v in addr if v)
     address = addr if addr else "—"
 
-    merchant_id = merchant.get("encoded_mct") or merchant.get("ENCODED_MCT")
-    if merchant_id is None:
-        debug_section = _get_debug_section(agent1_json)
-        resolve_block = debug_section.get("resolve") if isinstance(debug_section, dict) else None
-        if isinstance(resolve_block, dict):
-            merchant_id = resolve_block.get("resolved_merchant_id")
-    merchant_id = str(merchant_id) if merchant_id is not None else None
+    merchant_id = _extract_merchant_id(agent1_json)
 
     panel_summary: dict | None = None
     panel_df = _get_panel_dataframe()
@@ -785,8 +827,6 @@ def _render_status_summary(
     table_dict: dict | None,
     panel_summary: dict | None,
 ) -> None:
-    debug_mode = _is_debug_mode()
-
     if not table_dict:
         st.info("요약 정보가 없습니다.")
         return
@@ -805,8 +845,7 @@ def _render_status_summary(
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     if panel_summary is None:
-        if debug_mode:
-            st.caption("⚠️ panel_summary is None (skip status summary)")
+        st.caption("패널 요약 정보가 없습니다.")
         return
 
     if len(panel_summary.get("age_all") or []) > 3:
@@ -818,8 +857,108 @@ def _render_status_summary(
         with st.expander("전체 연령 비중 보기", expanded=False):
             st.markdown(", ".join(details) if details else "—")
 
-    if debug_mode and panel_summary.get("guard_fallback"):
-        st.caption("[guard fallback] used latest available month; sums outside 100±0.5")
+    if panel_summary.get("guard_fallback"):
+        st.caption("최근 월 데이터로 대체된 요약입니다.")
+
+
+def _render_data_profile_section(
+    question_text: str | None,
+    merchant_title: str,
+    merchant_id: str | None,
+) -> dict | None:
+    st.subheader("데이터 프로파일러 & 근거 뷰")
+    st.caption(
+        "이 기능은 무엇을 하나요? 상호별 보유 지표를 한눈에 보여주고 질문에 맞는 지표만 골라 근거를 남깁니다."
+    )
+    if not merchant_id:
+        st.info("가맹점 ID를 확인할 수 없어 데이터 프로파일을 표시할 수 없습니다.")
+        return None
+
+    cache = st.session_state.setdefault("_data_profile_cache", {})
+    cache_key = f"{merchant_id}::{question_text or ''}"
+    if cache_key in cache:
+        profile_payload = cache[cache_key]
+    else:
+        try:
+            profile_payload = diagnose_and_select(question_text or "", merchant_id)
+        except Exception as exc:  # pragma: no cover - defensive for UI
+            st.warning(f"데이터 프로파일 생성에 실패했습니다: {exc}")
+            return None
+        cache[cache_key] = profile_payload
+
+    profile_table = profile_payload.get("profile_table") or []
+    selected_features = profile_payload.get("selected_features") or []
+    selection_reasons = profile_payload.get("selection_reasons") or []
+    sufficiency_summary = profile_payload.get("sufficiency_summary") or "데이터 충분"
+
+    st.markdown(f"### 신한카드 보유 데이터({merchant_title})")
+
+    if not profile_table:
+        st.info("표시할 프로파일 데이터가 없습니다.")
+        return profile_payload
+
+    display_rows: list[dict[str, Any]] = []
+    for entry in profile_table:
+        display_rows.append(
+            {
+                "Source": entry.get("source", "—"),
+                "Column": entry.get("column", "—"),
+                "Label": entry.get("label", "—"),
+                "최근값": _format_metric_value(entry.get("value_recent"), entry.get("unit")),
+                "직전값": _format_metric_value(entry.get("value_prev"), entry.get("unit")),
+                "커버리지": _format_ratio_percent(entry.get("coverage")),
+                "최신월": entry.get("recency") or "—",
+                "가용기간": entry.get("time_span") or "—",
+                "충분도": entry.get("sufficiency") or "—",
+                "선택": "선택" if entry.get("selected") else "—",
+                "경고": entry.get("warning") or "—",
+            }
+        )
+
+    display_df = pd.DataFrame(display_rows)
+
+    def _highlight_selected(row: pd.Series) -> list[str]:
+        selected = row.get("선택") == "선택"
+        border_style = "border: 2px solid #ff4b4b" if selected else ""
+        return [border_style] * len(row)
+
+    def _badge_style(value: Any) -> str:
+        return "color: #ff4b4b; font-weight: 600" if value == "선택" else ""
+
+    styler = display_df.style.apply(_highlight_selected, axis=1)
+    styler = styler.applymap(_badge_style, subset=["선택"])
+
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+
+    with st.expander("선택 기준 보기(룰 카드)", expanded=False):
+        st.markdown(
+            "- Q1: 연령·성별/생활권/재방문·신규 지표, 최근 3개월 커버리지 60% 이상\n"
+            "- Q2: 재방문·신규·생활권 지표, 커버리지 50% 이상\n"
+            "- Q3: 매출·이용·배달 지표, 커버리지 50% 이상\n"
+            "- 질문 키워드와 role_tags 매칭으로 선택 사유를 자동 생성합니다."
+        )
+
+    st.markdown("**Agent-2로 전달된 지표**")
+    st.caption(f"총 {len(selected_features)}개")
+    if selected_features:
+        st.code(json.dumps(selected_features, ensure_ascii=False, indent=2))
+    else:
+        st.code("[]")
+
+    if selection_reasons:
+        label_map = {entry.get("column"): entry.get("label", entry.get("column")) for entry in profile_table}
+        st.markdown("**선택 사유(한 줄 설명)**")
+        for item in selection_reasons:
+            column = item.get("column")
+            label = label_map.get(column, column or "지표")
+            st.markdown(f"🧩 **{label}** — {item.get('reason', '사유 없음')}")
+
+    if sufficiency_summary == "데이터 부족":
+        st.warning("선택된 지표의 커버리지가 부족해 보수적인 해석이 필요합니다.")
+    else:
+        st.success("선택된 지표의 커버리지가 충분합니다.")
+
+    return profile_payload
 
 
 def render_summary_view(
@@ -829,8 +968,10 @@ def render_summary_view(
     table_dict: dict | None = None,
     panel_summary: dict | None = None,
     retrieval_payload: dict | None = None,
+    question_text: str | None = None,
 ) -> None:
     merchant_title = _extract_merchant_name(agent1_json)
+    merchant_id = _extract_merchant_id(agent1_json)
     st.header(f"📊 {merchant_title} 가맹점 방문 고객 현황 분석")
 
     context = (agent1_json or {}).get("context", {})
@@ -872,6 +1013,8 @@ def render_summary_view(
         st.subheader("현황 표")
         st.table(overview_df)
 
+    profile_payload = _render_data_profile_section(question_text, merchant_title, merchant_id)
+
     if not is_public_mode:
         period_text, goal_lines = _build_goal_lines(agent1_json)
         st.subheader("목표")
@@ -891,7 +1034,28 @@ def render_summary_view(
     use_weather = bool(data_flags.get("use_weather", False))
     use_external = bool(data_flags.get("use_external", False))
 
+    used_metrics_block = None
+    if profile_payload is not None:
+        used_metrics_block = generate_plan(
+            question_text or "",
+            merchant_id or "",
+            profile_payload.get("selected_features") or [],
+            profile_payload.get("sufficiency_summary", "데이터 충분"),
+        )
+
     st.subheader("아이디어 제안")
+    if used_metrics_block:
+        st.markdown("📑 **사용 지표**")
+        lines = used_metrics_block.get("used_metrics_lines") or []
+        if lines:
+            for line in lines:
+                st.markdown(f"- {line}")
+        else:
+            st.markdown("- 활용 가능한 지표가 선택되지 않았습니다.")
+        tone_message = used_metrics_block.get("tone_message")
+        if tone_message:
+            st.caption(tone_message)
+
     if not answers:
         st.info("아이디어 제안이 제공되지 않았습니다.")
     for idx, answer in enumerate(answers[:4], start=1):
