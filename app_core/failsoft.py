@@ -94,7 +94,8 @@ def rag_adapter(
         info["catalog_size"] = None
 
     info["selection_missing"] = bool(info["requested"] and not info["selected_doc_ids"])
-    effective_mode = mode if mode in {"auto", "always"} else "auto"
+    allowed_modes = {"auto", "always", "off"}
+    effective_mode = mode if mode in allowed_modes else "auto"
     info["mode"] = effective_mode
 
     info["enabled"] = (

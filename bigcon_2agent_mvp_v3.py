@@ -172,9 +172,7 @@ APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / 'data'
 SHINHAN_DIR = DATA_DIR / 'shinhan'
 EXTERNAL_DIR = DATA_DIR / 'external'
-OUTPUT_DIR = DATA_DIR / 'outputs'
 SCHEMA_PATH = APP_ROOT / 'schemas' / 'actioncard.schema.json'
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_MONTHS = 8
 SEED = 42
@@ -196,48 +194,31 @@ class PromptSection:
     min_policy: int = 0
 
 
+INPUT_TOKEN_LIMIT = 16384
+
+
 def _get_llm_preferences() -> Dict[str, Any]:
     defaults = {
-        "in_ctx": 8192,
+        "in_ctx": INPUT_TOKEN_LIMIT,
         "out_max": 2048,
-        "length_policy": "balanced",
     }
-    policy = defaults["length_policy"]
-    alias_flag = False
     if st is not None:
         try:
-            defaults["in_ctx"] = int(st.session_state.get("llm_in_ctx", defaults["in_ctx"]))
             defaults["out_max"] = int(
                 st.session_state.get("llm_out_max", defaults["out_max"])
             )
-            policy = st.session_state.get("llm_length_policy", policy)
         except Exception:  # pragma: no cover - defensive UI guard
             pass
-        alias_flag = bool(st.session_state.get("panel_allow_alias", False))
     else:
-        raw_in = os.getenv("LLM_IN_CTX")
-        if raw_in:
-            try:
-                defaults["in_ctx"] = int(raw_in)
-            except ValueError:
-                pass
         raw_out = os.getenv("LLM_OUT_MAX")
         if raw_out:
             try:
                 defaults["out_max"] = int(raw_out)
             except ValueError:
                 pass
-        policy = os.getenv("LLM_LENGTH_POLICY", policy)
-        alias_env = os.getenv("LLM_ALLOW_ALIAS", "").strip().lower()
-        alias_flag = alias_env in {"1", "true", "yes", "on"}
 
-    defaults["in_ctx"] = max(512, min(64000, defaults["in_ctx"]))
+    defaults["in_ctx"] = INPUT_TOKEN_LIMIT
     defaults["out_max"] = max(256, min(8192, defaults["out_max"]))
-
-    if policy not in {"short", "balanced", "long"}:
-        policy = "balanced"
-    defaults["length_policy"] = policy
-    defaults["allow_alias"] = alias_flag
     return defaults
 
 
@@ -1681,6 +1662,7 @@ def agent1_pipeline(
     external_dir: str | os.PathLike[str] | None = None,
 ):
     preferences = _get_llm_preferences()
+    allow_alias = False
     if shinhan_dir is None:
         shinhan_dir = SHINHAN_DIR
     if external_dir is None:
@@ -1692,7 +1674,7 @@ def agent1_pipeline(
                 'USE_LLM': USE_LLM,
                 'DEBUG_MAX_PREVIEW': DEBUG_MAX_PREVIEW,
                 'DEBUG_SHOW_RAW': DEBUG_SHOW_RAW,
-                'ALLOW_ALIAS': preferences.get('allow_alias', False),
+                'ALLOW_ALIAS': allow_alias,
             },
         },
         'errors': [],
@@ -1834,7 +1816,7 @@ def agent1_pipeline(
         'elapsed_ms': panel_elapsed,
         'stats': panel_stats,
     })
-    panel_stage['allow_alias'] = preferences.get('allow_alias', False)
+    panel_stage['allow_alias'] = allow_alias
     debug_block['panel'] = panel_stage
 
     wxm = None
@@ -1845,7 +1827,7 @@ def agent1_pipeline(
         wxm = None
 
     snapshot_t0 = tick()
-    kpis, kpi_debug = kpi_summary(sub, allow_alias=preferences.get("allow_alias", False))
+    kpis, kpi_debug = kpi_summary(sub, allow_alias=allow_alias)
     snapshot_elapsed = to_ms(snapshot_t0)
 
     raw_snapshot = {}
@@ -1926,10 +1908,6 @@ def agent1_pipeline(
         out['context']['merchant'] = merchant_match
         out['context']['merchant_masked_name'] = merchant_match.get('masked_name')
 
-    out_path = OUTPUT_DIR / 'agent1_output.json'
-    with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    print('✅ Agent-1 JSON 저장:', out_path)
     return out
 
 QUESTION_TYPE_INFO = {
@@ -2126,16 +2104,10 @@ def build_agent2_prompt_overhauled(
     rag_block, rag_reason = _summarise_rag_context(rag_context)
 
     preferences = _get_llm_preferences()
-    policy = preferences.get("length_policy", "balanced")
     out_max = int(preferences.get("out_max", 2048))
-    policy_levels = {"short": 0, "balanced": 1, "long": 2}
-    policy_level = policy_levels.get(policy, 1)
 
     data_payload = agent1_json or {}
-    if policy_level == 0:
-        data_text = json.dumps(data_payload, ensure_ascii=False, separators=(",", ":"))
-    else:
-        data_text = json.dumps(data_payload, ensure_ascii=False, indent=2)
+    data_text = json.dumps(data_payload, ensure_ascii=False, indent=2)
 
     sections: List[PromptSection] = [
         PromptSection(
@@ -2167,7 +2139,6 @@ def build_agent2_prompt_overhauled(
             text="[질문 유형별 지침]\n- " + "\n- ".join(type_rules) if type_rules else "",
             priority=15,
             required=False,
-            min_policy=0,
         ),
         PromptSection(
             name="schema",
@@ -2190,7 +2161,6 @@ def build_agent2_prompt_overhauled(
                 text="[RAG_CONTEXT]\n" + rag_block,
                 priority=25,
                 required=False,
-                min_policy=1,
             )
         )
     elif rag_reason:
@@ -2200,32 +2170,8 @@ def build_agent2_prompt_overhauled(
                 text=f"[RAG 참고 메모]\n- {rag_reason}",
                 priority=25,
                 required=False,
-                min_policy=1,
             )
         )
-
-    if policy_level >= 2:
-        debug_extra: list[str] = []
-        debug_block = (agent1_json or {}).get("debug")
-        if isinstance(debug_block, dict):
-            sanitized = debug_block.get("sanitized_snapshot")
-            if sanitized:
-                debug_extra.append(
-                    json.dumps({"sanitized_snapshot": sanitized}, ensure_ascii=False, indent=2)
-                )
-            panel_warn = debug_block.get("panel_warnings")
-            if panel_warn:
-                debug_extra.append("panel_warnings=" + ", ".join(map(str, panel_warn)))
-        if debug_extra:
-            sections.append(
-                PromptSection(
-                    name="debug_extra",
-                    text="[추가 컨텍스트]\n" + "\n".join(debug_extra),
-                    priority=30,
-                    required=False,
-                    min_policy=2,
-                )
-            )
 
     sections.append(
         PromptSection(
@@ -2239,10 +2185,9 @@ def build_agent2_prompt_overhauled(
         )
     )
 
-    eligible_sections = [sec for sec in sections if policy_level >= sec.min_policy]
     guide, used_sections, removed_sections, token_est, truncated = _render_sections_with_limit(
-        eligible_sections,
-        int(preferences.get("in_ctx", 8192)),
+        sections,
+        int(preferences.get("in_ctx", INPUT_TOKEN_LIMIT)),
     )
     schema_keys = []
     if isinstance(schema_obj, dict) and isinstance(schema_obj.get("properties"), dict):
@@ -2273,11 +2218,10 @@ def build_agent2_prompt_overhauled(
         "rag_threshold": rag_threshold,
         "rag_max_score": rag_max_score,
         "rag_mode": rag_mode,
-        "length_policy": policy,
         "prompt_sections_used": used_sections,
         "prompt_sections_removed": removed_sections,
         "prompt_tokens_est": token_est,
-        "prompt_token_limit": int(preferences.get("in_ctx", 8192)),
+        "prompt_token_limit": int(preferences.get("in_ctx", INPUT_TOKEN_LIMIT)),
         "prompt_truncated": truncated,
         "prompt_char_len": len(guide),
         "max_output_tokens": out_max,
@@ -2302,9 +2246,8 @@ def call_gemini_agent2_overhauled(
         _ = ", ".join(sorted(kwargs.keys()))  # noqa: F841 - reserved for debugging
 
     preferences = _get_llm_preferences()
-    in_ctx = int(preferences.get("in_ctx", 8192))
+    in_ctx = int(preferences.get("in_ctx", INPUT_TOKEN_LIMIT))
     out_max = int(preferences.get("out_max", 2048))
-    length_policy = preferences.get("length_policy", "balanced")
 
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
@@ -2377,7 +2320,6 @@ def call_gemini_agent2_overhauled(
         "prompt_length": len(prompt_payload),
         "attempts": [],
         "input_token_limit": in_ctx,
-        "length_policy": length_policy,
         "prompt_tokens_est": AGENT2_PROMPT_TRACE.get("prompt_tokens_est"),
         "truncation_notes": AGENT2_PROMPT_TRACE.get("truncation_notes"),
         "prompt_sections_used": AGENT2_PROMPT_TRACE.get("prompt_sections_used"),
@@ -2542,23 +2484,6 @@ def call_gemini_agent2_overhauled(
 
     if chosen_payload is not None:
         AGENT2_RESPONSE_TRACE.update({"status": "success", "chosen_model": chosen_model})
-        try:
-            debug_payload = {
-                "ts": datetime.datetime.utcnow().isoformat(),
-                "chosen_model": chosen_model,
-                "attempts": AGENT2_RESPONSE_TRACE["attempts"],
-                "schema_key": schema_key,
-            }
-            (OUTPUT_DIR / 'gemini_debug.json').write_text(
-                json.dumps(debug_payload, ensure_ascii=False, indent=2),
-                encoding='utf-8',
-            )
-        except Exception:
-            pass
-        (OUTPUT_DIR / 'agent2_result.json').write_text(
-            json.dumps(chosen_payload, ensure_ascii=False, indent=2),
-            encoding='utf-8',
-        )
         return chosen_payload
 
     AGENT2_RESPONSE_TRACE.update({
@@ -2572,10 +2497,6 @@ def call_gemini_agent2_overhauled(
             schema_validator.validate(fallback)
     except Exception:
         pass
-    (OUTPUT_DIR / 'agent2_result.json').write_text(
-        json.dumps(fallback, ensure_ascii=False, indent=2),
-        encoding='utf-8',
-    )
     return fallback
 
 
